@@ -1,0 +1,40 @@
+mod bitter;
+pub mod hex;
+pub mod href;
+pub mod mp4_atom_properties;
+pub mod mp4_parsing;
+pub mod network;
+mod pssh_data;
+pub mod query_codec;
+pub mod response;
+pub mod validator;
+
+#[cfg(test)]
+mod tests {
+    // Because we use a HashMap as the input when decoding to the query string value, the order of
+    // parameters is non-deterministic, so this method helps validate the string is as expected.
+    pub fn assert_definitions_string_equality(expected: &str, actual: &str) {
+        let expected_vec = expected.split("%22").fold(Vec::new(), |v, s| {
+            let mut vec = vec![s];
+            vec.extend(v);
+            vec
+        });
+        let actual_vec = actual.split("%22").fold(Vec::new(), |v, s| {
+            let mut vec = vec![s];
+            vec.extend(v);
+            vec
+        });
+        for expected in &expected_vec {
+            assert!(
+                actual_vec.contains(expected),
+                "actual_vec {actual_vec:?} did not contain {expected}"
+            );
+        }
+        for actual in &actual_vec {
+            assert!(
+                expected_vec.contains(actual),
+                "expected_vec {expected_vec:?} did not contain {actual}"
+            );
+        }
+    }
+}
