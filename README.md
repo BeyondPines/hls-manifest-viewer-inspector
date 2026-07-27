@@ -1,7 +1,5 @@
 # hls-manifest-viewer
 
-This site is uploaded to GitHub Pages here: https://therealrobg.github.io/hls-manifest-viewer/
-
 This is a static site written almost entirely in Rust using the [Leptos][1] framework (compiled to
 WebAssembly for serving). It makes use of my [m3u8][2] parsing library (also written in Rust).
 
@@ -54,19 +52,9 @@ just plain old HTML+CSS+JavaScript).
 
 [1]: https://leptos.dev
 [2]: https://github.com/theRealRobG/m3u8
-[3]: https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis-17#section-4.3
-[4]: https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis-17#section-3.1
-[5]: https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis-17#section-3.1.1
-[6]: https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis-17#section-3.1.2
-[7]: https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis-17#section-3.1.3
-[8]: https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis-17#section-3.1.4
-[9]: https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis-17#section-3.1.5
-[10]: https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis-17#ref-ISO_8601
-[11]: https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis-17#section-7.2
-[12]: https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis-17#appendix-D.2
-[13]: https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis-17#section-4.4.6.4
-[14]: https://developer.apple.com/documentation/http-live-streaming/using-apple-s-http-live-streaming-hls-tools
-[15]: https://unlicense.org/
+[3]: https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis
+[4]: https://developer.apple.com/documentation/http-live-streaming/using-apple-s-http-live-streaming-hls-tools
+[5]: https://unlicense.org/
 
 ## Building Locally
 
@@ -101,36 +89,6 @@ you want to build for release locally then run the following command:
 trunk build --release --public-url "/hls-manifest-viewer"
 ```
 
-## Acknowledgements
-* The genesis of this tool (for me) is the brilliant [Adaptive Bitrate Manifest Viewer][18] Chrome
-  extension, that sadly, is not available in the Chrome store anymore (as it does not follow best
-  practices for Chrome extensions and the developer does not have the time to update it). This
-  extension would hijack any requests to URLs with file extension `.m3u8` or `.m3u` and reload it
-  in a new page it would deliver instead that would make the manifest request, parse it, and provide
-  a colorized output with links that actually resolve properly. For me, this made my early learning
-  of HLS **much** easier, as I could easily browse manifests that I was dealing with and quickly
-  cross-reference tags against the HLS spec (which is also very convenient in the IETF site that it
-  has a "html-ized" version with quick links to the various sections). I still feel that this tool
-  is more convenient than my one, as it would automatically handle requests from search in the
-  Chrome URL input bar, so one less degree of separation and super convenient. I may later look into
-  delivering a Chrome extension too for the convenience factor (I believe Chrome extensions support
-  WebAssembly).
-* The fantastic [MP4Box.js / ISOBMFF Box Structure Viewer][19] is where most of the inspiration for
-  the "isobmff" view came from. That site does a really great job in displaying the contents of MP4
-  files, and at some stage I may add a button to link directly to that site for the fMP4 (I've found
-  that this works just by including the file URL as the query string, i.e., no key, just the value).
-  The only benefit for displaying the view in my tool is that it keeps the investigation of the
-  media in one place without having to jump around too many tools (and also, it was educational for
-  me to go through all of the ISOBMFF defined boxes, and further boxes e.g. CENC, AVC1, etc.).
-* Professionally, working with the [Comcast/mamba][20] (especially when writing many different types
-  of manifest manipulation for iOS playback) gave me my familiarity with the concepts of HLS, and
-  also demonstrated to me how zero copy parsers can be very fast (when a naiive younger me tried to
-  re-write it in Swift using plenty of String allocations and finding it orders of magnitudes slower
-  than mamba). As a result, I had a desire for some time to write a "zero-copy" HLS parser in Rust,
-  and eventually found the time to write [m3u8][2].
-* The great [PSSH box tools][21] GitHub Pages site finally gave me the idea that I could write a
-  GitHub Pages site with Rust that could provide a collection of tools to help me (and others) do
-  what I (/we) do easier.
 
 [18]: https://chromewebstore.google.com/detail/adaptive-bitrate-manifest/omjpjjekjefmdkidigpkhpjnojoadbih?hl=en
 [19]: https://dist.gpac.io/mp4box.js/test/filereader.html
