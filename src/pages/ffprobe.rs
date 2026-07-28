@@ -7,7 +7,6 @@ use leptos::prelude::*;
 use mp4_atom::{Header, ReadFrom};
 use quick_m3u8::{
     HlsLine, Reader,
-    config::ParsingOptionsBuilder,
     tag::{KnownTag, HlsPlaylistType, hls::Tag},
 };
 use std::{collections::HashSet, io::Cursor};
@@ -412,7 +411,7 @@ struct MediaPlaylist {
 // ── HLS parsing with quick-m3u8 ──────────────────────────────────────────────
 
 fn make_reader_opts() -> quick_m3u8::config::ParsingOptions {
-    ParsingOptionsBuilder::default().build()
+    quick_m3u8::config::ParsingOptions::default()
 }
 
 fn playlist_type_str(pt: HlsPlaylistType) -> String {
@@ -1093,7 +1092,7 @@ pub fn Ffprobe() -> impl IntoView {
                 <form on:submit=on_submit>
                     <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px;">
                         <input
-                            type="url"
+                            type="text"
                             placeholder="https://example.com/stream/master.m3u8"
                             style="flex: 1; min-width: 260px; background: #f8fafc; \
                                    border: 1.5px solid #cbd5e1; border-radius: 8px; \
@@ -1809,5 +1808,141 @@ fn AudioTable(tracks: Vec<AudioTrackInfo>, selected: HashSet<String>) -> impl In
                 </tbody>
             </table>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const APPLE_MASTER: &str = "#EXTM3U\n\
+        \n\
+        #EXT-X-VERSION:6\n\
+        \n\
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aache-44-64\",NAME=\"English\",LANGUAGE=\"en-US\",AUTOSELECT=YES,DEFAULT=YES,CHANNELS=\"2\",URI=\"audio/prog_index.m3u8\"\n\
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"ec3-48-768\",NAME=\"English\",LANGUAGE=\"en-US\",AUTOSELECT=YES,DEFAULT=YES,CHANNELS=\"16/JOC\",URI=\"atmos/prog_index.m3u8\"\n\
+        \n\
+        #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subtitles\",NAME=\"English\",LANGUAGE=\"en-US\",AUTOSELECT=YES,FORCED=NO,DEFAULT=YES,URI=\"subs/prog_index.m3u8\"\n\
+        \n\
+        #EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,GROUP-ID=\"cc\",LANGUAGE=\"en\",NAME=\"English\",DEFAULT=YES,AUTOSELECT=YES,INSTREAM-ID=\"CC1\"\n\
+        \n\
+        #EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=2193519,BANDWIDTH=3307941,VIDEO-RANGE=SDR,CODECS=\"avc1.64001f,mp4a.40.5\",RESOLUTION=1024x576,FRAME-RATE=23.976,CLOSED-CAPTIONS=\"cc\",AUDIO=\"aache-44-64\",SUBTITLES=\"subtitles\"\n\
+        sdr/prog_index.m3u8\n\
+        \n\
+        #EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=25097073,BANDWIDTH=37409767,VIDEO-RANGE=PQ,CODECS=\"dvh1.05.06,ec-3\",RESOLUTION=3840x2160,FRAME-RATE=23.976,CLOSED-CAPTIONS=\"cc\",AUDIO=\"ec3-48-768\",SUBTITLES=\"subtitles\"\n\
+        dv/prog_index.m3u8\n";
+
+    const APPLE_MEDIA: &str = "#EXTM3U\n\
+        #EXT-X-TARGETDURATION:6\n\
+        #EXT-X-VERSION:7\n\
+        #EXT-X-MEDIA-SEQUENCE:0\n\
+        #EXT-X-PLAYLIST-TYPE:VOD\n\
+        #EXT-X-INDEPENDENT-SEGMENTS\n\
+        \n\
+        #EXT-X-PROGRAM-DATE-TIME:2025-01-01T05:00:00.000Z\n\
+        #EXT-X-DATERANGE:ID=\"ad1\",CLASS=\"com.apple.hls.interstitial\",START-DATE=\"2025-01-01T05:00:10.000Z\",DURATION=6,X-ASSET-URI=\"https://example.com/ad.m3u8\",CUE=\"PRE\",X-RESUME-OFFSET=0,X-TIMELINE-STYLE=\"HIGHLIGHT\",X-TIMELINE-OCCUPIES=\"POINT\",X-RESTRICT=\"JUMP\",X-PLAYOUT-LIMIT=5.0\n\
+        #EXT-X-DATERANGE:ID=\"ad2\",CLASS=\"com.apple.hls.interstitial\",START-DATE=\"2025-01-01T05:00:25.000Z\",DURATION=25,X-ASSET-LIST=\"https://example.com/ads.json\",X-RESUME-OFFSET=0\n\
+        \n\
+        #EXT-X-MAP:URI=\"fileSequence0.mp4\"\n\
+        #EXTINF:5.46379,\t\n\
+        fileSequence1.m4s\n\
+        #EXTINF:5.21354,\t\n\
+        fileSequence2.m4s\n\
+        #EXT-X-ENDLIST\n";
+
+    fn count_ok_lines(content: &str) -> (usize, Option<String>) {
+        use quick_m3u8::Reader;
+        let opts = quick_m3u8::config::ParsingOptions::default();
+        let mut reader = Reader::from_str(content, opts);
+        let mut n = 0usize;
+        loop {
+            match reader.read_line() {
+                Ok(Some(_)) => n += 1,
+                Ok(None) => return (n, None),
+                Err(e) => return (n, Some(format!("{e:?}"))),
+            }
+        }
+    }
+
+    #[test]
+    fn diagnose_hlsline_kinds() {
+        use quick_m3u8::{HlsLine, Reader};
+        let content = "#EXTM3U\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=1000,RESOLUTION=640x360\n\
+            video.m3u8\n";
+        let opts = quick_m3u8::config::ParsingOptions::default();
+        let mut reader = Reader::from_str(content, opts);
+        let mut stream_inf_is_known = false;
+        let mut uri_seen = false;
+        loop {
+            match reader.read_line() {
+                Ok(Some(HlsLine::KnownTag(quick_m3u8::tag::KnownTag::Hls(
+                    quick_m3u8::tag::hls::Tag::StreamInf(_)
+                )))) => { stream_inf_is_known = true; }
+                Ok(Some(HlsLine::Uri(_))) => { uri_seen = true; }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(e) => panic!("Err: {e:?}"),
+            }
+        }
+        assert!(stream_inf_is_known, "EXT-X-STREAM-INF must come as KnownTag with default options");
+        assert!(uri_seen, "URI line must come as HlsLine::Uri");
+    }
+
+    #[test]
+    fn diagnose_channels_joc() {
+        // CHANNELS="16/JOC" must not break the parser
+        let (n, err) = count_ok_lines(
+            "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"g\",NAME=\"English\",CHANNELS=\"16/JOC\",DEFAULT=YES\n"
+        );
+        assert!(err.is_none(), "CHANNELS=16/JOC caused Err after {n} lines: {:?}", err);
+    }
+
+    #[test]
+    fn diagnose_daterange_tag() {
+        // EXT-X-DATERANGE must not break the parser
+        let (n, err) = count_ok_lines(
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n\
+             #EXT-X-DATERANGE:ID=\"ad1\",CLASS=\"com.apple.hls.interstitial\",START-DATE=\"2025-01-01T05:00:10.000Z\",DURATION=6,X-ASSET-URI=\"https://example.com/ad.m3u8\",CUE=\"PRE\",X-RESUME-OFFSET=0\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n"
+        );
+        assert!(err.is_none(), "EXT-X-DATERANGE caused Err after {n} lines: {:?}", err);
+        assert_eq!(n, 4, "should read all 4 lines, got {n}");
+    }
+
+    #[test]
+    fn master_parses_variants_and_renditions() {
+        let master = parse_master_playlist("https://example.com/master.m3u8", APPLE_MASTER);
+        assert_eq!(master.variants.len(), 2, "should parse 2 EXT-X-STREAM-INF variants");
+        assert_eq!(master.version, 6);
+        // DVH1 / Dolby Vision variant
+        let dv = master.variants.iter().find(|v| v.uri.contains("dv/")).unwrap();
+        assert!(dv.codecs.as_deref().unwrap().starts_with("dvh1"), "dvh1 codec must be preserved");
+        // Audio renditions: 2 (one JOC, one stereo)
+        let audio: Vec<_> = master.media_renditions.iter().filter(|r| r.media_type == "AUDIO").collect();
+        assert_eq!(audio.len(), 2);
+        // CHANNELS="16/JOC" should not cause a parse break
+        let joc = audio.iter().find(|r| r.name.contains("English") && r.group_id == "ec3-48-768");
+        assert!(joc.is_some(), "JOC audio rendition should be present");
+        // Subtitles
+        let subs: Vec<_> = master.media_renditions.iter().filter(|r| r.media_type == "SUBTITLES").collect();
+        assert_eq!(subs.len(), 1);
+        // Closed captions (no URI)
+        let cc: Vec<_> = master.media_renditions.iter().filter(|r| r.media_type == "CLOSED-CAPTIONS").collect();
+        assert_eq!(cc.len(), 1);
+    }
+
+    #[test]
+    fn media_playlist_parsed_past_daterange() {
+        let pl = parse_media_playlist("https://example.com/sdr/prog_index.m3u8", APPLE_MEDIA);
+        assert_eq!(pl.target_duration, 6.0, "EXT-X-TARGETDURATION should be 6");
+        assert_eq!(pl.playlist_type.as_deref(), Some("VOD"), "playlist type should be VOD");
+        assert!(pl.has_endlist, "EXT-X-ENDLIST should be detected");
+        assert_eq!(pl.segments.len(), 2, "should parse 2 segments (EXT-X-DATERANGE must not break the loop)");
+        // EXT-X-MAP URI must be propagated to each segment
+        assert!(
+            pl.segments.iter().all(|s| s.map_uri.as_deref() == Some("https://example.com/sdr/fileSequence0.mp4")),
+            "all segments must carry the resolved map_uri"
+        );
     }
 }
