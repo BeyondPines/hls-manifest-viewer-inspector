@@ -75,9 +75,7 @@
 
     /* General page styling */
     body {
-      @media (prefers-color-scheme: dark) {
-        background-color: var(--color-sky-950);
-      }
+      background-color: var(--color-white);
     }
 
     main {
@@ -191,10 +189,6 @@
 
     .spacer-bottom-large {
       margin-bottom: calc(var(--spacing) * 6);
-    }
-
-    table.larger-spaced-table td:not(:last-child) {
-      padding-right: 10px;
     }
 
     /* Nav styling */
@@ -390,11 +384,12 @@
     }
 
     .url-input-form .url-input::placeholder {
-      color: var(--color-sky-200);
+      color: var(--color-sky-500);
+    }
 
-      @media (prefers-color-scheme: dark) {
-        color: var(--color-sky-800);
-      }
+    @keyframes progress {
+      0%   { transform: translateX(-100%); }
+      100% { transform: translateX(350%); }
     }
   </style>
 </head>
