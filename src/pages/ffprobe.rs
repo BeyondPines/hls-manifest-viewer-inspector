@@ -2,14 +2,14 @@ use crate::utils::{
     mp4_atom_properties::{AtomPropertyValue, get_properties},
     network::{FetchError, fetch_array_buffer, fetch_text},
     query_codec::percent_encode,
-    validator::{
-        is_master_playlist,
-        parser::{parse_attributes, parse_master_playlist, parse_media_playlist},
-        types::MediaPlaylist,
-    },
 };
 use leptos::prelude::*;
 use mp4_atom::{Header, ReadFrom};
+use quick_m3u8::{
+    HlsLine, Reader,
+    config::ParsingOptionsBuilder,
+    tag::{KnownTag, HlsPlaylistType, hls::Tag},
+};
 use std::{collections::HashSet, io::Cursor};
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -354,31 +354,253 @@ fn fmt_dur(secs: f64) -> String {
     else { format!("{}:{:02}", s/60, s%60) }
 }
 
+// ── Local HLS parsing types (replaces crate::utils::validator) ───────────────
+
+/// A single variant stream from a master playlist.
+struct VariantStream {
+    uri: String,
+    bandwidth: Option<u64>,
+    codecs: Option<String>,
+    resolution: Option<String>,
+    frame_rate: Option<f64>,
+    video_range: Option<String>,
+    audio_group: Option<String>,
+}
+
+/// A media rendition from an EXT-X-MEDIA tag.
+struct MediaRendition {
+    media_type: String,
+    name: String,
+    group_id: String,
+    uri: Option<String>,
+    language: Option<String>,
+    is_default: bool,
+    /// Channel count extracted from the CHANNELS attribute.
+    channels: Option<u32>,
+}
+
+/// Parsed representation of a master playlist.
+struct MasterPlaylist {
+    version: u32,
+    variants: Vec<VariantStream>,
+    media_renditions: Vec<MediaRendition>,
+}
+
+/// A single segment entry from a media playlist.
+struct SegmentInfo {
+    duration: f64,
+    map_uri: Option<String>,
+}
+
+/// Parsed server control tag data.
+struct ServerControlInfo {
+    part_hold_back: Option<f64>,
+    can_skip_until: Option<f64>,
+    can_block_reload: bool,
+}
+
+/// Parsed representation of a media playlist.
+struct MediaPlaylist {
+    version: u32,
+    target_duration: f64,
+    playlist_type: Option<String>,
+    has_endlist: bool,
+    segments: Vec<SegmentInfo>,
+    server_control: Option<ServerControlInfo>,
+}
+
+// ── HLS parsing with quick-m3u8 ──────────────────────────────────────────────
+
+fn make_reader_opts() -> quick_m3u8::config::ParsingOptions {
+    ParsingOptionsBuilder::default().build()
+}
+
+fn playlist_type_str(pt: HlsPlaylistType) -> String {
+    match pt {
+        HlsPlaylistType::Event => "EVENT".into(),
+        HlsPlaylistType::Vod => "VOD".into(),
+    }
+}
+
+/// Returns `true` if the manifest text is a master (multivariant) playlist.
+fn is_master_playlist(content: &str) -> bool {
+    content.lines().any(|l| l.starts_with("#EXT-X-STREAM-INF"))
+}
+
+/// Resolve a potentially-relative URI against a base URL string.
+fn resolve_uri(base: &str, uri: &str) -> String {
+    if uri.starts_with("http://") || uri.starts_with("https://") {
+        return uri.to_string();
+    }
+    // Strip everything after the last '/' from the base to get the directory.
+    let base_dir = base.rfind('/').map(|i| &base[..=i]).unwrap_or(base);
+    if uri.starts_with('/') {
+        // Protocol-relative or absolute path — reuse the origin of the base.
+        let origin_end = base_dir.find("://")
+            .and_then(|p| base_dir[p + 3..].find('/').map(|q| p + 3 + q))
+            .unwrap_or(base_dir.len());
+        format!("{}{}", &base_dir[..origin_end], uri)
+    } else {
+        format!("{}{}", base_dir, uri)
+    }
+}
+
+fn parse_master_playlist(base_url: &str, content: &str) -> MasterPlaylist {
+    let mut master = MasterPlaylist {
+        version: 3,
+        variants: Vec::new(),
+        media_renditions: Vec::new(),
+    };
+    let opts = make_reader_opts();
+    let mut pending_stream_inf: Option<VariantStream> = None;
+
+    let mut reader = Reader::from_str(content, opts);
+    loop {
+        match reader.read_line() {
+            Ok(Some(hls_line)) => match hls_line {
+                HlsLine::KnownTag(KnownTag::Hls(Tag::Version(v))) => {
+                    master.version = v.version() as u32;
+                }
+                HlsLine::KnownTag(KnownTag::Hls(Tag::StreamInf(si))) => {
+                    let res = si.resolution().map(|r| format!("{}x{}", r.width, r.height));
+                    let codecs = si.codecs().map(|c| c.to_string());
+                    let video_range = si.video_range().map(|vr| vr.to_string());
+                    let audio_group = si.audio().map(|a| a.to_string());
+                    pending_stream_inf = Some(VariantStream {
+                        uri: String::new(),
+                        bandwidth: Some(si.bandwidth()),
+                        codecs,
+                        resolution: res,
+                        frame_rate: si.frame_rate(),
+                        video_range,
+                        audio_group,
+                    });
+                }
+                HlsLine::Uri(uri) => {
+                    if let Some(mut vs) = pending_stream_inf.take() {
+                        vs.uri = resolve_uri(base_url, &uri);
+                        master.variants.push(vs);
+                    }
+                }
+                HlsLine::KnownTag(KnownTag::Hls(Tag::Media(m))) => {
+                    // Extract numeric channel count from the CHANNELS attribute.
+                    // `valid()` borrows the `Channels` value, so we must call
+                    // `count()` (returning a Copy u32) inside the same closure.
+                    let channels = m.channels()
+                        .and_then(|c| c.valid().map(|v| v.count()));
+                    master.media_renditions.push(MediaRendition {
+                        media_type: m.media_type().to_string(),
+                        name: m.name().to_string(),
+                        group_id: m.group_id().to_string(),
+                        uri: m.uri().map(|u| resolve_uri(base_url, u)),
+                        language: m.language().map(|l| l.to_string()),
+                        is_default: m.default(),
+                        channels,
+                    });
+                }
+                _ => {}
+            },
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    master
+}
+
+fn parse_media_playlist(base_url: &str, content: &str) -> MediaPlaylist {
+    let mut pl = MediaPlaylist {
+        version: 3,
+        target_duration: 0.0,
+        playlist_type: None,
+        has_endlist: false,
+        segments: Vec::new(),
+        server_control: None,
+    };
+    let opts = make_reader_opts();
+    let mut pending_duration: Option<f64> = None;
+    let mut current_map_uri: Option<String> = None;
+
+    let mut reader = Reader::from_str(content, opts);
+    loop {
+        match reader.read_line() {
+            Ok(Some(hls_line)) => match hls_line {
+                HlsLine::KnownTag(KnownTag::Hls(Tag::Version(v))) => {
+                    pl.version = v.version() as u32;
+                }
+                HlsLine::KnownTag(KnownTag::Hls(Tag::Targetduration(td))) => {
+                    pl.target_duration = td.target_duration() as f64;
+                }
+                HlsLine::KnownTag(KnownTag::Hls(Tag::PlaylistType(pt))) => {
+                    pl.playlist_type = Some(playlist_type_str(pt.playlist_type()));
+                }
+                HlsLine::KnownTag(KnownTag::Hls(Tag::Endlist(_))) => {
+                    pl.has_endlist = true;
+                }
+                HlsLine::KnownTag(KnownTag::Hls(Tag::Map(m))) => {
+                    current_map_uri = Some(resolve_uri(base_url, m.uri()));
+                }
+                HlsLine::KnownTag(KnownTag::Hls(Tag::Inf(inf))) => {
+                    pending_duration = Some(inf.duration());
+                }
+                HlsLine::Uri(_uri) => {
+                    if let Some(dur) = pending_duration.take() {
+                        pl.segments.push(SegmentInfo {
+                            duration: dur,
+                            map_uri: current_map_uri.clone(),
+                        });
+                    }
+                }
+                HlsLine::KnownTag(KnownTag::Hls(Tag::ServerControl(sc))) => {
+                    pl.server_control = Some(ServerControlInfo {
+                        part_hold_back: sc.part_hold_back(),
+                        can_skip_until: sc.can_skip_until(),
+                        can_block_reload: sc.can_block_reload(),
+                    });
+                }
+                _ => {}
+            },
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    pl
+}
+
 fn parse_session_data(content: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for line in content.lines() {
-        if line.starts_with("#EXT-X-SESSION-DATA:") {
-            let attrs = parse_attributes(&line["#EXT-X-SESSION-DATA:".len()..]);
-            let k = attrs.get("DATA-ID").cloned().unwrap_or_default();
-            let v = attrs.get("VALUE").cloned().or_else(|| attrs.get("URI").cloned()).unwrap_or_default();
-            if !k.is_empty() { out.push((k, v)); }
+    let opts = make_reader_opts();
+    let mut reader = Reader::from_str(content, opts);
+    loop {
+        match reader.read_line() {
+            Ok(Some(HlsLine::KnownTag(KnownTag::Hls(Tag::SessionData(sd))))) => {
+                let k = sd.data_id().to_string();
+                let v = sd.value().map(|s| s.to_string())
+                    .or_else(|| sd.uri().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                if !k.is_empty() { out.push((k, v)); }
+            }
+            Ok(None) | Err(_) => break,
+            Ok(Some(_)) => {}
         }
     }
     out
 }
 
 fn parse_key_info(content: &str) -> (Vec<String>, Vec<String>) {
-    let mut methods = Vec::new();
-    let mut formats = Vec::new();
-    for line in content.lines() {
-        if line.starts_with("#EXT-X-KEY:") {
-            let attrs = parse_attributes(&line["#EXT-X-KEY:".len()..]);
-            if let Some(m) = attrs.get("METHOD") {
-                if !methods.contains(m) { methods.push(m.clone()); }
+    let mut methods: Vec<String> = Vec::new();
+    let mut formats: Vec<String> = Vec::new();
+    let opts = make_reader_opts();
+    let mut reader = Reader::from_str(content, opts);
+    loop {
+        match reader.read_line() {
+            Ok(Some(HlsLine::KnownTag(KnownTag::Hls(Tag::Key(k))))) => {
+                let m = k.method().to_string();
+                if !methods.contains(&m) { methods.push(m); }
+                let kf = k.keyformat().to_string();
+                if !formats.contains(&kf) { formats.push(kf); }
             }
-            if let Some(kf) = attrs.get("KEYFORMAT") {
-                if !formats.contains(kf) { formats.push(kf.clone()); }
-            }
+            Ok(None) | Err(_) => break,
+            Ok(Some(_)) => {}
         }
     }
     (methods, formats)
@@ -623,11 +845,9 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
             at.language = rend.language.clone();
             at.is_default = rend.is_default;
             at.playlist_uri = rend.uri.clone();
-            if let Some(ch) = &rend.channels {
-                if let Ok(n) = ch.split('/').next().unwrap_or("").parse::<u32>() {
-                    at.channels = Some(n);
-                    at.channel_layout = Some(channels_to_layout(n));
-                }
+            if let Some(n) = rend.channels {
+                at.channels = Some(n);
+                at.channel_layout = Some(channels_to_layout(n));
             }
             // Codec from stream-inf codecs map
             if let Some(raw) = audio_codec_map.get(&rend.group_id) {
@@ -660,8 +880,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
         // Probe first variant media playlist
         if let Some(first) = master.variants.first() {
             if let Ok(mr) = fetch_text(first.uri.clone()).await {
-                let mut pl = MediaPlaylist::new(String::new(), first.uri.clone());
-                parse_media_playlist(&first.uri, &mr.response_text, &mut pl);
+                let pl = parse_media_playlist(&first.uri, &mr.response_text);
                 r.target_duration = Some(pl.target_duration);
                 r.playlist_type = pl.playlist_type.clone();
                 r.is_live = !pl.has_endlist;
@@ -754,8 +973,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                             .and_then(|rend| rend.uri.clone());
                         if let Some(apl_url) = audio_pl_url {
                             if let Ok(apl_resp) = fetch_text(apl_url.clone()).await {
-                                let mut apl = MediaPlaylist::new(String::new(), apl_url.clone());
-                                parse_media_playlist(&apl_url, &apl_resp.response_text, &mut apl);
+                                let apl = parse_media_playlist(&apl_url, &apl_resp.response_text);
                                 let audio_init_url = apl.segments.iter().find_map(|s| s.map_uri.clone());
                                 if let Some(aiurl) = audio_init_url {
                                     if let Ok(aresp) = fetch_array_buffer(aiurl, None).await {
@@ -781,8 +999,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
     } else {
         // Single media playlist
         r.manifest_type = "HLS Media Playlist".into();
-        let mut pl = MediaPlaylist::new(String::new(), url.to_string());
-        parse_media_playlist(url, content, &mut pl);
+        let pl = parse_media_playlist(url, content);
         r.hls_version = Some(pl.version);
         r.target_duration = Some(pl.target_duration);
         r.playlist_type = pl.playlist_type.clone();
