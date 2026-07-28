@@ -200,7 +200,7 @@ pub static CATEGORIES: &[CheckCat] = &[
         items: &[
             CheckItem { id: "enc_method",  label: "Encryption method",  note: None },
             CheckItem { id: "key_format",  label: "Key format",         note: None },
-            CheckItem { id: "drm_systems", label: "DRM systems (PSSH)", note: Some("init seg") },
+            CheckItem { id: "drm_systems", label: "DRM systems", note: Some("PSSH / EXT-X-KEY") },
         ],
     },
     CheckCat {
@@ -605,6 +605,31 @@ fn parse_key_info(content: &str) -> (Vec<String>, Vec<String>) {
     (methods, formats)
 }
 
+/// Derive DRM system names from EXT-X-KEY KEYFORMAT values.
+/// FairPlay does not embed PSSH boxes in the init segment — its DRM identity
+/// lives entirely in the KEYFORMAT attribute of EXT-X-KEY.
+fn drm_from_key_formats(formats: &[String]) -> Vec<DrmInfo> {
+    formats.iter().filter_map(|kf| match kf.as_str() {
+        "com.apple.streamingkeydelivery" => Some(DrmInfo {
+            system_name: "Apple FairPlay".into(),
+            system_id: "94ce86fb-07ff-4f43-adb8-93d2fa968ca2".into(),
+        }),
+        "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed" => Some(DrmInfo {
+            system_name: "Google Widevine".into(),
+            system_id: "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed".into(),
+        }),
+        "com.microsoft.playready" => Some(DrmInfo {
+            system_name: "Microsoft PlayReady".into(),
+            system_id: "9a04f079-9840-4286-ab92-e65be0885f95".into(),
+        }),
+        "urn:uuid:f239e769-efa3-4850-9c16-a903c6932efb" => Some(DrmInfo {
+            system_name: "Adobe Primetime DRM".into(),
+            system_id: "f239e769-efa3-4850-9c16-a903c6932efb".into(),
+        }),
+        _ => None,
+    }).collect()
+}
+
 // ── MP4 init-segment prober ──────────────────────────────────────────────────
 
 fn probe_mp4(data: Vec<u8>) -> Mp4ProbeInfo {
@@ -887,7 +912,13 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                 r.duration_s = Some(pl.segments.iter().map(|s| s.duration).sum());
                 let (methods, fmts) = parse_key_info(&mr.response_text);
                 r.encryption_methods = methods;
-                r.key_formats = fmts;
+                r.key_formats = fmts.clone();
+                // Detect DRM from EXT-X-KEY KEYFORMAT (FairPlay carries no PSSH)
+                for d in drm_from_key_formats(&fmts) {
+                    if !r.drm_systems.iter().any(|e| e.system_id == d.system_id) {
+                        r.drm_systems.push(d);
+                    }
+                }
                 if let Some(sc) = &pl.server_control {
                     r.ll_hls = Some(LlHlsInfo {
                         part_hold_back: sc.part_hold_back,
@@ -948,7 +979,12 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                                         }
                                     }
                                 }
-                                r.drm_systems = mp4.drm_systems;
+                                // Merge PSSH-based findings; don't overwrite EXT-X-KEY derived ones
+                                for d in mp4.drm_systems {
+                                    if !r.drm_systems.iter().any(|e| e.system_id == d.system_id) {
+                                        r.drm_systems.push(d);
+                                    }
+                                }
                                 r.init_segment_probed = true;
                             }
                             Err(e) => { r.probe_notes.push(format!("Init segment fetch failed: {e}")); }
@@ -1007,7 +1043,12 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
         r.duration_s = Some(pl.segments.iter().map(|s| s.duration).sum());
         let (methods, fmts) = parse_key_info(content);
         r.encryption_methods = methods;
-        r.key_formats = fmts;
+        r.key_formats = fmts.clone();
+        for d in drm_from_key_formats(&fmts) {
+            if !r.drm_systems.iter().any(|e| e.system_id == d.system_id) {
+                r.drm_systems.push(d);
+            }
+        }
         if let Some(sc) = &pl.server_control {
             r.ll_hls = Some(LlHlsInfo {
                 part_hold_back: sc.part_hold_back,
@@ -1464,7 +1505,7 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                                             view! {
                                                 <InfoRow label="DRM systems (PSSH)">
                                                     <span style="color: #64748b; font-style: italic;">
-                                                        {if probed_init { "None found in init segment" } else { "Init segment not probed" }}
+                                                        {if probed_init { "None found (no PSSH or known KEYFORMAT)" } else { "Init segment not probed" }}
                                                     </span>
                                                 </InfoRow>
                                             }.into_any()
