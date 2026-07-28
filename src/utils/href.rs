@@ -284,7 +284,7 @@ where
     }
 }
 
-fn replace_hls_variables<'a>(
+pub fn replace_hls_variables<'a>(
     uri: &'a str,
     definitions: &'a HashMap<String, String>,
 ) -> Cow<'a, str> {
