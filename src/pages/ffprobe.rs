@@ -1124,25 +1124,28 @@ pub fn Ffprobe() -> impl IntoView {
             </div>
 
             // ── Input card ──────────────────────────────────────────────────
-            <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; \
-                        padding: 24px 28px; box-shadow: 0 2px 12px rgba(0,0,0,.06); margin-bottom: 24px;">
+            <div style="background: var(--color-white); border: 1px solid var(--color-sky-200); border-radius: 12px; \
+                        padding: calc(var(--spacing) * 6) calc(var(--spacing) * 7); \
+                        box-shadow: 0 2px 12px rgba(0,0,0,.06); \
+                        margin-top: calc(var(--spacing) * 6); margin-bottom: calc(var(--spacing) * 6);">
                 <form on:submit=on_submit>
-                    <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px;">
+                    <div style="display: flex; gap: calc(var(--spacing) * 2.5); flex-wrap: wrap; margin-bottom: calc(var(--spacing) * 5);">
                         <input
                             type="text"
                             placeholder="https://example.com/stream/master.m3u8"
-                            style="flex: 1; min-width: 260px; background: #f8fafc; \
-                                   border: 1.5px solid #cbd5e1; border-radius: 8px; \
-                                   color: #1e293b; font-size: 1rem; padding: 12px 16px; outline: none;"
+                            style="flex: 1; min-width: 260px; background: var(--color-sky-50); \
+                                   border: 1.5px solid var(--color-sky-200); border-radius: 8px; \
+                                   color: var(--color-sky-950); font-size: 1rem; \
+                                   padding: calc(var(--spacing) * 3) calc(var(--spacing) * 4); outline: none;"
                             prop:value=move || url.get()
                             on:input=move |ev| set_url.set(event_target_value(&ev))
                         />
                         <button
                             type="submit"
-                            style="background: linear-gradient(135deg, #38bdf8, #0ea5e9); \
-                                   color: #fff; border: none; border-radius: 8px; \
-                                   padding: 12px 28px; font-size: 1rem; font-weight: 700; \
-                                   cursor: pointer; white-space: nowrap;"
+                            style="background: linear-gradient(135deg, var(--color-sky-300), var(--color-sky-500)); \
+                                   color: var(--color-white); border: none; border-radius: 8px; \
+                                   padding: calc(var(--spacing) * 3) calc(var(--spacing) * 7); \
+                                   font-size: 1rem; font-weight: 700; cursor: pointer; white-space: nowrap;"
                             disabled=move || loading.get()
                         >
                             {move || if loading.get() { "⏳ Probing…" } else { "🔍 Probe" }}
@@ -1151,24 +1154,24 @@ pub fn Ffprobe() -> impl IntoView {
 
                     // ── Check category boxes ────────────────────────────────
                     <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); \
-                                gap: 12px;">
+                                gap: calc(var(--spacing) * 3);">
                         {CATEGORIES.iter().map(|cat| {
                             let cat_id = cat.id;
                             view! {
-                                <div style="background: #f8fafc; border: 1px solid #e2e8f0; \
-                                            border-radius: 8px; padding: 12px;">
-                                    <div style="display: flex; align-items: center; gap: 6px; \
-                                                margin-bottom: 8px;">
+                                <div style="background: var(--color-sky-50); border: 1px solid var(--color-sky-200); \
+                                            border-radius: 8px; padding: calc(var(--spacing) * 3);">
+                                    <div style="display: flex; align-items: center; gap: calc(var(--spacing) * 1.5); \
+                                                margin-bottom: calc(var(--spacing) * 2);">
                                         <span style="font-size: .85rem;">{cat.icon}</span>
                                         <span style="font-size: .78rem; font-weight: 700; \
-                                                     color: #1e293b; text-transform: uppercase; \
+                                                     color: var(--color-sky-950); text-transform: uppercase; \
                                                      letter-spacing: .06em;">
                                             {cat.label}
                                         </span>
                                         <button
                                             type="button"
                                             style="margin-left: auto; font-size: .65rem; font-weight: 600; \
-                                                   color: #38bdf8; background: none; border: none; \
+                                                   color: var(--color-sky-300); background: none; border: none; \
                                                    cursor: pointer; padding: 0;"
                                             on:click=move |_| toggle_category(cat_id)
                                         >
@@ -1188,9 +1191,9 @@ pub fn Ffprobe() -> impl IntoView {
                                         let label = item.label;
                                         let note = item.note;
                                         view! {
-                                            <label style="display: flex; align-items: center; gap: 6px; \
-                                                          font-size: .78rem; color: #334155; \
-                                                          margin-bottom: 4px; cursor: pointer;">
+                                            <label style="display: flex; align-items: center; gap: calc(var(--spacing) * 1.5); \
+                                                          font-size: .78rem; color: var(--color-sky-800); \
+                                                          margin-bottom: var(--spacing); cursor: pointer;">
                                                 <input
                                                     type="checkbox"
                                                     prop:checked=move || selected.get().contains(&id)
@@ -1198,7 +1201,7 @@ pub fn Ffprobe() -> impl IntoView {
                                                 />
                                                 {label}
                                                 {note.map(|n| view! {
-                                                    <span style="font-size: .68rem; color: #94a3b8; \
+                                                    <span style="font-size: .68rem; color: var(--color-sky-200); \
                                                                  font-style: italic;">
                                                         {format!("({})", n)}
                                                     </span>
@@ -1215,14 +1218,14 @@ pub fn Ffprobe() -> impl IntoView {
 
             // ── Loading bar ─────────────────────────────────────────────────
             {move || loading.get().then(|| view! {
-                <div style="margin-bottom: 16px;">
-                    <div style="height: 3px; background: #e2e8f0; border-radius: 2px; overflow: hidden;">
+                <div style="margin-bottom: calc(var(--spacing) * 4);">
+                    <div style="height: 3px; background: var(--color-sky-200); border-radius: 2px; overflow: hidden;">
                         <div style="width: 40%; height: 100%; \
-                                    background: linear-gradient(90deg, #38bdf8, #0ea5e9); \
+                                    background: linear-gradient(90deg, var(--color-sky-300), var(--color-sky-500)); \
                                     animation: progress 1.5s ease-in-out infinite; border-radius: 2px;">
                         </div>
                     </div>
-                    <div style="font-size: .85rem; color: #64748b; margin-top: 6px;">
+                    <div style="font-size: .85rem; color: var(--color-sky-700); margin-top: calc(var(--spacing) * 1.5);">
                         "Fetching manifest and probing stream…"
                     </div>
                 </div>
@@ -1230,9 +1233,11 @@ pub fn Ffprobe() -> impl IntoView {
 
             // ── Error ───────────────────────────────────────────────────────
             {move || error_msg.get().map(|e| view! {
-                <div style="padding: 14px 18px; background: rgba(239,68,68,.12); \
-                            border: 1px solid #ef4444; border-radius: 8px; \
-                            color: #fca5a5; font-size: .9rem; margin-bottom: 16px;">
+                <div style="padding: calc(var(--spacing) * 3.5) calc(var(--spacing) * 4.5); \
+                            background: rgba(239,68,68,.12); \
+                            border: 1px solid var(--color-red-400); border-radius: 8px; \
+                            color: var(--color-red-400); font-size: .9rem; \
+                            margin-bottom: calc(var(--spacing) * 4);">
                     {format!("⚠ {}", e)}
                 </div>
             })}
@@ -1291,21 +1296,22 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
     view! {
         <div>
             // Header badge
-            <div style="display: flex; align-items: flex-start; gap: 12px; \
-                        padding: 16px 20px; margin-bottom: 20px; \
+            <div style="display: flex; align-items: flex-start; gap: calc(var(--spacing) * 3); \
+                        padding: calc(var(--spacing) * 4) calc(var(--spacing) * 5); \
+                        margin-bottom: calc(var(--spacing) * 5); \
                         background: rgba(56,189,248,.08); border: 1px solid rgba(56,189,248,.3); \
                         border-radius: 10px; flex-wrap: wrap;">
                 <span style="font-size: 1.4rem; margin-top: 2px;">{"🔍"}</span>
                 <div style="flex: 1; min-width: 0;">
-                    <div style="font-size: .9rem; font-weight: 700; color: #0ea5e9; margin-bottom: 8px;">{manifest_type}</div>
+                    <div style="font-size: .9rem; font-weight: 700; color: var(--color-sky-500); margin-bottom: calc(var(--spacing) * 2);">{manifest_type}</div>
                     // Multivariant playlist link
                     <div style="margin-bottom: 6px;">
-                        <span style="font-size: .72rem; font-weight: 600; color: #64748b; text-transform: uppercase; \
-                                     letter-spacing: .05em; margin-right: 8px;">"Multivariant Playlist"</span>
+                        <span style="font-size: .72rem; font-weight: 600; color: var(--color-sky-700); text-transform: uppercase; \
+                                     letter-spacing: .05em; margin-right: calc(var(--spacing) * 2);">"Multivariant Playlist"</span>
                         <a href={Url::parse(&url).ok().and_then(|b| playlist_href(b, "", &Default::default())).unwrap_or_default()}
                            target="_blank"
-                           style="font-size: .75rem; color: #0ea5e9; word-break: break-all; text-decoration: none; \
-                                  border-bottom: 1px dotted #0ea5e9;"
+                           style="font-size: .75rem; color: var(--color-sky-500); word-break: break-all; text-decoration: none; \
+                                  border-bottom: 1px dotted var(--color-sky-500);"
                         >{url.clone()}</a>
                     </div>
                     // Video media playlist links (one per variant, ascending by bitrate → pixel count)
@@ -1330,7 +1336,7 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                         let links: Vec<(String, String)> = links.into_iter().map(|(_, l, u)| (l, u)).collect();
                         (!links.is_empty()).then(|| view! {
                             <div style="margin-bottom: 4px;">
-                                <span style="font-size: .72rem; font-weight: 600; color: #64748b; text-transform: uppercase; \
+                                <span style="font-size: .72rem; font-weight: 600; color: var(--color-sky-700); text-transform: uppercase; \
                                              letter-spacing: .05em;">"Variant Playlists (init segments)"</span>
                                 <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px;">
                                     {links.into_iter().map(|(label, uri)| {
@@ -1339,7 +1345,8 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                                             <a href={href} target="_blank"
                                                style="font-size: .72rem; background: rgba(56,189,248,.12); \
                                                       border: 1px solid rgba(56,189,248,.35); border-radius: 4px; \
-                                                      padding: 2px 8px; color: #0ea5e9; text-decoration: none; white-space: nowrap;">
+                                                      padding: calc(var(--spacing) * 0.5) calc(var(--spacing) * 2); \
+                                                      color: var(--color-sky-500); text-decoration: none; white-space: nowrap;">
                                                 {label}
                                             </a>
                                         }
@@ -1355,7 +1362,7 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                             .collect::<Vec<_>>();
                         (!links.is_empty()).then(|| view! {
                             <div>
-                                <span style="font-size: .72rem; font-weight: 600; color: #64748b; text-transform: uppercase; \
+                                <span style="font-size: .72rem; font-weight: 600; color: var(--color-sky-700); text-transform: uppercase; \
                                              letter-spacing: .05em;">"Audio Playlists"</span>
                                 <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px;">
                                     {links.into_iter().map(|(label, uri)| {
@@ -1364,7 +1371,8 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                                             <a href={href} target="_blank"
                                                style="font-size: .72rem; background: rgba(16,185,129,.1); \
                                                       border: 1px solid rgba(16,185,129,.35); border-radius: 4px; \
-                                                      padding: 2px 8px; color: #059669; text-decoration: none; white-space: nowrap;">
+                                                      padding: calc(var(--spacing) * 0.5) calc(var(--spacing) * 2); \
+                                                      color: var(--color-green-600); text-decoration: none; white-space: nowrap;">
                                                 {label}
                                             </a>
                                         }
@@ -1374,7 +1382,7 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                         })
                     })}
                 </div>
-                <div style="font-size: .75rem; color: #64748b; white-space: nowrap;">
+                <div style="font-size: .75rem; color: var(--color-sky-700); white-space: nowrap;">
                     {if probed_init { "✓ Init segment fetched" } else { "" }}
                 </div>
             </div>
@@ -1382,7 +1390,8 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
             {(!notes.is_empty()).then(|| {
                 let notes2 = notes.clone();
                 view! {
-                    <div style="margin-bottom: 16px; padding: 12px 16px; \
+                    <div style="margin-bottom: calc(var(--spacing) * 4); \
+                                padding: calc(var(--spacing) * 3) calc(var(--spacing) * 4); \
                                 background: rgba(245,158,11,.1); border: 1px solid rgba(245,158,11,.35); \
                                 border-radius: 8px; font-size: .8rem; color: #d97706;">
                         {notes2.iter().map(|n| view! { <div>{format!("ⓘ {}", n)}</div> }).collect::<Vec<_>>()}
@@ -1452,10 +1461,10 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                         {show_subs.then(|| view! {
                             <div>
                                 <SectionTitle label="📝 Subtitles & Captions" />
-                                <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px 18px; margin-bottom: 28px;">
+                                <div style="background: var(--color-sky-50); border: 1px solid var(--color-sky-200); border-radius: 10px; padding: calc(var(--spacing) * 4) calc(var(--spacing) * 4.5); margin-bottom: calc(var(--spacing) * 7);">
                                     {if subs.is_empty() && caps.is_empty() {
                                         view! {
-                                            <div style="font-size: .82rem; color: #64748b; font-style: italic;">
+                                            <div style="font-size: .82rem; color: var(--color-sky-700); font-style: italic;">
                                                 "No subtitle or caption tracks found in this stream."
                                             </div>
                                         }.into_any()
@@ -1464,9 +1473,9 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                                             <div>
                                                 {(s_sub_tracks && !subs.is_empty()).then(|| view! {
                                                     <div style="margin-bottom: 10px;">
-                                                        <div style="font-size: .75rem; font-weight: 700; color: #64748b; text-transform: uppercase; margin-bottom: 6px;">"Subtitles"</div>
+                                                        <div style="font-size: .75rem; font-weight: 700; color: var(--color-sky-700); text-transform: uppercase; margin-bottom: calc(var(--spacing) * 1.5);">"Subtitles"</div>
                                                         {subs.iter().map(|s| view! {
-                                                            <div style="font-size: .82rem; color: #1e293b; margin-bottom: 3px;">
+                                                            <div style="font-size: .82rem; color: var(--color-sky-950); margin-bottom: calc(var(--spacing) * 0.75);">
                                                                 {format!("{} — lang: {} {}", s.name, s.language.as_deref().unwrap_or("—"), if s.is_default { "(default)" } else { "" })}
                                                             </div>
                                                         }).collect::<Vec<_>>()}
@@ -1474,9 +1483,9 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                                                 })}
                                                 {(s_cap_tracks && !caps.is_empty()).then(|| view! {
                                                     <div>
-                                                        <div style="font-size: .75rem; font-weight: 700; color: #64748b; text-transform: uppercase; margin-bottom: 6px;">"Closed Captions"</div>
+                                                        <div style="font-size: .75rem; font-weight: 700; color: var(--color-sky-700); text-transform: uppercase; margin-bottom: calc(var(--spacing) * 1.5);">"Closed Captions"</div>
                                                         {caps.iter().map(|c| view! {
-                                                            <div style="font-size: .82rem; color: #1e293b; margin-bottom: 3px;">
+                                                            <div style="font-size: .82rem; color: var(--color-sky-950); margin-bottom: calc(var(--spacing) * 0.75);">
                                                                 {format!("{} (group: {}) — lang: {} {}", c.name, c.group_id, c.language.as_deref().unwrap_or("—"), if c.is_default { "(default)" } else { "" })}
                                                             </div>
                                                         }).collect::<Vec<_>>()}
@@ -1500,7 +1509,7 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                                         {if drm.is_empty() {
                                             view! {
                                                 <InfoRow label="DRM systems (PSSH)">
-                                                    <span style="color: #64748b; font-style: italic;">
+                                                    <span style="color: var(--color-sky-700); font-style: italic;">
                                                         {if probed_init { "None found (no PSSH or known KEYFORMAT)" } else { "Init segment not probed" }}
                                                     </span>
                                                 </InfoRow>
@@ -1510,9 +1519,9 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                                                 <InfoRow label="DRM systems (PSSH)">
                                                     <div>
                                                         {drm.iter().map(|d| view! {
-                                                            <div style="font-size: .8rem; margin-bottom: 3px;">
+                                                            <div style="font-size: .8rem; margin-bottom: calc(var(--spacing) * 0.75);">
                                                                 <b>{d.system_name.clone()}</b>
-                                                                <span style="color: #64748b; font-family: monospace; font-size: .72rem;">
+                                                                <span style="color: var(--color-sky-700); font-family: monospace; font-size: .72rem;">
                                                                     {format!(" — {}", d.system_id)}
                                                                 </span>
                                                             </div>
@@ -1553,10 +1562,10 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
 #[component]
 fn SectionTitle(label: &'static str) -> impl IntoView {
     view! {
-        <div style="font-size: 1rem; font-weight: 700; color: #64748b; text-transform: uppercase; \
-                    letter-spacing: .08em; margin-bottom: 12px; display: flex; align-items: center; gap: 8px;">
+        <div style="font-size: 1rem; font-weight: 700; color: var(--color-sky-700); text-transform: uppercase; \
+                    letter-spacing: .08em; margin-bottom: calc(var(--spacing) * 3); display: flex; align-items: center; gap: calc(var(--spacing) * 2);">
             {label}
-            <span style="flex: 1; height: 1px; background: #e2e8f0;"></span>
+            <span style="flex: 1; height: 1px; background: var(--color-sky-200);"></span>
         </div>
     }
 }
@@ -1564,9 +1573,9 @@ fn SectionTitle(label: &'static str) -> impl IntoView {
 #[component]
 fn ProbeSection(title: &'static str, show: bool, children: Children) -> impl IntoView {
     show.then(|| view! {
-        <div style="margin-bottom: 28px;">
+        <div style="margin-bottom: calc(var(--spacing) * 7);">
             <SectionTitle label=title />
-            <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px 18px;">
+            <div style="background: var(--color-sky-50); border: 1px solid var(--color-sky-200); border-radius: 10px; padding: calc(var(--spacing) * 4) calc(var(--spacing) * 4.5);">
                 {children()}
             </div>
         </div>
@@ -1578,13 +1587,13 @@ fn ProbeRow(label: &'static str, value: Option<String>, show: bool) -> impl Into
     show.then(|| {
         let display = value.filter(|v| !v.is_empty()).unwrap_or_else(|| "—".into());
         view! {
-            <div style="display: flex; gap: 12px; padding: 5px 0; \
-                        border-bottom: 1px solid #f1f5f9; align-items: baseline; flex-wrap: wrap;">
+            <div style="display: flex; gap: calc(var(--spacing) * 3); padding: calc(var(--spacing) * 1.25) 0; \
+                        border-bottom: 1px solid var(--color-sky-100); align-items: baseline; flex-wrap: wrap;">
                 <span style="min-width: 200px; font-size: .78rem; font-weight: 600; \
-                             color: #475569; flex-shrink: 0;">
+                             color: var(--color-sky-700); flex-shrink: 0;">
                     {label}
                 </span>
-                <span style="font-size: .82rem; color: #1e293b; font-family: ui-monospace, monospace;">
+                <span style="font-size: .82rem; color: var(--color-sky-950); font-family: ui-monospace, monospace;">
                     {display}
                 </span>
             </div>
@@ -1595,13 +1604,13 @@ fn ProbeRow(label: &'static str, value: Option<String>, show: bool) -> impl Into
 #[component]
 fn InfoRow(label: &'static str, children: Children) -> impl IntoView {
     view! {
-        <div style="display: flex; gap: 12px; padding: 5px 0; \
-                    border-bottom: 1px solid #f1f5f9; align-items: baseline; flex-wrap: wrap;">
+        <div style="display: flex; gap: calc(var(--spacing) * 3); padding: calc(var(--spacing) * 1.25) 0; \
+                    border-bottom: 1px solid var(--color-sky-100); align-items: baseline; flex-wrap: wrap;">
             <span style="min-width: 200px; font-size: .78rem; font-weight: 600; \
-                         color: #475569; flex-shrink: 0;">
+                         color: var(--color-sky-700); flex-shrink: 0;">
                 {label}
             </span>
-            <div style="font-size: .82rem; color: #1e293b;">{children()}</div>
+            <div style="font-size: .82rem; color: var(--color-sky-950);">{children()}</div>
         </div>
     }
 }
@@ -1682,16 +1691,16 @@ fn VideoTable(mut tracks: Vec<VideoTrackInfo>, selected: HashSet<String>) -> imp
 
     view! {
         // Outer wrapper: relative so the scroll-hint overlay is clipped to the table bounds
-        <div style="position: relative; margin-bottom: 28px;">
-            <div style="overflow-x: auto; border: 1px solid #e2e8f0; border-radius: 10px;">
+        <div style="position: relative; margin-bottom: calc(var(--spacing) * 7);">
+            <div style="overflow-x: auto; border: 1px solid var(--color-sky-200); border-radius: 10px;">
                 <table style="width: 100%; border-collapse: collapse; font-size: .82rem;">
                     <thead>
                         <tr>
                             {headers.into_iter().map(|h| view! {
-                                <th style="text-align: left; padding: 9px 14px; \
-                                           background: #f1f5f9; \
-                                           border-bottom: 2px solid #e2e8f0; \
-                                           font-size: .7rem; font-weight: 700; color: #475569; \
+                                <th style="text-align: left; padding: calc(var(--spacing) * 2.25) calc(var(--spacing) * 3.5); \
+                                           background: var(--color-sky-100); \
+                                           border-bottom: 2px solid var(--color-sky-200); \
+                                           font-size: .7rem; font-weight: 700; color: var(--color-sky-700); \
                                            text-transform: uppercase; letter-spacing: .07em; \
                                            white-space: nowrap;">
                                     {h}
@@ -1701,13 +1710,13 @@ fn VideoTable(mut tracks: Vec<VideoTrackInfo>, selected: HashSet<String>) -> imp
                     </thead>
                     <tbody>
                         {table_rows.into_iter().enumerate().map(|(ri, row)| {
-                            let bg = if ri % 2 == 0 { "#ffffff" } else { "#f8fafc" };
+                            let bg = if ri % 2 == 0 { "var(--color-white)" } else { "var(--color-sky-50)" };
                             view! {
                                 <tr style=format!("background: {}; transition: background .1s;", bg)>
                                     {row.into_iter().map(|val| view! {
-                                        <td style="padding: 8px 14px; \
-                                                   border-bottom: 1px solid #f1f5f9; \
-                                                   color: #1e293b; \
+                                        <td style="padding: calc(var(--spacing) * 2) calc(var(--spacing) * 3.5); \
+                                                   border-bottom: 1px solid var(--color-sky-100); \
+                                                   color: var(--color-sky-950); \
                                                    font-family: ui-monospace, monospace; \
                                                    white-space: nowrap; vertical-align: middle;">
                                             {val}
@@ -1724,16 +1733,16 @@ fn VideoTable(mut tracks: Vec<VideoTrackInfo>, selected: HashSet<String>) -> imp
             // pointer-events: none so it never blocks scroll or click interactions.
             <div style="position: absolute; right: 1px; top: 1px; height: 38px; width: 52px; \
                         border-radius: 0 10px 0 0; pointer-events: none; \
-                        background: linear-gradient(to right, transparent, rgba(241,245,249,0.96)); \
+                        background: linear-gradient(to right, transparent, color-mix(in srgb, var(--color-sky-100) 96%, transparent)); \
                         display: flex; align-items: center; justify-content: flex-end; \
-                        padding-right: 7px;">
+                        padding-right: calc(var(--spacing) * 1.75);">
                 <style>
                     "@keyframes hls-scroll-bounce {
                         0%, 100% { transform: translateX(0); opacity: .55; }
                         50%       { transform: translateX(4px); opacity: 1; }
                     }"
                 </style>
-                <span style="font-size: 1.25rem; color: #64748b; line-height: 1; \
+                <span style="font-size: 1.25rem; color: var(--color-sky-700); line-height: 1; \
                              user-select: none; \
                              animation: hls-scroll-bounce 1.4s ease-in-out infinite;">
                     {"›"}
@@ -1783,22 +1792,22 @@ fn AudioTable(tracks: Vec<AudioTrackInfo>, selected: HashSet<String>) -> impl In
         .collect();
 
     view! {
-        <div style="overflow-x: auto; margin-bottom: 28px; \
-                    border: 1px solid #e2e8f0; border-radius: 10px;">
+        <div style="overflow-x: auto; margin-bottom: calc(var(--spacing) * 7); \
+                    border: 1px solid var(--color-sky-200); border-radius: 10px;">
             <table style="width: 100%; border-collapse: collapse; font-size: .82rem;">
                 <thead>
                     <tr>
-                        <th style="text-align: left; padding: 9px 14px; \
-                                   background: #f1f5f9; border-bottom: 2px solid #e2e8f0; \
-                                   font-size: .7rem; font-weight: 700; color: #475569; \
+                        <th style="text-align: left; padding: calc(var(--spacing) * 2.25) calc(var(--spacing) * 3.5); \
+                                   background: var(--color-sky-100); border-bottom: 2px solid var(--color-sky-200); \
+                                   font-size: .7rem; font-weight: 700; color: var(--color-sky-700); \
                                    text-transform: uppercase; letter-spacing: .07em; \
                                    white-space: nowrap;">
                             "Track"
                         </th>
                         {headers.into_iter().map(|h| view! {
-                            <th style="text-align: left; padding: 9px 14px; \
-                                       background: #f1f5f9; border-bottom: 2px solid #e2e8f0; \
-                                       font-size: .7rem; font-weight: 700; color: #475569; \
+                            <th style="text-align: left; padding: calc(var(--spacing) * 2.25) calc(var(--spacing) * 3.5); \
+                                       background: var(--color-sky-100); border-bottom: 2px solid var(--color-sky-200); \
+                                       font-size: .7rem; font-weight: 700; color: var(--color-sky-700); \
                                        text-transform: uppercase; letter-spacing: .07em; \
                                        white-space: nowrap;">
                                 {h}
@@ -1808,33 +1817,33 @@ fn AudioTable(tracks: Vec<AudioTrackInfo>, selected: HashSet<String>) -> impl In
                 </thead>
                 <tbody>
                     {table_rows.into_iter().enumerate().map(|(ri, (name, is_default, bitrate_bps, row))| {
-                        let bg = if ri % 2 == 0 { "#ffffff" } else { "#f8fafc" };
+                        let bg = if ri % 2 == 0 { "var(--color-white)" } else { "var(--color-sky-50)" };
                         view! {
                             <tr style=format!("background: {}; transition: background .1s;", bg)>
-                                <td style="padding: 8px 14px; border-bottom: 1px solid #f1f5f9; \
+                                <td style="padding: calc(var(--spacing) * 2) calc(var(--spacing) * 3.5); border-bottom: 1px solid var(--color-sky-100); \
                                            white-space: nowrap; vertical-align: middle;">
                                     <div style="display: flex; align-items: center; gap: 6px;">
-                                        <span style="font-size: .82rem; font-weight: 600; color: #1e293b;">
+                                        <span style="font-size: .82rem; font-weight: 600; color: var(--color-sky-950);">
                                             {name}
                                         </span>
                                         {is_default.then(|| view! {
-                                            <span style="font-size: .65rem; color: #22c55e; font-weight: 700; \
+                                            <span style="font-size: .65rem; color: var(--color-green-600); font-weight: 700; \
                                                          background: rgba(34,197,94,.1); \
                                                          border: 1px solid rgba(34,197,94,.3); \
-                                                         border-radius: 4px; padding: 1px 5px;">
+                                                         border-radius: 4px; padding: var(--spacing) calc(var(--spacing) * 1.25);">
                                                 "DEFAULT"
                                             </span>
                                         })}
                                         {bitrate_bps.map(|bps| view! {
-                                            <span style="font-size: .72rem; color: #94a3b8;">
+                                            <span style="font-size: .72rem; color: var(--color-sky-300);">
                                                 {format!("({})", fmt_bps(bps))}
                                             </span>
                                         })}
                                     </div>
                                 </td>
                                 {row.into_iter().map(|val| view! {
-                                    <td style="padding: 8px 14px; border-bottom: 1px solid #f1f5f9; \
-                                               color: #1e293b; font-family: ui-monospace, monospace; \
+                                    <td style="padding: calc(var(--spacing) * 2) calc(var(--spacing) * 3.5); border-bottom: 1px solid var(--color-sky-100); \
+                                               color: var(--color-sky-950); font-family: ui-monospace, monospace; \
                                                white-space: nowrap; vertical-align: middle;">
                                         {val}
                                     </td>
