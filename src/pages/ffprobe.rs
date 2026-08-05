@@ -1,8 +1,9 @@
 use crate::utils::{
+    href::playlist_href,
     mp4_atom_properties::{AtomPropertyValue, get_properties},
     network::{FetchError, fetch_array_buffer, fetch_text},
-    query_codec::percent_encode,
 };
+use url::Url;
 use leptos::prelude::*;
 use mp4_atom::{Header, ReadFrom};
 use quick_m3u8::{
@@ -13,9 +14,6 @@ use std::{collections::HashSet, io::Cursor};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Base URL for the HLS manifest viewer — used for all playlist links.
-const MANIFEST_VIEWER_BASE: &str =
-    "https://therealrobg.github.io/hls-manifest-viewer/?playlist_url=";
 
 // ── Data types ───────────────────────────────────────────────────────────────
 
@@ -1111,20 +1109,18 @@ pub fn Ffprobe() -> impl IntoView {
 
     view! {
         <div class="body-content" style="max-width: min(96vw, 1440px); margin-bottom: 2em;">
-            <div style="text-align: center; margin-bottom: 2em;">
-                <h1 style="font-size: 2.4rem; font-weight: 800; margin-bottom: 12px; \
-                           background: linear-gradient(90deg, #0f172a, #0ea5e9); \
-                           -webkit-background-clip: text; -webkit-text-fill-color: transparent; \
-                           background-clip: text;">
-                    "Stream Inspector"
-                </h1>
-                <p style="color: #64748b; font-size: 1rem; line-height: 1.6; \
-                          max-width: 620px; margin: 0 auto;">
-                    "Enter an HLS stream URL. Choose the checks you want, then click Probe. \
-                     Checks marked \u{201c}(init seg)\u{201d} will fetch the first init segment \u{2014} \
-                     these work even on encrypted streams because init segments carry \
-                     unencrypted codec and DRM metadata."
-                </p>
+            <div>
+                <div class="body-content">
+                    <h1 class="body-content">
+                        "Stream Inspector"
+                    </h1>
+                    <p class="body-content body-text">
+                        "Enter an HLS stream URL. Choose the checks you want, then click Probe. \
+                         Checks marked \u{201c}(init seg)\u{201d} will fetch the first init segment \u{2014} \
+                         these work even on encrypted streams because init segments carry \
+                         unencrypted codec and DRM metadata."
+                    </p>
+                </div>
             </div>
 
             // ── Input card ──────────────────────────────────────────────────
@@ -1306,7 +1302,7 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                     <div style="margin-bottom: 6px;">
                         <span style="font-size: .72rem; font-weight: 600; color: #64748b; text-transform: uppercase; \
                                      letter-spacing: .05em; margin-right: 8px;">"Multivariant Playlist"</span>
-                        <a href={format!("{}{}", MANIFEST_VIEWER_BASE, percent_encode(&url))}
+                        <a href={Url::parse(&url).ok().and_then(|b| playlist_href(b, "", &Default::default())).unwrap_or_default()}
                            target="_blank"
                            style="font-size: .75rem; color: #0ea5e9; word-break: break-all; text-decoration: none; \
                                   border-bottom: 1px dotted #0ea5e9;"
@@ -1338,7 +1334,7 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                                              letter-spacing: .05em;">"Variant Playlists (init segments)"</span>
                                 <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px;">
                                     {links.into_iter().map(|(label, uri)| {
-                                        let href = format!("{}{}", MANIFEST_VIEWER_BASE, percent_encode(&uri));
+                                        let href = Url::parse(&uri).ok().and_then(|b| playlist_href(b, "", &Default::default())).unwrap_or_default();
                                         view! {
                                             <a href={href} target="_blank"
                                                style="font-size: .72rem; background: rgba(56,189,248,.12); \
@@ -1363,7 +1359,7 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                                              letter-spacing: .05em;">"Audio Playlists"</span>
                                 <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px;">
                                     {links.into_iter().map(|(label, uri)| {
-                                        let href = format!("{}{}", MANIFEST_VIEWER_BASE, percent_encode(&uri));
+                                        let href = Url::parse(&uri).ok().and_then(|b| playlist_href(b, "", &Default::default())).unwrap_or_default();
                                         view! {
                                             <a href={href} target="_blank"
                                                style="font-size: .72rem; background: rgba(16,185,129,.1); \
