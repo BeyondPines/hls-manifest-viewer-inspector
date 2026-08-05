@@ -145,36 +145,36 @@ pub fn Validate() -> impl IntoView {
 
     view! {
         <div class="body-content" style="margin-bottom: 2em;">
-            <h1 style="font-size: 2rem; font-weight: 800; margin-bottom: 8px; background: linear-gradient(90deg, #0f172a, #0ea5e9); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;">
+            <h1 class="body-content">
                 "Validate HLS streams instantly"
             </h1>
-            <p style="color: #64748b; font-size: 1rem; margin-bottom: 1.5em; max-width: 560px; line-height: 1.6;">
+            <p class="body-content body-text">
                 "Enter a master playlist URL to run 20+ compliance checks against RFC 8216 and the HLS bis draft — structural integrity, alignment, LL-HLS, encryption and more."
             </p>
-            <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 28px; box-shadow: 0 2px 12px rgba(0,0,0,.06);">
+            <div style="background: var(--color-white); border: 1px solid var(--color-sky-200); border-radius: 12px; padding: calc(var(--spacing) * 7); box-shadow: 0 2px 12px rgba(0,0,0,.06); margin-top: calc(var(--spacing) * 6);">
                 <form on:submit=on_submit>
-                    <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                    <div style="display: flex; gap: calc(var(--spacing) * 2.5); flex-wrap: wrap;">
                         <input
                             type="url"
                             placeholder="https://example.com/stream/master.m3u8"
-                            style="flex: 1; min-width: 260px; background: #f8fafc; border: 1.5px solid #cbd5e1; border-radius: 8px; color: #1e293b; font-size: 1rem; padding: 12px 16px; outline: none;"
+                            style="flex: 1; min-width: 260px; background: var(--color-sky-50); border: 1.5px solid var(--color-sky-200); border-radius: 8px; color: var(--color-sky-950); font-size: 1rem; padding: calc(var(--spacing) * 3) calc(var(--spacing) * 4); outline: none;"
                             prop:value=move || url_input.get()
                             on:input=move |ev| set_url_input.set(event_target_value(&ev))
                         />
                         <button
                             type="submit"
-                            style="background: linear-gradient(135deg, #38bdf8, #0ea5e9); color: #fff; border: none; border-radius: 8px; padding: 12px 28px; font-size: 1rem; font-weight: 700; cursor: pointer; white-space: nowrap;"
+                            style="background: linear-gradient(135deg, var(--color-sky-300), var(--color-sky-500)); color: var(--color-white); border: none; border-radius: 8px; padding: calc(var(--spacing) * 3) calc(var(--spacing) * 7); font-size: 1rem; font-weight: 700; cursor: pointer; white-space: nowrap;"
                             disabled=move || loading.get()
                         >
                             {move || if loading.get() { "⏳ Validating..." } else { "▶ Validate" }}
                         </button>
                     </div>
                     // Options row
-                    <div style="display: flex; flex-wrap: wrap; gap: 20px; margin-top: 18px; align-items: center;">
-                        <div style="display: flex; align-items: center; gap: 8px; font-size: .875rem; color: #64748b;">
+                    <div style="display: flex; flex-wrap: wrap; gap: calc(var(--spacing) * 5); margin-top: calc(var(--spacing) * 4.5); align-items: center;">
+                        <div style="display: flex; align-items: center; gap: calc(var(--spacing) * 2); font-size: .875rem; color: var(--color-sky-700);">
                             <label>"Tolerance"</label>
                             <input type="number"
-                                style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; color: #1e293b; padding: 5px 10px; width: 80px; font-size: .875rem; outline: none;"
+                                style="background: var(--color-sky-50); border: 1px solid var(--color-sky-200); border-radius: 6px; color: var(--color-sky-950); padding: calc(var(--spacing) * 1.25) calc(var(--spacing) * 2.5); width: 80px; font-size: .875rem; outline: none;"
                                 prop:value=move || tolerance.get().to_string()
                                 on:input=move |ev| {
                                     if let Ok(v) = event_target_value(&ev).parse::<f64>() {
@@ -192,7 +192,7 @@ pub fn Validate() -> impl IntoView {
                             );
                             view! {
                                 <a href=viewer_url target="_blank" rel="noopener noreferrer"
-                                    style="display: inline-flex; align-items: center; gap: 6px; font-size: .82rem; font-weight: 700; color: #fff; background: linear-gradient(135deg, #38bdf8, #0ea5e9); border-radius: 6px; padding: 7px 14px; text-decoration: none; white-space: nowrap; margin-left: auto;">
+                                    style="display: inline-flex; align-items: center; gap: calc(var(--spacing) * 1.5); font-size: .82rem; font-weight: 700; color: var(--color-white); background: linear-gradient(135deg, var(--color-sky-300), var(--color-sky-500)); border-radius: 6px; padding: calc(var(--spacing) * 1.75) calc(var(--spacing) * 3.5); text-decoration: none; white-space: nowrap; margin-left: auto;">
                                     "🔗 Inspect the manifest"
                                 </a>
                             }
@@ -200,15 +200,15 @@ pub fn Validate() -> impl IntoView {
                     </div>
                 </form>
                 {move || loading.get().then(|| view! {
-                    <div style="margin-top: 12px;">
-                        <div style="height: 3px; background: #e2e8f0; border-radius: 2px; overflow: hidden;">
-                            <div style="width: 40%; height: 100%; background: linear-gradient(90deg, #38bdf8, #0ea5e9); animation: progress 1.5s ease-in-out infinite; border-radius: 2px;"></div>
+                    <div style="margin-top: calc(var(--spacing) * 3);">
+                        <div style="height: 3px; background: var(--color-sky-200); border-radius: 2px; overflow: hidden;">
+                            <div style="width: 40%; height: 100%; background: linear-gradient(90deg, var(--color-sky-300), var(--color-sky-500)); animation: progress 1.5s ease-in-out infinite; border-radius: 2px;"></div>
                         </div>
-                        <div style="font-size: .85rem; color: #64748b; margin-top: 6px;">"Fetching playlists and running checks…"</div>
+                        <div style="font-size: .85rem; color: var(--color-sky-700); margin-top: calc(var(--spacing) * 1.5);">"Fetching playlists and running checks…"</div>
                     </div>
                 })}
                 {move || error_msg.get().map(|e| view! {
-                    <div style="margin-top: 12px; padding: 14px 18px; background: rgba(239,68,68,.15); border: 1px solid #ef4444; border-radius: 8px; color: #fca5a5; font-size: .9rem;">
+                    <div style="margin-top: calc(var(--spacing) * 3); padding: calc(var(--spacing) * 3.5) calc(var(--spacing) * 4.5); background: rgba(239,68,68,.15); border: 1px solid var(--color-red-400); border-radius: 8px; color: var(--color-red-400); font-size: .9rem;">
                         {format!("⚠ {}", e)}
                     </div>
                 })}
@@ -252,7 +252,7 @@ fn ValidationResults(report: ValidationReport) -> impl IntoView {
                 rendition_count=rend_count elapsed_ms=elapsed />
 
             // Stats row — flex so all cards stay on one line
-            <div style="display: flex; flex-wrap: nowrap; gap: 12px; margin-bottom: 28px;">
+            <div style="display: flex; flex-wrap: nowrap; gap: calc(var(--spacing) * 3); margin-bottom: calc(var(--spacing) * 7);">
                 <StatCard value=rend_count.to_string() label="Renditions" color="#60a5fa" />
                 <StatCard value=errors.to_string() label="Errors" color=error_color />
                 <StatCard value=warnings.to_string() label="Warnings" color=warn_color />
@@ -291,7 +291,7 @@ fn ValidationResults(report: ValidationReport) -> impl IntoView {
             })}
             {(!has_deltas).then(|| view! {
                 <SectionTitle label="⏩ Playlist Delta Updates" />
-                <div style="color: #64748b; font-size: .88rem; margin-bottom: 28px; padding: 14px 18px; background: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0;">
+                <div style="color: var(--color-sky-700); font-size: .88rem; margin-bottom: calc(var(--spacing) * 7); padding: calc(var(--spacing) * 3.5) calc(var(--spacing) * 4.5); background: var(--color-sky-50); border-radius: 8px; border: 1px solid var(--color-sky-200);">
                     "No renditions advertise CAN-SKIP-UNTIL — Playlist Delta Updates are not offered by this stream."
                 </div>
             })}
@@ -300,9 +300,9 @@ fn ValidationResults(report: ValidationReport) -> impl IntoView {
             <SectionTitle label="🔍 Check Results" />
             <CheckResultsTable groups=check_groups has_interstitials_data=has_interstitials_data renditions=renditions.clone() />
 
-            <div style="text-align: center; padding: 32px 20px 0; font-size: .8rem; color: #64748b;">
+            <div style="text-align: center; padding: calc(var(--spacing) * 8) calc(var(--spacing) * 5) 0; font-size: .8rem; color: var(--color-sky-700);">
                 "HLS Validator · Based on "
-                <a href="https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis" target="_blank" style="color: #38bdf8;">
+                <a href="https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis" target="_blank" style="color: var(--color-sky-500);">
                     "draft-pantos-hls-rfc8216bis"
                 </a>
                 " & RFC 8216"
@@ -353,7 +353,7 @@ fn ResultBanner(is_pass: bool, errors: usize, warnings: usize, rendition_count: 
                 <div style=format!("font-size: 1.6rem; font-weight: 800; color: {};", title_color)>
                     {label}
                 </div>
-                <div style="font-size: .9rem; color: #64748b;">
+                <div style="font-size: .9rem; color: var(--color-sky-700);">
                     {format!("{} rendition{} analysed · {} error{} · {} warning{}",
                         rendition_count, if rendition_count != 1 { "s" } else { "" },
                         errors, if errors != 1 { "s" } else { "" },
@@ -361,7 +361,7 @@ fn ResultBanner(is_pass: bool, errors: usize, warnings: usize, rendition_count: 
                     )}
                 </div>
             </div>
-            <div style="margin-left: auto; text-align: right; font-size: .8rem; color: #64748b;">
+            <div style="margin-left: auto; text-align: right; font-size: .8rem; color: var(--color-sky-700);">
                 {format!("Completed in {}ms", elapsed_ms)}
             </div>
         </div>
@@ -373,9 +373,9 @@ fn ResultBanner(is_pass: bool, errors: usize, warnings: usize, rendition_count: 
 #[component]
 fn SectionTitle(label: &'static str) -> impl IntoView {
     view! {
-        <div style="font-size: 1rem; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 12px; display: flex; align-items: center; gap: 8px;">
+        <div style="font-size: 1rem; font-weight: 700; color: var(--color-sky-700); text-transform: uppercase; letter-spacing: .08em; margin-bottom: calc(var(--spacing) * 3); display: flex; align-items: center; gap: calc(var(--spacing) * 2);">
             {label}
-            <span style="flex: 1; height: 1px; background: #e2e8f0;"></span>
+            <span style="flex: 1; height: 1px; background: var(--color-sky-200);"></span>
         </div>
     }
 }
@@ -386,13 +386,13 @@ fn SectionTitle(label: &'static str) -> impl IntoView {
 fn StatCard(value: String, label: &'static str, color: &'static str) -> impl IntoView {
     view! {
         <div style=format!(
-            "flex: 1; min-width: 100px; padding: 16px 20px; background: #f8fafc; \
-             border: 1px solid #e2e8f0; border-radius: 12px; text-align: center;"
+            "flex: 1; min-width: 100px; padding: calc(var(--spacing) * 4) calc(var(--spacing) * 5); background: var(--color-sky-50); \
+             border: 1px solid var(--color-sky-200); border-radius: 12px; text-align: center;"
         )>
             <div style=format!("font-size: 1.5rem; font-weight: 700; color: {};", color)>
                 {value}
             </div>
-            <div style="font-size: .8rem; color: #64748b; margin-top: 2px;">{label}</div>
+            <div style="font-size: .8rem; color: var(--color-sky-700); margin-top: calc(var(--spacing) * 0.5);">{label}</div>
         </div>
     }
 }
@@ -409,10 +409,10 @@ fn RenditionsTable(renditions: Vec<Rendition>) -> impl IntoView {
         a.bandwidth.cmp(&b.bandwidth)
     });
 
-    let th_style = "padding: 4px 12px 8px; font-size: .72rem; color: #64748b; text-transform: uppercase; letter-spacing: .07em; text-align: left; font-weight: 600;";
+    let th_style = "padding: var(--spacing) calc(var(--spacing) * 3) calc(var(--spacing) * 2); font-size: .72rem; color: var(--color-sky-700); text-transform: uppercase; letter-spacing: .07em; text-align: left; font-weight: 600;";
 
     view! {
-        <div style="overflow-x: auto; margin-bottom: 28px;">
+        <div style="overflow-x: auto; margin-bottom: calc(var(--spacing) * 7);">
             <table style="width: 100%; border-collapse: separate; border-spacing: 0 4px;">
                 <thead>
                     <tr>
@@ -466,7 +466,7 @@ fn RenditionsTable(renditions: Vec<Rendition>) -> impl IntoView {
                             view! { <span>"—"</span> }.into_any()
                         };
 
-                        let td_style = "padding: 10px 12px; vertical-align: middle; background: #f8fafc;";
+                        let td_style = "padding: calc(var(--spacing) * 2.5) calc(var(--spacing) * 3); vertical-align: middle; background: var(--color-sky-50);";
 
                         view! {
                             <tr style="transition: background .15s;">
@@ -476,12 +476,12 @@ fn RenditionsTable(renditions: Vec<Rendition>) -> impl IntoView {
                                 <td style=td_style>
                                     <div style="font-weight: 600; font-size: .9rem; word-break: break-all;">
                                         <a href=viewer_url target="_blank" rel="noopener noreferrer"
-                                           style="color: #38bdf8; font-size: .8rem; font-weight: 600; display: inline-flex; align-items: center; gap: 5px; border: 1px solid rgba(56,189,248,.3); border-radius: 5px; padding: 4px 10px; background: rgba(56,189,248,.06); text-decoration: none;">
+                                           style="color: var(--color-sky-500); font-size: .8rem; font-weight: 600; display: inline-flex; align-items: center; gap: calc(var(--spacing) * 1.25); border: 1px solid rgba(56,189,248,.3); border-radius: 5px; padding: var(--spacing) calc(var(--spacing) * 2.5); background: rgba(56,189,248,.06); text-decoration: none;">
                                             {rn.name.clone()}
                                         </a>
                                     </div>
                                     {(!group_id.is_empty()).then(|| view! {
-                                        <div style="font-size: .75rem; color: #64748b; margin-top: 2px;">
+                                        <div style="font-size: .75rem; color: var(--color-sky-700); margin-top: calc(var(--spacing) * 0.5);">
                                             {format!("{}: {}", group_label, group_id)}
                                         </div>
                                     })}
@@ -546,8 +546,8 @@ fn InterstitialTimeline(interstitials: Vec<Interstitial>, renditions: Vec<Rendit
     let note = if has_offsets { "" } else { " (relative timing)" };
 
     view! {
-        <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 18px 20px; margin-bottom: 16px;">
-            <div style="font-size: .78rem; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 12px;">
+        <div style="background: var(--color-sky-50); border: 1px solid var(--color-sky-200); border-radius: 10px; padding: calc(var(--spacing) * 4.5) calc(var(--spacing) * 5); margin-bottom: calc(var(--spacing) * 4);">
+            <div style="font-size: .78rem; font-weight: 700; color: var(--color-sky-700); text-transform: uppercase; letter-spacing: .06em; margin-bottom: calc(var(--spacing) * 3);">
                 {format!("🎬 Interstitial Timeline — {} event{} · {} total{}", unique_len, if unique_len != 1 { "s" } else { "" }, total_dur_fmt, note)}
             </div>
             // Above-track markers — clickable <a> tags opening primary playlist in manifest viewer
@@ -584,7 +584,7 @@ fn InterstitialTimeline(interstitials: Vec<Interstitial>, renditions: Vec<Rendit
                 }).collect::<Vec<_>>()}
             </div>
             // Track bar with resume-offset spans
-            <div style="position: relative; height: 28px; border-radius: 6px; overflow: visible; background: rgba(148,163,184,.06); border: 1px solid #e2e8f0;">
+            <div style="position: relative; height: 28px; border-radius: 6px; overflow: visible; background: rgba(148,163,184,.06); border: 1px solid var(--color-sky-200);">
                 {unique.iter().filter_map(|it| {
                     let off = it.start_offset_s.unwrap_or(0.0);
                     let left_pct = (off / total_dur * 100.0).min(99.5);
@@ -616,13 +616,13 @@ fn InterstitialTimeline(interstitials: Vec<Interstitial>, renditions: Vec<Rendit
                 {ticks.into_iter().map(|(pct, label)| view! {
                     <span style=format!(
                         "position: absolute; left: {:.2}%; transform: translateX(-50%); \
-                         font-size: .68rem; color: #64748b; white-space: nowrap;",
+                         font-size: .68rem; color: var(--color-sky-700); white-space: nowrap;",
                         pct
                     )>{label}</span>
                 }).collect::<Vec<_>>()}
             </div>
             // Legend
-            <div style="display: flex; gap: 14px; margin-top: 10px; font-size: .73rem; color: #64748b; flex-wrap: wrap;">
+            <div style="display: flex; gap: calc(var(--spacing) * 3.5); margin-top: calc(var(--spacing) * 2.5); font-size: .73rem; color: var(--color-sky-700); flex-wrap: wrap;">
                 <span><span style="display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 4px; vertical-align: middle; background: rgba(168,85,247,.6);"></span>"Interstitial (X-PLAYOUT-LIMIT) · click to open playlist"</span>
                 <span><span style="display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 4px; vertical-align: middle; background: rgba(234,179,8,.6);"></span>"Content consumed (X-RESUME-OFFSET)"</span>
                 <span><span style="display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 4px; vertical-align: middle; background: rgba(239,68,68,.6);"></span>"Has validation errors"</span>
@@ -672,7 +672,7 @@ fn InterstitialsSection(interstitials: Vec<Interstitial>) -> impl IntoView {
     let unique = dedup_interstitials(interstitials);
 
     view! {
-        <div style="display: flex; flex-direction: column; gap: 10px; margin-bottom: 28px;">
+        <div style="display: flex; flex-direction: column; gap: calc(var(--spacing) * 2.5); margin-bottom: calc(var(--spacing) * 7);">
             {unique.into_iter().map(|it| {
                 let has_errors = !it.errors.is_empty();
                 let _status_cls = if has_errors { "fail" } else { "pass" };
@@ -698,12 +698,12 @@ fn InterstitialsSection(interstitials: Vec<Interstitial>) -> impl IntoView {
                 };
 
                 view! {
-                    <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px 18px;">
-                        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px;">
+                    <div style="background: var(--color-sky-50); border: 1px solid var(--color-sky-200); border-radius: 10px; padding: calc(var(--spacing) * 4) calc(var(--spacing) * 4.5);">
+                        <div style="display: flex; align-items: center; gap: calc(var(--spacing) * 2.5); flex-wrap: wrap; margin-bottom: calc(var(--spacing) * 2.5);">
                             <span style="background: rgba(56,189,248,.15); color: #38bdf8; border: 1px solid rgba(56,189,248,.3); border-radius: 6px; padding: 3px 9px; font-size: .72rem; font-weight: 700; white-space: nowrap;">
                                 "INTERSTITIAL"
                             </span>
-                            <span style="font-weight: 700; font-size: .9rem; font-family: monospace; color: #1e293b;">
+                            <span style="font-weight: 700; font-size: .9rem; font-family: monospace; color: var(--color-sky-950);">
                                 {if it.id.is_empty() { "(no id)".to_string() } else { it.id.clone() }}
                             </span>
                             <span style=format!(
@@ -714,29 +714,29 @@ fn InterstitialsSection(interstitials: Vec<Interstitial>) -> impl IntoView {
                             )>{status_label}</span>
                             {viewer_url.map(|vu| view! {
                                 <a href=vu target="_blank" rel="noopener noreferrer"
-                                    style="display: inline-flex; align-items: center; gap: 5px; font-size: .78rem; font-weight: 600; color: #38bdf8; border: 1px solid rgba(56,189,248,.3); border-radius: 5px; padding: 4px 10px; background: rgba(56,189,248,.06); text-decoration: none;">
+                                    style="display: inline-flex; align-items: center; gap: calc(var(--spacing) * 1.25); font-size: .78rem; font-weight: 600; color: var(--color-sky-500); border: 1px solid rgba(56,189,248,.3); border-radius: 5px; padding: var(--spacing) calc(var(--spacing) * 2.5); background: rgba(56,189,248,.06); text-decoration: none;">
                                     "🔗 Open asset in HLS Viewer"
                                 </a>
                             })}
                         </div>
-                        <div style="display: flex; gap: 16px; flex-wrap: wrap; font-size: .8rem; color: #64748b; margin-bottom: 8px;">
-                            <span><b style="color: #1e293b;">"Rendition"</b>{format!(" {}", it.rendition)}</span>
-                            <span><b style="color: #1e293b;">"START-DATE"</b>{format!(" {}", it.start_date)}</span>
-                            {it.snap.map(|s| view! { <span><b style="color: #1e293b;">"X-SNAP"</b>{format!(" {}", s)}</span> })}
-                            {it.resume_offset.map(|r| view! { <span><b style="color: #1e293b;">"X-RESUME-OFFSET"</b>{format!(" {}s", r)}</span> })}
-                            {it.playout_limit.map(|p| view! { <span><b style="color: #1e293b;">"X-PLAYOUT-LIMIT"</b>{format!(" {}s", p)}</span> })}
-                            {it.timeline_style.map(|t| view! { <span><b style="color: #1e293b;">"X-TIMELINE-STYLE"</b>{format!(" {}", t)}</span> })}
-                            {it.cue.map(|c| view! { <span><b style="color: #1e293b;">"X-CUE"</b>{format!(" {}", c)}</span> })}
+                        <div style="display: flex; gap: calc(var(--spacing) * 4); flex-wrap: wrap; font-size: .8rem; color: var(--color-sky-700); margin-bottom: calc(var(--spacing) * 2);">
+                            <span><b style="color: var(--color-sky-950);">"Rendition"</b>{format!(" {}", it.rendition)}</span>
+                            <span><b style="color: var(--color-sky-950);">"START-DATE"</b>{format!(" {}", it.start_date)}</span>
+                            {it.snap.map(|s| view! { <span><b style="color: var(--color-sky-950);">"X-SNAP"</b>{format!(" {}", s)}</span> })}
+                            {it.resume_offset.map(|r| view! { <span><b style="color: var(--color-sky-950);">"X-RESUME-OFFSET"</b>{format!(" {}s", r)}</span> })}
+                            {it.playout_limit.map(|p| view! { <span><b style="color: var(--color-sky-950);">"X-PLAYOUT-LIMIT"</b>{format!(" {}s", p)}</span> })}
+                            {it.timeline_style.map(|t| view! { <span><b style="color: var(--color-sky-950);">"X-TIMELINE-STYLE"</b>{format!(" {}", t)}</span> })}
+                            {it.cue.map(|c| view! { <span><b style="color: var(--color-sky-950);">"X-CUE"</b>{format!(" {}", c)}</span> })}
                         </div>
                         {asset_url.map(|url| view! {
-                            <div style="font-size: .75rem; color: #64748b; word-break: break-all; margin-top: 4px;">
+                            <div style="font-size: .75rem; color: var(--color-sky-700); word-break: break-all; margin-top: var(--spacing);">
                                 <b>{format!("{}:", asset_type)}</b>{format!(" {}", url)}
                             </div>
                         })}
                         {has_errors.then(|| view! {
                             <div style="margin-top: 8px;">
                                 {it.errors.iter().map(|e| view! {
-                                    <div style="font-size: .8rem; color: #ef4444; padding: 3px 0; display: flex; align-items: baseline; gap: 6px;">
+                                    <div style="font-size: .8rem; color: var(--color-red-400); padding: calc(var(--spacing) * 0.75) 0; display: flex; align-items: baseline; gap: calc(var(--spacing) * 1.5);">
                                         <span style="font-weight: 700; flex-shrink: 0;">"✗"</span>
                                         {e.clone()}
                                     </div>
@@ -798,50 +798,50 @@ fn Scte35Section(ad_breaks: Vec<AdBreak>, playlist_window_s: f64) -> impl IntoVi
     let breaks_for_rows = ad_breaks.clone();
 
     view! {
-        <div style="margin-bottom: 28px;">
+        <div style="margin-bottom: calc(var(--spacing) * 7);">
 
             // ── Summary bar ────────────────────────────────────────────────
-            <div style="display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px;">
-                <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 16px; font-size: .82rem; color: #64748b;">
-                    <b style="color: #1e293b;">{ad_breaks.len()}</b>
+            <div style="display: flex; flex-wrap: wrap; gap: calc(var(--spacing) * 2.5); margin-bottom: calc(var(--spacing) * 3.5);">
+                <div style="background: var(--color-sky-50); border: 1px solid var(--color-sky-200); border-radius: 8px; padding: calc(var(--spacing) * 2.5) calc(var(--spacing) * 4); font-size: .82rem; color: var(--color-sky-700);">
+                    <b style="color: var(--color-sky-950);">{ad_breaks.len()}</b>
                     {if ad_breaks.len() == 1 { " marker" } else { " markers" }}
                     " · "
-                    <b style="color: #1e293b;">{commercial_count}</b>" commercial"
+                    <b style="color: var(--color-sky-950);">{commercial_count}</b>" commercial"
                     {(open_count > 0).then(|| view! {
                         <span>" · "<b style="color: #f59e0b;">{open_count}</b>" open"</span>
                     })}
                     " · "
-                    <b style="color: #1e293b;">{closed_count}</b>" closed"
+                    <b style="color: var(--color-sky-950);">{closed_count}</b>" closed"
                 </div>
                 {(total_actual > 0.0).then(|| view! {
-                    <div style="background: rgba(234,179,8,.12); border: 1px solid rgba(234,179,8,.35); border-radius: 8px; padding: 10px 16px; font-size: .82rem; color: #64748b;">
+                    <div style="background: rgba(234,179,8,.12); border: 1px solid rgba(234,179,8,.35); border-radius: 8px; padding: calc(var(--spacing) * 2.5) calc(var(--spacing) * 4); font-size: .82rem; color: var(--color-sky-700);">
                         "Ad time consumed: "<b style="color: #d97706;">{fmt_time(total_actual)}</b>
                     </div>
                 })}
                 {(total_planned > 0.0 && (total_planned - total_actual).abs() > 1.0).then(|| view! {
-                    <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 16px; font-size: .82rem; color: #64748b;">
-                        "Planned: "<b style="color: #1e293b;">{fmt_time(total_planned)}</b>
+                    <div style="background: var(--color-sky-50); border: 1px solid var(--color-sky-200); border-radius: 8px; padding: calc(var(--spacing) * 2.5) calc(var(--spacing) * 4); font-size: .82rem; color: var(--color-sky-700);">
+                        "Planned: "<b style="color: var(--color-sky-950);">{fmt_time(total_planned)}</b>
                     </div>
                 })}
             </div>
 
             // ── Per-marker timeline ─────────────────────────────────────────
-            <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 18px 20px; margin-bottom: 16px;">
+            <div style="background: var(--color-sky-50); border: 1px solid var(--color-sky-200); border-radius: 10px; padding: calc(var(--spacing) * 4.5) calc(var(--spacing) * 5); margin-bottom: calc(var(--spacing) * 4);">
 
                 // Section label
-                <div style="font-size: .78rem; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 14px;">
+                <div style="font-size: .78rem; font-weight: 700; color: var(--color-sky-700); text-transform: uppercase; letter-spacing: .06em; margin-bottom: calc(var(--spacing) * 3.5);">
                     {format!("Markers against {} playlist window", fmt_time(window_s))}
                 </div>
 
                 // Shared time axis (top, drawn once for all rows)
-                <div style="position: relative; height: 16px; margin-bottom: 6px; border-bottom: 1px solid #e2e8f0; padding-bottom: 4px;">
+                <div style="position: relative; height: 16px; margin-bottom: calc(var(--spacing) * 1.5); border-bottom: 1px solid var(--color-sky-200); padding-bottom: var(--spacing);">
                     {ticks.iter().map(|(pct, label)| {
                         let pct = *pct;
                         let label = label.clone();
                         view! {
                             <span style=format!(
                                 "position: absolute; left: {:.2}%; transform: translateX(-50%); \
-                                 font-size: .65rem; color: #94a3b8; white-space: nowrap; user-select: none;",
+                                 font-size: .65rem; color: var(--color-sky-300); white-space: nowrap; user-select: none;",
                                 pct
                             )>{label}</span>
                         }
@@ -849,7 +849,7 @@ fn Scte35Section(ad_breaks: Vec<AdBreak>, playlist_window_s: f64) -> impl IntoVi
                 </div>
 
                 // One row per SCTE-35 marker
-                <div style="display: flex; flex-direction: column; gap: 10px; margin-top: 8px;">
+                <div style="display: flex; flex-direction: column; gap: calc(var(--spacing) * 2.5); margin-top: calc(var(--spacing) * 2);">
                     {breaks_for_rows.into_iter().map(|b| {
                         let is_program = b.break_type == "program";
                         let is_open    = b.actual_duration_s.is_none();
@@ -925,13 +925,13 @@ fn Scte35Section(ad_breaks: Vec<AdBreak>, playlist_window_s: f64) -> impl IntoVi
                                          font-weight: 700; white-space: nowrap; flex-shrink: 0;",
                                         badge_bg, badge_fg, badge_border
                                     )>{badge_label}</span>
-                                    <span style="font-family: monospace; font-size: .8rem; font-weight: 600; color: #1e293b; white-space: nowrap;">
+                                    <span style="font-family: monospace; font-size: .8rem; font-weight: 600; color: var(--color-sky-950); white-space: nowrap;">
                                         {id_short}
                                     </span>
-                                    <span style="font-size: .75rem; color: #94a3b8; white-space: nowrap;">
+                                    <span style="font-size: .75rem; color: var(--color-sky-300); white-space: nowrap;">
                                         {b.start_date.clone()}
                                     </span>
-                                    <span style="font-size: .78rem; color: #64748b; white-space: nowrap;">
+                                    <span style="font-size: .78rem; color: var(--color-sky-700); white-space: nowrap;">
                                         {dur_text}
                                     </span>
                                     <span style=format!(
@@ -941,7 +941,7 @@ fn Scte35Section(ad_breaks: Vec<AdBreak>, playlist_window_s: f64) -> impl IntoVi
                                     )>{st_label}</span>
                                     {(!b.rendition_url.is_empty()).then(|| view! {
                                         <a href=viewer_href.clone() target="_blank" rel="noopener noreferrer"
-                                           style="display: inline-flex; align-items: center; gap: 4px; font-size: .72rem; font-weight: 600; color: #38bdf8; border: 1px solid rgba(56,189,248,.3); border-radius: 5px; padding: 2px 8px; background: rgba(56,189,248,.06); text-decoration: none; white-space: nowrap; margin-left: auto;">
+                                           style="display: inline-flex; align-items: center; gap: var(--spacing); font-size: .72rem; font-weight: 600; color: var(--color-sky-500); border: 1px solid rgba(56,189,248,.3); border-radius: 5px; padding: calc(var(--spacing) * 0.5) calc(var(--spacing) * 2); background: rgba(56,189,248,.06); text-decoration: none; white-space: nowrap; margin-left: auto;">
                                             "🔗 Open in HLS Viewer"
                                         </a>
                                     })}
@@ -949,7 +949,7 @@ fn Scte35Section(ad_breaks: Vec<AdBreak>, playlist_window_s: f64) -> impl IntoVi
 
                                 // Track row: full-width bar with the break segment highlighted
                                 <a href=viewer_href target="_blank" rel="noopener noreferrer"
-                                   style="display: block; text-decoration: none; position: relative; height: 22px; border-radius: 5px; background: rgba(148,163,184,.08); border: 1px solid #e2e8f0; overflow: hidden; cursor: pointer;"
+                                   style="display: block; text-decoration: none; position: relative; height: 22px; border-radius: 5px; background: rgba(148,163,184,.08); border: 1px solid var(--color-sky-200); overflow: hidden; cursor: pointer;"
                                    title=tooltip>
                                     // Highlighted break segment
                                     <div style=format!(
@@ -971,7 +971,7 @@ fn Scte35Section(ad_breaks: Vec<AdBreak>, playlist_window_s: f64) -> impl IntoVi
                 </div>
 
                 // Legend
-                <div style="display: flex; gap: 14px; margin-top: 14px; font-size: .72rem; color: #64748b; flex-wrap: wrap;">
+                <div style="display: flex; gap: calc(var(--spacing) * 3.5); margin-top: calc(var(--spacing) * 3.5); font-size: .72rem; color: var(--color-sky-700); flex-wrap: wrap;">
                     <span>
                         <span style="display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: middle; background: rgba(234,179,8,.7);"></span>
                         "Commercial break"
@@ -996,7 +996,7 @@ fn Scte35Section(ad_breaks: Vec<AdBreak>, playlist_window_s: f64) -> impl IntoVi
 #[component]
 fn DeltaSection(deltas: Vec<DeltaReport>) -> impl IntoView {
     view! {
-        <div style="display: flex; flex-direction: column; gap: 10px; margin-bottom: 28px;">
+        <div style="display: flex; flex-direction: column; gap: calc(var(--spacing) * 2.5); margin-bottom: calc(var(--spacing) * 7);">
             {deltas.into_iter().map(|d| {
                 let has_error = d.delta_error.is_some();
                 let is_audio = d.media_type == "AUDIO";
@@ -1023,10 +1023,10 @@ fn DeltaSection(deltas: Vec<DeltaReport>) -> impl IntoView {
                 );
 
                 view! {
-                    <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px 18px;">
-                        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px;">
+                    <div style="background: var(--color-sky-50); border: 1px solid var(--color-sky-200); border-radius: 10px; padding: calc(var(--spacing) * 4) calc(var(--spacing) * 4.5);">
+                        <div style="display: flex; align-items: center; gap: calc(var(--spacing) * 2.5); flex-wrap: wrap; margin-bottom: calc(var(--spacing) * 2.5);">
                             <span style=type_badge_style>{if is_audio { "AUDIO" } else { "VIDEO" }}</span>
-                            <span style="font-weight: 600; font-size: .9rem; flex: 1; min-width: 120px;">{d.name.clone()}</span>
+                            <span style="font-weight: 600; font-size: .9rem; color: var(--color-sky-950); flex: 1; min-width: 120px;">{d.name.clone()}</span>
                             <span style=format!(
                                 "display: inline-flex; align-items: center; gap: 5px; border-radius: 20px; \
                                  padding: 4px 12px; font-size: .78rem; font-weight: 700; white-space: nowrap; \
@@ -1035,23 +1035,23 @@ fn DeltaSection(deltas: Vec<DeltaReport>) -> impl IntoView {
                             )>{status_label}</span>
                             {(!has_error).then(|| view! {
                                 <a href=viewer_url.clone() target="_blank" rel="noopener noreferrer"
-                                    style="display: inline-flex; align-items: center; gap: 5px; font-size: .78rem; font-weight: 600; color: #38bdf8; border: 1px solid rgba(56,189,248,.3); border-radius: 5px; padding: 4px 10px; background: rgba(56,189,248,.06); text-decoration: none;">
+                                    style="display: inline-flex; align-items: center; gap: calc(var(--spacing) * 1.25); font-size: .78rem; font-weight: 600; color: var(--color-sky-500); border: 1px solid rgba(56,189,248,.3); border-radius: 5px; padding: var(--spacing) calc(var(--spacing) * 2.5); background: rgba(56,189,248,.06); text-decoration: none;">
                                     "🔗 Open delta in HLS Viewer"
                                 </a>
                             })}
                         </div>
-                        <div style="display: flex; gap: 20px; flex-wrap: wrap; font-size: .8rem; color: #64748b; margin-bottom: 10px;">
-                            <span><b style="color: #1e293b;">"CAN-SKIP-UNTIL"</b>{format!(" {:.1}s", d.can_skip_until)}</span>
-                            <span><b style="color: #1e293b;">"HOLD-BACK"</b>{format!(" {:.1}s", d.hold_back)}</span>
-                            <span><b style="color: #1e293b;">"CAN-BLOCK-RELOAD"</b>{if d.can_block_reload { " YES" } else { " NO" }}</span>
-                            <span><b style="color: #1e293b;">"Full playlist"</b>{format!(" {} segs", d.full_segment_count)}</span>
+                        <div style="display: flex; gap: calc(var(--spacing) * 5); flex-wrap: wrap; font-size: .8rem; color: var(--color-sky-700); margin-bottom: calc(var(--spacing) * 2.5);">
+                            <span><b style="color: var(--color-sky-950);">"CAN-SKIP-UNTIL"</b>{format!(" {:.1}s", d.can_skip_until)}</span>
+                            <span><b style="color: var(--color-sky-950);">"HOLD-BACK"</b>{format!(" {:.1}s", d.hold_back)}</span>
+                            <span><b style="color: var(--color-sky-950);">"CAN-BLOCK-RELOAD"</b>{if d.can_block_reload { " YES" } else { " NO" }}</span>
+                            <span><b style="color: var(--color-sky-950);">"Full playlist"</b>{format!(" {} segs", d.full_segment_count)}</span>
                             {(!has_error).then(|| view! {
-                                <span><b style="color: #1e293b;">"Delta playlist"</b>{format!(" {} live segs + {} skipped", d.delta_segment_count, d.skipped_segments)}</span>
+                                <span><b style="color: var(--color-sky-950);">"Delta playlist"</b>{format!(" {} live segs + {} skipped", d.delta_segment_count, d.skipped_segments)}</span>
                             })}
                         </div>
                         // Skip ratio bar
                         {(!has_error && total > 0).then(|| view! {
-                            <div style="height: 6px; background: #e2e8f0; border-radius: 3px; overflow: hidden; margin-bottom: 10px;">
+                            <div style="height: 6px; background: var(--color-sky-200); border-radius: 3px; overflow: hidden; margin-bottom: calc(var(--spacing) * 2.5);">
                                 <div style=format!(
                                     "height: 100%; border-radius: 3px; background: linear-gradient(90deg, #22c55e, #16a34a); \
                                      width: {:.0}%;",
@@ -1059,7 +1059,7 @@ fn DeltaSection(deltas: Vec<DeltaReport>) -> impl IntoView {
                                 )></div>
                             </div>
                         })}
-                        <div style="font-size: .75rem; color: #64748b; word-break: break-all;">{d.delta_url.clone()}</div>
+                        <div style="font-size: .75rem; color: var(--color-sky-700); word-break: break-all;">{d.delta_url.clone()}</div>
                     </div>
                 }
             }).collect::<Vec<_>>()}
@@ -1077,7 +1077,7 @@ fn CheckResultsTable(groups: Vec<CheckGroup>, has_interstitials_data: bool, rend
         .map(|r| (r.name.clone(), r.url.clone()))
         .collect();
 
-    let th_style = "font-size: .75rem; color: #64748b; text-transform: uppercase; letter-spacing: .08em; padding: 0 12px 8px; text-align: left; font-weight: 600;";
+    let th_style = "font-size: .75rem; color: var(--color-sky-700); text-transform: uppercase; letter-spacing: .08em; padding: 0 calc(var(--spacing) * 3) calc(var(--spacing) * 2); text-align: left; font-weight: 600;";
 
     view! {
         <table style="width: 100%; border-collapse: separate; border-spacing: 0 6px; margin-bottom: 8px;">
@@ -1114,7 +1114,7 @@ fn CheckResultsTable(groups: Vec<CheckGroup>, has_interstitials_data: bool, rend
                     view! {
                         <tr
                             style=format!(
-                                "background: #f8fafc; transition: background .15s; {}",
+                                "background: var(--color-sky-50); transition: background .15s; {}",
                                 if has_issues { "cursor: pointer;" } else { "" }
                             )
                             on:click=move |_| { if has_issues { set_expanded.set(!expanded.get()); } }
@@ -1123,10 +1123,10 @@ fn CheckResultsTable(groups: Vec<CheckGroup>, has_interstitials_data: bool, rend
                                 <div style="font-weight: 600; font-size: .92rem;">{g.name.clone()}</div>
                             </td>
                             <td style="padding: 12px 14px; vertical-align: middle;">
-                                <div style="font-size: .75rem; color: #64748b;">{g.section.clone()}</div>
+                                <div style="font-size: .75rem; color: var(--color-sky-700);">{g.section.clone()}</div>
                             </td>
                             <td style="padding: 12px 14px; vertical-align: middle;">
-                                <span style="font-size: .72rem; color: #38bdf8; background: rgba(56,189,248,.1); border-radius: 4px; padding: 2px 7px; display: inline-block; white-space: nowrap;">
+                                <span style="font-size: .72rem; color: var(--color-sky-500); background: rgba(56,189,248,.1); border-radius: 4px; padding: calc(var(--spacing) * 0.5) calc(var(--spacing) * 1.75); display: inline-block; white-space: nowrap;">
                                     {g.reference.clone()}
                                 </span>
                             </td>
@@ -1140,7 +1140,7 @@ fn CheckResultsTable(groups: Vec<CheckGroup>, has_interstitials_data: bool, rend
                             </td>
                             <td style="padding: 12px 14px; vertical-align: middle; border-radius: 0 8px 8px 0;">
                                 {has_issues.then(|| view! {
-                                    <button style="background: none; border: none; color: #64748b; cursor: pointer; font-size: .8rem; padding: 0; display: flex; align-items: center; gap: 4px;">
+                                    <button style="background: none; border: none; color: var(--color-sky-700); cursor: pointer; font-size: .8rem; padding: 0; display: flex; align-items: center; gap: var(--spacing);">
                                         {move || if expanded.get() {
                                             format!("▲ {} issue{}", issue_count, if issue_count != 1 { "s" } else { "" })
                                         } else {
@@ -1149,7 +1149,7 @@ fn CheckResultsTable(groups: Vec<CheckGroup>, has_interstitials_data: bool, rend
                                     </button>
                                 })}
                                 {(!has_issues).then(|| view! {
-                                    <span style="color: #64748b; font-size: .8rem;">"—"</span>
+                                    <span style="color: var(--color-sky-700); font-size: .8rem;">"—"</span>
                                 })}
                             </td>
                         </tr>
@@ -1159,7 +1159,7 @@ fn CheckResultsTable(groups: Vec<CheckGroup>, has_interstitials_data: bool, rend
                             view! {
                                 <tr>
                                     <td colspan="5" style="padding: 0 14px 10px;">
-                                        <div style="background: #f1f5f9; border-radius: 8px; padding: 12px 14px; border: 1px solid #e2e8f0;">
+                                        <div style="background: var(--color-sky-100); border-radius: 8px; padding: calc(var(--spacing) * 3) calc(var(--spacing) * 3.5); border: 1px solid var(--color-sky-200);">
                                             {issues.into_iter().map(|iss| {
                                                 let (sev_color, sev_icon) = match iss.severity {
                                                     Severity::Error => ("#ef4444", "✗"),
@@ -1209,7 +1209,7 @@ fn CheckResultsTable(groups: Vec<CheckGroup>, has_interstitials_data: bool, rend
                                                     <div style=format!(
                                                         "border-left: 3px solid {}; padding: 10px 12px; \
                                                          margin-bottom: 8px; border-radius: 0 6px 6px 0; \
-                                                         background: rgba(255,255,255,.02);",
+                                                         background: rgba(255,255,255,.04);",
                                                         sev_color
                                                     )>
                                                         <div style=format!(
@@ -1219,21 +1219,21 @@ fn CheckResultsTable(groups: Vec<CheckGroup>, has_interstitials_data: bool, rend
                                                         )>
                                                             {format!("{} {}", sev_icon, iss.severity.to_string())}
                                                         </div>
-                                                        <div style="font-size: .85rem; line-height: 1.6; color: #1e293b;">
+                                                        <div style="font-size: .85rem; line-height: 1.6; color: var(--color-sky-950);">
                                                             {iss.message.clone()}
                                                         </div>
                                                         {iss.uri_note.as_ref().map(|n| view! {
-                                                            <div style="font-size: .78rem; color: #64748b; margin-top: 6px; padding-top: 6px; border-top: 1px solid #e2e8f0; line-height: 1.5;">
+                                                            <div style="font-size: .78rem; color: var(--color-sky-700); margin-top: calc(var(--spacing) * 1.5); padding-top: calc(var(--spacing) * 1.5); border-top: 1px solid var(--color-sky-200); line-height: 1.5;">
                                                                 {format!("📎 {}", n)}
                                                             </div>
                                                         })}
-                                                        <div style="font-size: .75rem; color: #64748b; margin-top: 4px;">
+                                                        <div style="font-size: .75rem; color: var(--color-sky-700); margin-top: var(--spacing);">
                                                             {seg_label}
                                                             {iss.rendition_a.as_ref().map(|ra| {
                                                                 if let Some(rb) = &iss.rendition_b {
-                                                                    view! { <span style="color: #38bdf8;">{format!(" · {} ↔ {}", ra, rb)}</span> }.into_any()
+                                                                    view! { <span style="color: var(--color-sky-500);">{format!(" · {} ↔ {}", ra, rb)}</span> }.into_any()
                                                                 } else {
-                                                                    view! { <span style="color: #38bdf8;">{format!(" · {}", ra)}</span> }.into_any()
+                                                                    view! { <span style="color: var(--color-sky-500);">{format!(" · {}", ra)}</span> }.into_any()
                                                                 }
                                                             })}
                                                         </div>
@@ -1241,7 +1241,7 @@ fn CheckResultsTable(groups: Vec<CheckGroup>, has_interstitials_data: bool, rend
                                                             <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px;">
                                                                 {viewer_links.into_iter().map(|(name, url)| view! {
                                                                     <a href=url target="_blank" rel="noopener noreferrer"
-                                                                        style="display: inline-flex; align-items: center; gap: 5px; font-size: .78rem; font-weight: 600; color: #38bdf8; border: 1px solid rgba(56,189,248,.3); border-radius: 5px; padding: 4px 10px; background: rgba(56,189,248,.06); text-decoration: none;">
+                                                                        style="display: inline-flex; align-items: center; gap: calc(var(--spacing) * 1.25); font-size: .78rem; font-weight: 600; color: var(--color-sky-500); border: 1px solid rgba(56,189,248,.3); border-radius: 5px; padding: var(--spacing) calc(var(--spacing) * 2.5); background: rgba(56,189,248,.06); text-decoration: none;">
                                                                         {format!("🔗 View {}", name)}
                                                                     </a>
                                                                 }).collect::<Vec<_>>()}
