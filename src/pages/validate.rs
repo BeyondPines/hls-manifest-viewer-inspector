@@ -8,7 +8,6 @@ use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const MANIFEST_VIEWER_BASE: &str = "https://therealrobg.github.io/hls-manifest-viewer";
 
 // ── Helper functions ─────────────────────────────────────────────────────────
 
@@ -81,11 +80,11 @@ fn manifest_viewer_href(
     let resolved = replace_hls_variables(url, definitions);
     let encoded_url = utf8_percent_encode(&*resolved, NON_ALPHANUMERIC);
     if definitions.is_empty() {
-        format!("{MANIFEST_VIEWER_BASE}/?playlist_url={encoded_url}")
+        format!("?playlist_url={encoded_url}")
     } else {
         let encoded_defs = encode_definitions(definitions);
         format!(
-            "{MANIFEST_VIEWER_BASE}/?playlist_url={encoded_url}&{DEFINITIONS_QUERY_NAME}={encoded_defs}"
+            "?playlist_url={encoded_url}&{DEFINITIONS_QUERY_NAME}={encoded_defs}"
         )
     }
 }
@@ -106,12 +105,12 @@ fn manifest_viewer_href_with_asset_list(
     let encoded_supplemental = encode_asset_list(&resolved_asset_list, daterange_id);
     if definitions.is_empty() {
         format!(
-            "{MANIFEST_VIEWER_BASE}/?playlist_url={encoded_rendition}&{SUPPLEMENTAL_VIEW_QUERY_NAME}={encoded_supplemental}"
+            "?playlist_url={encoded_rendition}&{SUPPLEMENTAL_VIEW_QUERY_NAME}={encoded_supplemental}"
         )
     } else {
         let encoded_defs = encode_definitions(definitions);
         format!(
-            "{MANIFEST_VIEWER_BASE}/?playlist_url={encoded_rendition}&{DEFINITIONS_QUERY_NAME}={encoded_defs}&{SUPPLEMENTAL_VIEW_QUERY_NAME}={encoded_supplemental}"
+            "?playlist_url={encoded_rendition}&{DEFINITIONS_QUERY_NAME}={encoded_defs}&{SUPPLEMENTAL_VIEW_QUERY_NAME}={encoded_supplemental}"
         )
     }
 }
@@ -187,7 +186,7 @@ pub fn Validate() -> impl IntoView {
                         // Inspect manifest link (shown after validation)
                         {move || report.get().map(|r| {
                             let viewer_url = format!(
-                                "{MANIFEST_VIEWER_BASE}/?playlist_url={}",
+                                "?playlist_url={}",
                                 utf8_percent_encode(&r.master_url, NON_ALPHANUMERIC)
                             );
                             view! {
@@ -446,7 +445,7 @@ fn RenditionsTable(renditions: Vec<Rendition>) -> impl IntoView {
                         let group_id = rn.group_id.clone().unwrap_or_default();
                         let cc = if is_audio { "—".to_string() } else { rn.closed_captions.clone().unwrap_or_else(|| "—".to_string()) };
                         let viewer_url = format!(
-                            "{MANIFEST_VIEWER_BASE}/?playlist_url={}",
+                            "?playlist_url={}",
                             utf8_percent_encode(&rn.url, NON_ALPHANUMERIC)
                         );
 
@@ -899,7 +898,7 @@ fn Scte35Section(ad_breaks: Vec<AdBreak>, playlist_window_s: f64) -> impl IntoVi
                         let opacity = if is_open { "0.6" } else { "1.0" };
 
                         let viewer_href = format!(
-                            "{MANIFEST_VIEWER_BASE}/?playlist_url={}",
+                            "?playlist_url={}",
                             utf8_percent_encode(&b.rendition_url, NON_ALPHANUMERIC)
                         );
                         let tooltip = format!("{} — starts at {} — {} {}",
@@ -1018,7 +1017,7 @@ fn DeltaSection(deltas: Vec<DeltaReport>) -> impl IntoView {
                     "background: rgba(56,189,248,.15); color: #38bdf8; border: 1px solid rgba(56,189,248,.3); border-radius: 6px; padding: 3px 9px; font-size: .72rem; font-weight: 700;"
                 };
                 let viewer_url = format!(
-                    "{MANIFEST_VIEWER_BASE}/?playlist_url={}",
+                    "?playlist_url={}",
                     utf8_percent_encode(&d.delta_url, NON_ALPHANUMERIC)
                 );
 
@@ -1181,7 +1180,7 @@ fn CheckResultsTable(groups: Vec<CheckGroup>, has_interstitials_data: bool, rend
                                                     if let Some(ref ra) = iss.rendition_a {
                                                         if let Some(url) = rend_url_map.get(ra) {
                                                             links.push((ra.clone(), format!(
-                                                                "{MANIFEST_VIEWER_BASE}/?playlist_url={}",
+                                                                "?playlist_url={}",
                                                                 utf8_percent_encode(url, NON_ALPHANUMERIC)
                                                             )));
                                                         }
@@ -1189,7 +1188,7 @@ fn CheckResultsTable(groups: Vec<CheckGroup>, has_interstitials_data: bool, rend
                                                     if let Some(ref rb) = iss.rendition_b {
                                                         if let Some(url) = rend_url_map.get(rb) {
                                                             links.push((rb.clone(), format!(
-                                                                "{MANIFEST_VIEWER_BASE}/?playlist_url={}",
+                                                                "?playlist_url={}",
                                                                 utf8_percent_encode(url, NON_ALPHANUMERIC)
                                                             )));
                                                         }
@@ -1357,7 +1356,7 @@ mod tests {
         let url = "https://cdn.example.com/master.m3u8";
         let defs = HashMap::new();
         let href = manifest_viewer_href(url, &defs);
-        assert!(href.starts_with("https://therealrobg.github.io/hls-manifest-viewer/?playlist_url="));
+        assert!(href.starts_with("?playlist_url="));
         assert!(href.contains("cdn%2Eexample%2Ecom"));
     }
 
