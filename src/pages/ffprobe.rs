@@ -1308,7 +1308,7 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                     <div style="margin-bottom: 6px;">
                         <span style="font-size: .72rem; font-weight: 600; color: var(--color-sky-700); text-transform: uppercase; \
                                      letter-spacing: .05em; margin-right: calc(var(--spacing) * 2);">"Multivariant Playlist"</span>
-                        <a href={Url::parse(&url).ok().and_then(|b| playlist_href(b, "", &Default::default())).unwrap_or_default()}
+                        <a href={Url::parse(&url).ok().and_then(|b| playlist_href(b, "", &Default::default())).map(|h| format!("/{}", h)).unwrap_or_default()}
                            target="_blank"
                            style="font-size: .75rem; color: var(--color-sky-500); word-break: break-all; text-decoration: none; \
                                   border-bottom: 1px dotted var(--color-sky-500);"
@@ -1340,7 +1340,7 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                                              letter-spacing: .05em;">"Variant Playlists (init segments)"</span>
                                 <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px;">
                                     {links.into_iter().map(|(label, uri)| {
-                                        let href = Url::parse(&uri).ok().and_then(|b| playlist_href(b, "", &Default::default())).unwrap_or_default();
+                                        let href = Url::parse(&uri).ok().and_then(|b| playlist_href(b, "", &Default::default())).map(|h| format!("/{}", h)).unwrap_or_default();
                                         view! {
                                             <a href={href} target="_blank"
                                                style="font-size: .72rem; background: rgba(56,189,248,.12); \
@@ -1366,7 +1366,7 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                                              letter-spacing: .05em;">"Audio Playlists"</span>
                                 <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px;">
                                     {links.into_iter().map(|(label, uri)| {
-                                        let href = Url::parse(&uri).ok().and_then(|b| playlist_href(b, "", &Default::default())).unwrap_or_default();
+                                        let href = Url::parse(&uri).ok().and_then(|b| playlist_href(b, "", &Default::default())).map(|h| format!("/{}", h)).unwrap_or_default();
                                         view! {
                                             <a href={href} target="_blank"
                                                style="font-size: .72rem; background: rgba(16,185,129,.1); \
