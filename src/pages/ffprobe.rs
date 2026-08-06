@@ -1693,19 +1693,41 @@ fn VideoTable(mut tracks: Vec<VideoTrackInfo>, selected: HashSet<String>) -> imp
     let show_hint = RwSignal::new(false);
 
     Effect::new(move |_| {
+        use wasm_bindgen::JsCast;
         if let Some(el) = scroll_ref.get() {
-            // Initial check: only show hint if content overflows
-            let overflows = el.scroll_width() > el.client_width();
-            show_hint.set(overflows);
-            // Update on scroll: hide when scrolled to the right edge
-            let el_clone = el.clone();
-            let closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                let remaining = el_clone.scroll_width() - el_clone.scroll_left() - el_clone.client_width();
-                show_hint.set(remaining > 4);
-            });
-            use wasm_bindgen::JsCast;
-            el.add_event_listener_with_callback("scroll", closure.as_ref().unchecked_ref()).ok();
-            closure.forget();
+            // Shared check: has unscrolled overflow remaining?
+            let check = {
+                let el = el.clone();
+                move || {
+                    let remaining = el.scroll_width() - el.scroll_left() - el.client_width();
+                    show_hint.set(remaining > 4);
+                }
+            };
+
+            // Scroll listener
+            let check_scroll = check.clone();
+            let scroll_cb = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || check_scroll());
+            el.add_event_listener_with_callback("scroll", scroll_cb.as_ref().unchecked_ref()).ok();
+            scroll_cb.forget();
+
+            // ResizeObserver fires on mount and on every size change (window resize,
+            // column toggle, etc.) so the hint stays in sync without a separate
+            // window "resize" listener.
+            let check_resize = check.clone();
+            let resize_cb = wasm_bindgen::closure::Closure::<dyn Fn()>::new(
+                move || check_resize(),
+            );
+            if let Ok(observer) = web_sys::ResizeObserver::new(resize_cb.as_ref().unchecked_ref()) {
+                observer.observe(&el);
+                // Keep observer alive for the lifetime of the component
+                resize_cb.forget();
+                // We intentionally leak the observer too — it lives as long as the element.
+                std::mem::forget(observer);
+            } else {
+                resize_cb.forget();
+                // Fallback: run once immediately if ResizeObserver isn't available
+                check();
+            }
         }
     });
 
