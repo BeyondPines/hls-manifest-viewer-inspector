@@ -1693,7 +1693,7 @@ fn VideoTable(mut tracks: Vec<VideoTrackInfo>, selected: HashSet<String>) -> imp
         // Outer wrapper: relative so the scroll-hint overlay is clipped to the table bounds
         <div style="position: relative; margin-bottom: calc(var(--spacing) * 7);">
             <div style="overflow-x: auto; border: 1px solid var(--color-sky-200); border-radius: 10px;">
-                <table style="width: 100%; border-collapse: collapse; font-size: .82rem;">
+                <table style="width: max-content; min-width: 100%; border-collapse: collapse; font-size: .82rem;">
                     <thead>
                         <tr>
                             {headers.into_iter().map(|h| view! {
@@ -1794,7 +1794,7 @@ fn AudioTable(tracks: Vec<AudioTrackInfo>, selected: HashSet<String>) -> impl In
     view! {
         <div style="overflow-x: auto; margin-bottom: calc(var(--spacing) * 7); \
                     border: 1px solid var(--color-sky-200); border-radius: 10px;">
-            <table style="width: 100%; border-collapse: collapse; font-size: .82rem;">
+            <table style="width: max-content; min-width: 100%; border-collapse: collapse; font-size: .82rem;">
                 <thead>
                     <tr>
                         <th style="text-align: left; padding: calc(var(--spacing) * 2.25) calc(var(--spacing) * 3.5); \
