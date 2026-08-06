@@ -1689,10 +1689,30 @@ fn VideoTable(mut tracks: Vec<VideoTrackInfo>, selected: HashSet<String>) -> imp
         })
         .collect();
 
+    let scroll_ref = NodeRef::<leptos::html::Div>::new();
+    let show_hint = RwSignal::new(false);
+
+    Effect::new(move |_| {
+        if let Some(el) = scroll_ref.get() {
+            // Initial check: only show hint if content overflows
+            let overflows = el.scroll_width() > el.client_width();
+            show_hint.set(overflows);
+            // Update on scroll: hide when scrolled to the right edge
+            let el_clone = el.clone();
+            let closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                let remaining = el_clone.scroll_width() - el_clone.scroll_left() - el_clone.client_width();
+                show_hint.set(remaining > 4);
+            });
+            use wasm_bindgen::JsCast;
+            el.add_event_listener_with_callback("scroll", closure.as_ref().unchecked_ref()).ok();
+            closure.forget();
+        }
+    });
+
     view! {
         // Outer wrapper: relative so the scroll-hint overlay is clipped to the table bounds
         <div style="position: relative; margin-bottom: calc(var(--spacing) * 7);">
-            <div style="overflow-x: auto; border: 1px solid var(--color-sky-200); border-radius: 10px;">
+            <div node_ref=scroll_ref style="overflow-x: auto; border: 1px solid var(--color-sky-200); border-radius: 10px;">
                 <table style="width: max-content; min-width: 100%; border-collapse: collapse; font-size: .82rem;">
                     <thead>
                         <tr>
@@ -1731,11 +1751,7 @@ fn VideoTable(mut tracks: Vec<VideoTrackInfo>, selected: HashSet<String>) -> imp
             // Scroll hint: right-edge gradient + animated chevron anchored to the header row.
             // Pinning to the header keeps it visible regardless of how far the user has scrolled.
             // pointer-events: none so it never blocks scroll or click interactions.
-            <div style="position: absolute; right: 1px; top: 1px; height: 38px; width: 52px; \
-                        border-radius: 0 10px 0 0; pointer-events: none; \
-                        background: linear-gradient(to right, transparent, color-mix(in srgb, var(--color-sky-100) 96%, transparent)); \
-                        display: flex; align-items: center; justify-content: flex-end; \
-                        padding-right: calc(var(--spacing) * 1.75);">
+            <div style=move || format!("position: absolute; right: 1px; top: 1px; height: 38px; width: 52px;                         border-radius: 0 10px 0 0; pointer-events: none;                         background: linear-gradient(to right, transparent, color-mix(in srgb, var(--color-sky-100) 96%, transparent));                         display: flex; align-items: center; justify-content: flex-end;                         padding-right: calc(var(--spacing) * 1.75);                         opacity: {}; transition: opacity .2s;", if show_hint.get() {{ 1 }} else {{ 0 }})>
                 <style>
                     "@keyframes hls-scroll-bounce {
                         0%, 100% { transform: translateX(0); opacity: .55; }
