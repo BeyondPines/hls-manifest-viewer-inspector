@@ -156,7 +156,7 @@ fn definitions_query_value() -> Option<String> {
     query_value_from_leptos_url(&url, DEFINITIONS_QUERY_NAME).map(|cow| cow.to_string())
 }
 
-fn playlist_href(
+pub fn playlist_href(
     base_url: Url,
     relative_uri: &str,
     local_definitions: &HashMap<String, String>,
