@@ -1279,6 +1279,11 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
         if pl.raw_content.is_empty() {
             continue;
         }
+        // Per rfc8216bis section D.2 a DATERANGE with the same ID as a
+        // previously-seen tag is an update; update tags don't need to
+        // repeat X-ASSET-URI/X-ASSET-LIST, so we only validate + push
+        // the first occurrence of each ID.
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for line in pl.raw_content.lines() {
             let line = line.trim();
             if !line.starts_with("#EXT-X-DATERANGE:") {
@@ -1290,6 +1295,13 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
                 continue;
             }
             let dr_id = attrs.get("ID").cloned().unwrap_or_default();
+            let is_update = !dr_id.is_empty() && seen_ids.contains(&dr_id);
+            if !is_update {
+                seen_ids.insert(dr_id.clone());
+            }
+            if is_update {
+                continue;
+            }
             let start_date = attrs.get("START-DATE").cloned().unwrap_or_default();
             let asset_uri = attrs.get("X-ASSET-URI").cloned();
             let asset_list = attrs.get("X-ASSET-LIST").cloned();
@@ -1857,4 +1869,39 @@ mod tests {
         let (issues, _) = check_interstitials(&[pl]);
         assert!(issues.iter().any(|i| i.severity == Severity::Warn && i.message.contains("X-SNAP")));
     }
+    /// Regression: a second EXT-X-DATERANGE with the same ID and CLASS
+    /// (per rfc8216bis §D.2 this is an "update" tag) must NOT trigger a
+    /// false "Missing X-ASSET-URI or X-ASSET-LIST" error.
+    #[test]
+    fn interstitial_update_tag_no_false_asset_error() {
+        // First DATERANGE: the real "OUT" tag with X-ASSET-LIST.
+        // Second DATERANGE: same ID + CLASS, no asset attrs (update / IN tag).
+        let content = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-DATERANGE:",
+            "ID=\"ad-sle-1\",",
+            "START-DATE=\"2024-01-15T12:00:00Z\",",
+            "CLASS=\"com.apple.hls.interstitial\",",
+            "PLANNED-DURATION=30.0,",
+            "X-ASSET-LIST=\"https://ads.example.com/assets.json\"\n",
+            // Update tag — same ID, same CLASS, no asset attributes
+            "#EXT-X-DATERANGE:",
+            "ID=\"ad-sle-1\",",
+            "START-DATE=\"2024-01-15T12:00:00Z\",",
+            "CLASS=\"com.apple.hls.interstitial\",",
+            "X-RESUME-OFFSET=0\n",
+        );
+        let pl = make_playlist("v1", content);
+        let (issues, interstitials) = check_interstitials(&[pl]);
+        // No errors — the update tag must not trigger a false positive
+        let errors: Vec<_> = issues.iter().filter(|i| i.severity == Severity::Error).collect();
+        assert!(
+            errors.is_empty(),
+            "update DATERANGE tag must not produce errors, got: {:?}", errors
+        );
+        // Only one Interstitial should be created (the first occurrence)
+        assert_eq!(interstitials.len(), 1, "update tag must not create a second Interstitial");
+        assert!(interstitials[0].asset_list.is_some());
+    }
+
 }
