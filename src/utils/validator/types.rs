@@ -157,6 +157,7 @@ pub struct MediaPlaylist {
     // Rendition info (from master playlist)
     pub media_type: String,  // "VIDEO" or "AUDIO"
     pub bandwidth: Option<u64>,
+    pub average_bandwidth: Option<u64>,
     pub codecs: Option<String>,
     pub resolution: Option<String>,
     pub frame_rate: Option<f64>,
@@ -208,6 +209,7 @@ impl MediaPlaylist {
             rendition_reports: Vec::new(),
             media_type: "VIDEO".to_string(),
             bandwidth: None,
+            average_bandwidth: None,
             codecs: None,
             resolution: None,
             frame_rate: None,
@@ -266,6 +268,7 @@ pub struct Rendition {
     pub media_type: String,  // "VIDEO" or "AUDIO"
     pub url: String,
     pub bandwidth: u64,
+    pub average_bandwidth: Option<u64>,
     pub resolution: Option<String>,
     pub codecs: Option<String>,
     pub frame_rate: Option<f64>,
