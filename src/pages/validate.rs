@@ -419,6 +419,7 @@ fn RenditionsTable(renditions: Vec<Rendition>) -> impl IntoView {
                         <th style=th_style>"Name / Group"</th>
                         <th style=th_style>"Resolution"</th>
                         <th style=th_style>"Bandwidth"</th>
+                        <th style=th_style>"Avg Bandwidth"</th>
                         <th style=th_style>"Frame Rate"</th>
                         <th style=th_style>"Colour"</th>
                         <th style=th_style>"Codecs"</th>
@@ -437,6 +438,7 @@ fn RenditionsTable(renditions: Vec<Rendition>) -> impl IntoView {
                         let type_label = if is_audio { "AUDIO" } else { "VIDEO" };
                         let resolution = if is_audio { "—".to_string() } else { rn.resolution.clone().unwrap_or_else(|| "—".to_string()) };
                         let bw = format_bandwidth(rn.bandwidth);
+                        let avg_bw = rn.average_bandwidth.map(format_bandwidth).unwrap_or_else(|| "—".to_string());
                         let frame_rate = if is_audio { "—".to_string() } else {
                             rn.frame_rate.map(|f| format!("{:.2} fps", f)).unwrap_or_else(|| "—".to_string())
                         };
@@ -487,6 +489,7 @@ fn RenditionsTable(renditions: Vec<Rendition>) -> impl IntoView {
                                 </td>
                                 <td style=td_style>{resolution}</td>
                                 <td style=format!("{} white-space: nowrap;", td_style)>{bw}</td>
+                                <td style=format!("{} white-space: nowrap;", td_style)>{avg_bw}</td>
                                 <td style=td_style>{frame_rate}</td>
                                 <td style=td_style>{colour_view}</td>
                                 <td style=td_style>{codecs}</td>

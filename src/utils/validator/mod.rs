@@ -42,6 +42,7 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
         struct VariantInfo {
             uri: String,
             bandwidth: Option<u64>,
+            average_bandwidth: Option<u64>,
             codecs: Option<String>,
             resolution: Option<String>,
             frame_rate: Option<f64>,
@@ -53,6 +54,7 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
         let variant_infos: Vec<VariantInfo> = master.variants.iter().map(|v| VariantInfo {
             uri: v.uri.clone(),
             bandwidth: v.bandwidth,
+            average_bandwidth: v.average_bandwidth,
             codecs: v.codecs.clone(),
             resolution: v.resolution.clone(),
             frame_rate: v.frame_rate,
@@ -102,6 +104,7 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
                     let mut pl = MediaPlaylist::new(name, vi.uri.clone());
                     pl.media_type = "VIDEO".to_string();
                     pl.bandwidth = vi.bandwidth;
+                    pl.average_bandwidth = vi.average_bandwidth;
                     pl.codecs = vi.codecs.clone();
                     pl.resolution = vi.resolution.clone();
                     pl.frame_rate = vi.frame_rate;
@@ -278,6 +281,7 @@ fn build_renditions(playlists: &[MediaPlaylist]) -> Vec<Rendition> {
             media_type: pl.media_type.clone(),
             url: pl.url.clone(),
             bandwidth: pl.bandwidth.unwrap_or(0),
+            average_bandwidth: pl.average_bandwidth,
             resolution: pl.resolution.clone(),
             codecs: pl.codecs.clone(),
             frame_rate: pl.frame_rate,
