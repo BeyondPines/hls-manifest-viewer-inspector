@@ -1,7 +1,7 @@
 use crate::utils::{
     href::playlist_href,
     mp4_atom_properties::{AtomPropertyValue, get_properties},
-    network::{FetchError, fetch_array_buffer, fetch_text},
+    network::{FetchError, RequestRange, fetch_array_buffer, fetch_text},
 };
 use url::Url;
 use leptos::prelude::*;
@@ -403,6 +403,16 @@ struct MasterPlaylist {
 struct SegmentInfo {
     duration: f64,
     map_uri: Option<String>,
+    map_byterange: Option<RequestRange>,
+}
+
+impl MediaPlaylist {
+    /// The init segment location of the first segment that declares one.
+    fn init_segment(&self) -> Option<(String, Option<RequestRange>)> {
+        self.segments
+            .iter()
+            .find_map(|s| s.map_uri.clone().map(|uri| (uri, s.map_byterange)))
+    }
 }
 
 /// Parsed server control tag data.
@@ -551,6 +561,7 @@ fn parse_media_playlist(base_url: &str, content: &str) -> MediaPlaylist {
     let opts = make_reader_opts();
     let mut pending_duration: Option<f64> = None;
     let mut current_map_uri: Option<String> = None;
+    let mut current_map_byterange: Option<RequestRange> = None;
 
     let mut reader = Reader::from_str(content, opts);
     loop {
@@ -570,6 +581,7 @@ fn parse_media_playlist(base_url: &str, content: &str) -> MediaPlaylist {
                 }
                 HlsLine::KnownTag(KnownTag::Hls(Tag::Map(m))) => {
                     current_map_uri = Some(resolve_uri(base_url, m.uri()));
+                    current_map_byterange = m.byterange().map(RequestRange::from);
                 }
                 HlsLine::KnownTag(KnownTag::Hls(Tag::Inf(inf))) => {
                     pending_duration = Some(inf.duration());
@@ -579,6 +591,7 @@ fn parse_media_playlist(base_url: &str, content: &str) -> MediaPlaylist {
                         pl.segments.push(SegmentInfo {
                             duration: dur,
                             map_uri: current_map_uri.clone(),
+                            map_byterange: current_map_byterange,
                         });
                     }
                 }
@@ -976,8 +989,8 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                 // Probe init segment of first variant for muxed-audio and DRM data.
                 // Each variant gets its own init probe below for per-track metadata.
                 if needs_init
-                    && let Some(iurl) = pl.segments.iter().find_map(|s| s.map_uri.clone())
-                        && let Ok(resp) = fetch_array_buffer(iurl, None).await {
+                    && let Some((iurl, irange)) = pl.init_segment()
+                        && let Ok(resp) = fetch_array_buffer(iurl, irange).await {
                             let mp4 = probe_mp4(resp.response_body);
                             r.major_brand = mp4.major_brand.clone();
                             // Muxed streams: first init segment carries audio info
@@ -1004,8 +1017,8 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
             for (vt, variant) in r.video_tracks.iter_mut().zip(non_iframe_variants.iter()) {
                 if let Ok(mr) = fetch_text(variant.uri.clone()).await {
                     let pl = parse_media_playlist(&variant.uri, &mr.response_text);
-                    if let Some(iurl) = pl.segments.iter().find_map(|s| s.map_uri.clone()) {
-                        match fetch_array_buffer(iurl, None).await {
+                    if let Some((iurl, irange)) = pl.init_segment() {
+                        match fetch_array_buffer(iurl, irange).await {
                             Ok(resp) => {
                                 let mp4 = probe_mp4(resp.response_body);
                                 if r.major_brand.is_none() { r.major_brand = mp4.major_brand; }
@@ -1052,8 +1065,8 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                 if let Some(apl_url) = audio_pl_url
                     && let Ok(apl_resp) = fetch_text(apl_url.clone()).await {
                         let apl = parse_media_playlist(&apl_url, &apl_resp.response_text);
-                        if let Some(aiurl) = apl.segments.iter().find_map(|s| s.map_uri.clone())
-                            && let Ok(aresp) = fetch_array_buffer(aiurl, None).await {
+                        if let Some((aiurl, airange)) = apl.init_segment()
+                            && let Ok(aresp) = fetch_array_buffer(aiurl, airange).await {
                                 let amp4 = probe_mp4(aresp.response_body);
                                 for at in r.audio_tracks.iter_mut() {
                                     if at.sample_rate.is_none() { at.sample_rate = amp4.audio_sample_rate; }
@@ -1098,8 +1111,8 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
         r.session_tags = parse_session_data(content);
         // Init segment probe for direct media playlist URLs
         if needs_init {
-            if let Some(iurl) = pl.segments.iter().find_map(|s| s.map_uri.clone()) {
-                match fetch_array_buffer(iurl, None).await {
+            if let Some((iurl, irange)) = pl.init_segment() {
+                match fetch_array_buffer(iurl, irange).await {
                     Ok(resp) => {
                         let mp4 = probe_mp4(resp.response_body);
                         r.major_brand = mp4.major_brand;
