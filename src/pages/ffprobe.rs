@@ -842,8 +842,11 @@ fn probe_mp4(data: Vec<u8>) -> Mp4ProbeInfo {
                     info.audio_sample_rate = Some(hz);
                 }
                 if info.audio_bitrate_bps.is_none() {
-                    info.audio_bitrate_bps =
-                        get("bit_rate").and_then(|s| s.parse().ok()).filter(|&b| b > 0);
+                    // AC3SpecificBox bit_rate is in kbps.
+                    info.audio_bitrate_bps = get("bit_rate")
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .filter(|&b| b > 0)
+                        .map(|kbps| kbps.saturating_mul(1000));
                 }
                 if info.audio_codec_override.is_none() {
                     info.audio_codec_override = Some("AC-3".into());
@@ -853,11 +856,11 @@ fn probe_mp4(data: Vec<u8>) -> Mp4ProbeInfo {
             "EC3SpecificBox" => {
                 // fscod lives in nested independent_substream tables; data_rate is top-level.
                 if info.audio_bitrate_bps.is_none() {
-                    // data_rate is in kbps for EC-3 specific box
-                    if let Some(kbps) = get("data_rate").and_then(|s| s.parse::<u64>().ok()).filter(|&b| b > 0)
-                    {
-                        info.audio_bitrate_bps = Some(kbps.saturating_mul(1000));
-                    }
+                    // EC3SpecificBox data_rate is in kbps.
+                    info.audio_bitrate_bps = get("data_rate")
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .filter(|&b| b > 0)
+                        .map(|kbps| kbps.saturating_mul(1000));
                 }
                 if info.audio_codec_override.is_none() {
                     info.audio_codec_override = Some("E-AC-3".into());
