@@ -1,3 +1,7 @@
+//! Validator data model types. Some fields are populated for UI/report
+//! completeness and are not yet read by every check.
+#![allow(dead_code)]
+
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]

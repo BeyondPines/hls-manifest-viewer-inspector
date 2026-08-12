@@ -4,6 +4,7 @@ pub mod checks;
 
 use types::*;
 use parser::*;
+use crate::utils::href::replace_hls_variables;
 use crate::utils::network::{fetch_text, FetchError};
 
 /// Determine if content is a master (multivariant) playlist
@@ -83,7 +84,9 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
 
         // Fetch variant playlists
         for vi in &variant_infos {
-            if !seen_urls.insert(vi.uri.clone()) {
+            // Substitute EXT-X-DEFINE variables before fetching (UI links already do this).
+            let fetch_uri = replace_hls_variables(&vi.uri, &master.definitions).into_owned();
+            if !seen_urls.insert(fetch_uri.clone()) {
                 continue;
             }
             // Include bandwidth in name to disambiguate renditions that share a resolution
@@ -97,11 +100,15 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
             } else if let Some(b) = vi.bandwidth {
                 format!("video/{}k", b / 1000)
             } else {
-                vi.uri.split('/').last().unwrap_or("unknown").to_string()
+                fetch_uri
+                    .split('/')
+                    .next_back()
+                    .unwrap_or("unknown")
+                    .to_string()
             };
-            match fetch_text(vi.uri.clone()).await {
+            match fetch_text(fetch_uri.clone()).await {
                 Ok(resp) => {
-                    let mut pl = MediaPlaylist::new(name, vi.uri.clone());
+                    let mut pl = MediaPlaylist::new(name, fetch_uri.clone());
                     pl.media_type = "VIDEO".to_string();
                     pl.bandwidth = vi.bandwidth;
                     pl.average_bandwidth = vi.average_bandwidth;
@@ -113,13 +120,13 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
                     pl.video_range = vi.video_range.clone();
                     pl.color_info = derive_color_info(vi.video_range.as_deref(), vi.codecs.as_deref());
                     pl.is_iframe = vi.is_iframe;
-                    parse_media_playlist(&vi.uri, &resp.response_text, &mut pl);
+                    parse_media_playlist(&fetch_uri, &resp.response_text, &mut pl);
                     apply_master_definitions(&resp.response_text, &master.definitions, &mut pl.definitions);
                     playlists.push(pl);
                 }
                 Err(e) => {
                     report.issues.push(Issue::warn(format!(
-                        "Could not fetch media playlist '{}': {}", vi.uri, e
+                        "Could not fetch media playlist '{}': {}", fetch_uri, e
                     )));
                 }
             }
@@ -127,7 +134,8 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
 
         // Fetch audio renditions
         for (uri, name, group_id, channels) in &audio_uris {
-            if !seen_urls.insert(uri.clone()) {
+            let fetch_uri = replace_hls_variables(uri, &master.definitions).into_owned();
+            if !seen_urls.insert(fetch_uri.clone()) {
                 continue;
             }
             // Build a unique, human-readable name.
@@ -137,20 +145,20 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
                 .unwrap_or_default();
             let audio_name = format!("audio/{} ({}){}", name, group_id, channel_suffix);
 
-            match fetch_text(uri.clone()).await {
+            match fetch_text(fetch_uri.clone()).await {
                 Ok(resp) => {
-                    let mut pl = MediaPlaylist::new(audio_name, uri.clone());
+                    let mut pl = MediaPlaylist::new(audio_name, fetch_uri.clone());
                     pl.media_type = "AUDIO".to_string();
                     pl.group_id = Some(group_id.clone());
                     // Derive audio codec from the STREAM-INF entry that references this group
                     pl.codecs = audio_group_codec.get(group_id.as_str()).cloned();
-                    parse_media_playlist(uri, &resp.response_text, &mut pl);
+                    parse_media_playlist(&fetch_uri, &resp.response_text, &mut pl);
                     apply_master_definitions(&resp.response_text, &master.definitions, &mut pl.definitions);
                     playlists.push(pl);
                 }
                 Err(e) => {
                     report.issues.push(Issue::warn(format!(
-                        "Could not fetch audio rendition '{}': {}", uri, e
+                        "Could not fetch audio rendition '{}': {}", fetch_uri, e
                     )));
                 }
             }
@@ -183,7 +191,7 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
         report.playlist_window_s = playlists.iter()
             .filter(|pl| pl.media_type == "VIDEO")
             .max_by_key(|pl| pl.bandwidth.unwrap_or(0))
-            .map(|pl| pdt_span_or_extinf_sum(pl))
+            .map(pdt_span_or_extinf_sum)
             .unwrap_or(0.0);
 
         // Fetch delta updates for playlists with CAN-SKIP-UNTIL
@@ -223,11 +231,10 @@ fn resolve_imports(
     for line in content.lines() {
         if let Some(attr_str) = line.trim().strip_prefix("#EXT-X-DEFINE:") {
             let attrs = parse_attributes(attr_str);
-            if let Some(name) = attrs.get("IMPORT") {
-                if let Some(value) = master_defs.get(name.as_str()) {
+            if let Some(name) = attrs.get("IMPORT")
+                && let Some(value) = master_defs.get(name.as_str()) {
                     dest.entry(name.clone()).or_insert_with(|| value.clone());
                 }
-            }
         }
     }
 }
@@ -270,7 +277,7 @@ fn run_media_checks(playlists: &[MediaPlaylist], report: &mut ValidationReport) 
     report.issues.extend(checks::check_media_sequence_continuity(playlists));
 
     // Sort issues by severity (errors first)
-    report.issues.sort_by(|a, b| b.severity.cmp(&a.severity));
+    report.issues.sort_by_key(|a| std::cmp::Reverse(a.severity));
 }
 
 /// Build renditions list for UI display from parsed playlists
@@ -433,11 +440,10 @@ fn compute_interstitial_offsets(interstitials: &mut [Interstitial], playlists: &
     for it in interstitials.iter_mut() {
         if let Some(&(first_pdt, content_dur)) = rendition_info.get(it.rendition.as_str()) {
             it.content_duration_s = content_dur;
-            if let Some(first_pdt_epoch) = first_pdt {
-                if let Some(it_epoch) = parser::parse_iso8601_to_epoch(&it.start_date) {
+            if let Some(first_pdt_epoch) = first_pdt
+                && let Some(it_epoch) = parser::parse_iso8601_to_epoch(&it.start_date) {
                     it.start_offset_s = Some(it_epoch - first_pdt_epoch);
                 }
-            }
         }
     }
 }
@@ -448,11 +454,10 @@ fn compute_interstitial_offsets(interstitials: &mut [Interstitial], playlists: &
 /// spans the entire DVR window even when skipped-segment counts are unreliable.
 /// Falls back to EXTINF sum (+ skipped_segments * target_duration) when PDTs are absent.
 fn pdt_span_or_extinf_sum(pl: &MediaPlaylist) -> f64 {
-    if let (Some(first_seg), Some(last_seg)) = (pl.segments.first(), pl.segments.last()) {
-        if let (Some(first_pdt), Some(last_pdt)) = (first_seg.pdt, last_seg.pdt) {
+    if let (Some(first_seg), Some(last_seg)) = (pl.segments.first(), pl.segments.last())
+        && let (Some(first_pdt), Some(last_pdt)) = (first_seg.pdt, last_seg.pdt) {
             return (last_pdt - first_pdt) + last_seg.duration;
         }
-    }
     // No PDTs — fall back to EXTINF sum, padding for any skipped segments
     let extinf: f64 = pl.segments.iter().map(|s| s.duration).sum();
     let skip_estimate = pl.skipped_segments as f64 * pl.target_duration.max(1.0);
@@ -483,15 +488,14 @@ pub fn collect_scte35_ad_breaks(playlists: &[MediaPlaylist]) -> Vec<AdBreak> {
         }
         for line in pl.raw_content.lines() {
             let line = line.trim();
-            if !line.starts_with("#EXT-X-DATERANGE:") {
+            let Some(rest) = line.strip_prefix("#EXT-X-DATERANGE:") else {
                 continue;
-            }
-            let attrs = parser::parse_attributes(&line["#EXT-X-DATERANGE:".len()..]);
-            if attrs.get("CLASS").map_or(false, |c| c.contains("com.apple.hls.interstitial")) {
-                if let Some(id) = attrs.get("ID") {
+            };
+            let attrs = parser::parse_attributes(rest);
+            if attrs.get("CLASS").is_some_and(|c| c.contains("com.apple.hls.interstitial"))
+                && let Some(id) = attrs.get("ID") {
                     interstitial_ids.insert(id.clone());
                 }
-            }
         }
     }
 
@@ -509,10 +513,10 @@ pub fn collect_scte35_ad_breaks(playlists: &[MediaPlaylist]) -> Vec<AdBreak> {
 
         for line in pl.raw_content.lines() {
             let line = line.trim();
-            if !line.starts_with("#EXT-X-DATERANGE:") {
+            let Some(rest) = line.strip_prefix("#EXT-X-DATERANGE:") else {
                 continue;
-            }
-            let attrs = parser::parse_attributes(&line["#EXT-X-DATERANGE:".len()..]);
+            };
+            let attrs = parser::parse_attributes(rest);
 
             // Must carry at least one SCTE35 payload attribute
             let has_scte35 = attrs.contains_key("SCTE35-OUT") || attrs.contains_key("SCTE35-IN");
@@ -587,13 +591,13 @@ pub fn collect_scte35_ad_breaks(playlists: &[MediaPlaylist]) -> Vec<AdBreak> {
 
             for line in pl.raw_content.lines() {
                 let line = line.trim();
-                if line.starts_with("#EXT-X-PROGRAM-DATE-TIME:") {
-                    last_pdt_str = Some(line["#EXT-X-PROGRAM-DATE-TIME:".len()..].to_string());
-                } else if line.starts_with("#EXT-X-DATERANGE:") {
+                if let Some(rest) = line.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
+                    last_pdt_str = Some(rest.to_string());
+                } else if let Some(rest) = line.strip_prefix("#EXT-X-DATERANGE:") {
                     // Update context: is this DATERANGE an interstitial?
-                    let attrs = parser::parse_attributes(&line["#EXT-X-DATERANGE:".len()..]);
+                    let attrs = parser::parse_attributes(rest);
                     let is_interstitial = attrs.get("CLASS")
-                        .map_or(false, |c| c.contains("com.apple.hls.interstitial"));
+                        .is_some_and(|c| c.contains("com.apple.hls.interstitial"));
                     if is_interstitial {
                         in_interstitial_ctx = true;
                     } else {
@@ -603,12 +607,12 @@ pub fn collect_scte35_ad_breaks(playlists: &[MediaPlaylist]) -> Vec<AdBreak> {
                     }
                     // Cancel any pending non-interstitial CUE-OUT=YES when context changes
                     if in_interstitial_ctx { pending = None; }
-                } else if line.starts_with("#EXT-X-SCTE35:") {
+                } else if let Some(rest) = line.strip_prefix("#EXT-X-SCTE35:") {
                     if in_interstitial_ctx {
                         // This tag belongs to an interstitial break — skip it entirely.
                         continue;
                     }
-                    let attrs = parser::parse_attributes(&line["#EXT-X-SCTE35:".len()..]);
+                    let attrs = parser::parse_attributes(rest);
                     // Only the first segment of a break carries CUE-OUT=YES
                     if attrs.get("CUE-OUT").map(|v| v.as_str()) == Some("YES") {
                         pending = Some(attrs);
@@ -877,8 +881,8 @@ async fn check_media_sequence_monotonicity(playlists: &[MediaPlaylist]) -> Vec<I
                 let new_msn: Option<u64> = resp.response_text.lines()
                     .find(|l| l.trim().starts_with("#EXT-X-MEDIA-SEQUENCE:"))
                     .and_then(|l| l.split_once(':').and_then(|(_, v)| v.trim().parse().ok()));
-                if let Some(new_msn) = new_msn {
-                    if new_msn < pl.media_sequence {
+                if let Some(new_msn) = new_msn
+                    && new_msn < pl.media_sequence {
                         issues.push(Issue {
                             severity: Severity::Error,
                             segment_index: -1,
@@ -901,7 +905,6 @@ async fn check_media_sequence_monotonicity(playlists: &[MediaPlaylist]) -> Vec<I
                             count: 1, seg_first: -1, seg_last: -1,
                         });
                     }
-                }
             }
             Err(e) => {
                 issues.push(Issue::warn(format!(

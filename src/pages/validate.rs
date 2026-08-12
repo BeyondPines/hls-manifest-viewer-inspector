@@ -78,7 +78,7 @@ fn manifest_viewer_href(
     definitions: &std::collections::HashMap<String, String>,
 ) -> String {
     let resolved = replace_hls_variables(url, definitions);
-    let encoded_url = utf8_percent_encode(&*resolved, NON_ALPHANUMERIC);
+    let encoded_url = utf8_percent_encode(&resolved, NON_ALPHANUMERIC);
     if definitions.is_empty() {
         format!("/hls-manifest-viewer/?playlist_url={encoded_url}")
     } else {
@@ -101,7 +101,7 @@ fn manifest_viewer_href_with_asset_list(
 ) -> String {
     let resolved_rendition = replace_hls_variables(rendition_url, definitions);
     let resolved_asset_list = replace_hls_variables(asset_list_url, definitions);
-    let encoded_rendition = utf8_percent_encode(&*resolved_rendition, NON_ALPHANUMERIC);
+    let encoded_rendition = utf8_percent_encode(&resolved_rendition, NON_ALPHANUMERIC);
     let encoded_supplemental = encode_asset_list(&resolved_asset_list, daterange_id);
     if definitions.is_empty() {
         format!(
@@ -313,14 +313,12 @@ fn ValidationResults(report: ValidationReport) -> impl IntoView {
 fn compute_latency(renditions: &[Rendition]) -> Option<(String, String)> {
     let primary = renditions.iter().find(|r| r.media_type == "VIDEO")
         .or_else(|| renditions.first())?;
-    if primary.has_parts {
-        if let Some(phb) = primary.part_hold_back {
-            if phb > 0.0 {
+    if primary.has_parts
+        && let Some(phb) = primary.part_hold_back
+            && phb > 0.0 {
                 let disp = if phb >= 1.0 { format!("{:.1}s", phb) } else { format!("{}ms", (phb * 1000.0) as u64) };
                 return Some((disp, "Est. Latency · LL-HLS".to_string()));
             }
-        }
-    }
     let hb = primary.hold_back.unwrap_or(0.0);
     let latency = if hb > 0.0 { hb } else { primary.target_duration * 3.0 };
     if latency <= 0.0 { return None; }
@@ -1180,22 +1178,20 @@ fn CheckResultsTable(groups: Vec<CheckGroup>, has_interstitials_data: bool, rend
                                                     || iss.message.starts_with("Cumulative EXTINF drift");
                                                 let viewer_links: Vec<(String, String)> = if is_drift {
                                                     let mut links = Vec::new();
-                                                    if let Some(ref ra) = iss.rendition_a {
-                                                        if let Some(url) = rend_url_map.get(ra) {
+                                                    if let Some(ref ra) = iss.rendition_a
+                                                        && let Some(url) = rend_url_map.get(ra) {
                                                             links.push((ra.clone(), format!(
                                                                 "/hls-manifest-viewer/?playlist_url={}",
                                                                 utf8_percent_encode(url, NON_ALPHANUMERIC)
                                                             )));
                                                         }
-                                                    }
-                                                    if let Some(ref rb) = iss.rendition_b {
-                                                        if let Some(url) = rend_url_map.get(rb) {
+                                                    if let Some(ref rb) = iss.rendition_b
+                                                        && let Some(url) = rend_url_map.get(rb) {
                                                             links.push((rb.clone(), format!(
                                                                 "/hls-manifest-viewer/?playlist_url={}",
                                                                 utf8_percent_encode(url, NON_ALPHANUMERIC)
                                                             )));
                                                         }
-                                                    }
                                                     links
                                                 } else {
                                                     Vec::new()
@@ -1219,7 +1215,7 @@ fn CheckResultsTable(groups: Vec<CheckGroup>, has_interstitials_data: bool, rend
                                                              letter-spacing: .06em; margin-bottom: 4px; color: {};",
                                                             sev_color
                                                         )>
-                                                            {format!("{} {}", sev_icon, iss.severity.to_string())}
+                                                            {format!("{} {}", sev_icon, iss.severity)}
                                                         </div>
                                                         <div style="font-size: .85rem; line-height: 1.6; color: var(--color-sky-950);">
                                                             {iss.message.clone()}

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use url::Url;
 use super::types::*;
 
 /// Parse HLS attribute string: KEY=VALUE,KEY="VALUE",... into HashMap
@@ -40,8 +41,15 @@ pub fn parse_attributes(attr_string: &str) -> HashMap<String, String> {
     attrs
 }
 
-/// Resolve a potentially relative URL against a base URL
+/// Resolve a potentially relative URL against a base URL using RFC 3986 semantics
+/// (same behavior as `url::Url::join` used by the manifest viewer).
 pub fn resolve_url(base_url: &str, relative: &str) -> String {
+    if let Ok(base) = Url::parse(base_url)
+        && let Ok(joined) = base.join(relative)
+    {
+        return joined.to_string();
+    }
+    // Fallback for non-absolute bases used in unit tests (e.g. "master.m3u8").
     if relative.starts_with("http://") || relative.starts_with("https://") {
         return relative.to_string();
     }
@@ -54,7 +62,7 @@ pub fn resolve_url(base_url: &str, relative: &str) -> String {
 
 /// Extract the value of a named query parameter from a URL string.
 fn extract_query_param(url: &str, param: &str) -> Option<String> {
-    let query = url.splitn(2, '?').nth(1)?;
+    let query = url.split_once('?')?.1;
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
         if k == param { Some(v.to_string()) } else { None }
@@ -79,8 +87,7 @@ pub fn parse_master_playlist(url: &str, content: &str) -> MasterPlaylist {
             if let Ok(v) = line.split_once(':').unwrap().1.trim().parse::<u32>() {
                 master.version = v;
             }
-        } else if line.starts_with("#EXT-X-STREAM-INF:") {
-            let attr_str = &line["#EXT-X-STREAM-INF:".len()..];
+        } else if let Some(attr_str) = line.strip_prefix("#EXT-X-STREAM-INF:") {
             let attrs = parse_attributes(attr_str);
             i += 1;
             let uri = if i < lines.len() { lines[i].trim().to_string() } else { String::new() };
@@ -97,8 +104,7 @@ pub fn parse_master_playlist(url: &str, content: &str) -> MasterPlaylist {
                 video_range: attrs.get("VIDEO-RANGE").cloned(),
                 is_iframe: false,
             });
-        } else if line.starts_with("#EXT-X-I-FRAME-STREAM-INF:") {
-            let attr_str = &line["#EXT-X-I-FRAME-STREAM-INF:".len()..];
+        } else if let Some(attr_str) = line.strip_prefix("#EXT-X-I-FRAME-STREAM-INF:") {
             let attrs = parse_attributes(attr_str);
             if let Some(uri) = attrs.get("URI") {
                 master.variants.push(MasterRendition {
@@ -115,8 +121,7 @@ pub fn parse_master_playlist(url: &str, content: &str) -> MasterPlaylist {
                     is_iframe: true,
                 });
             }
-        } else if line.starts_with("#EXT-X-MEDIA:") {
-            let attr_str = &line["#EXT-X-MEDIA:".len()..];
+        } else if let Some(attr_str) = line.strip_prefix("#EXT-X-MEDIA:") {
             let attrs = parse_attributes(attr_str);
             master.media_renditions.push(MediaRendition {
                 media_type: attrs.get("TYPE").cloned().unwrap_or_default(),
@@ -124,12 +129,12 @@ pub fn parse_master_playlist(url: &str, content: &str) -> MasterPlaylist {
                 name: attrs.get("NAME").cloned().unwrap_or_default(),
                 uri: attrs.get("URI").map(|u| resolve_url(url, u)),
                 language: attrs.get("LANGUAGE").cloned(),
-                is_default: attrs.get("DEFAULT").map_or(false, |v| v == "YES"),
-                autoselect: attrs.get("AUTOSELECT").map_or(false, |v| v == "YES"),
+                is_default: attrs.get("DEFAULT").is_some_and(|v| v == "YES"),
+                autoselect: attrs.get("AUTOSELECT").is_some_and(|v| v == "YES"),
                 channels: attrs.get("CHANNELS").cloned(),
             });
-        } else if line.starts_with("#EXT-X-DEFINE:") {
-            let attrs = parse_attributes(&line["#EXT-X-DEFINE:".len()..]);
+        } else if let Some(rest) = line.strip_prefix("#EXT-X-DEFINE:") {
+            let attrs = parse_attributes(rest);
             if let (Some(name), Some(value)) = (attrs.get("NAME"), attrs.get("VALUE")) {
                 // Inline definition — store directly
                 master.definitions.insert(name.clone(), value.clone());
@@ -184,8 +189,7 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
             pl.playlist_type = line.split_once(':').map(|(_, v)| v.trim().to_string());
         } else if line.starts_with("#EXT-X-ENDLIST") {
             pl.has_endlist = true;
-        } else if line.starts_with("#EXTINF:") {
-            let val = &line["#EXTINF:".len()..];
+        } else if let Some(val) = line.strip_prefix("#EXTINF:") {
             let comma_pos = val.find(',').unwrap_or(val.len());
             current_duration = val[..comma_pos].trim().parse::<f64>().ok();
             if comma_pos < val.len() {
@@ -194,8 +198,7 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
                     current_title = Some(title.to_string());
                 }
             }
-        } else if line.starts_with("#EXT-X-PROGRAM-DATE-TIME:") {
-            let dt_str = &line["#EXT-X-PROGRAM-DATE-TIME:".len()..];
+        } else if let Some(dt_str) = line.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
             current_pdt = parse_iso8601_to_epoch(dt_str);
             if current_pdt.is_some() {
                 // New PDT anchor — reset cumulative so extrapolation starts fresh from this tag
@@ -204,57 +207,57 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
             }
         } else if line.starts_with("#EXT-X-DISCONTINUITY") && !line.contains(':') {
             current_discontinuity = true;
-        } else if line.starts_with("#EXT-X-BYTERANGE:") {
-            current_byterange = Some(line["#EXT-X-BYTERANGE:".len()..].to_string());
-        } else if line.starts_with("#EXT-X-MAP:") {
-            let attrs = parse_attributes(&line["#EXT-X-MAP:".len()..]);
+        } else if let Some(rest) = line.strip_prefix("#EXT-X-BYTERANGE:") {
+            current_byterange = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("#EXT-X-MAP:") {
+            let attrs = parse_attributes(rest);
             current_map_uri = attrs.get("URI").map(|u| resolve_url(url, u));
-        } else if line.starts_with("#EXT-X-KEY:") {
-            let attrs = parse_attributes(&line["#EXT-X-KEY:".len()..]);
+        } else if let Some(rest) = line.strip_prefix("#EXT-X-KEY:") {
+            let attrs = parse_attributes(rest);
             if let Some(method) = attrs.get("METHOD") {
                 pl.encryption_methods.insert(method.clone());
             }
-        } else if line.starts_with("#EXT-X-SERVER-CONTROL:") {
-            let attrs = parse_attributes(&line["#EXT-X-SERVER-CONTROL:".len()..]);
+        } else if let Some(rest) = line.strip_prefix("#EXT-X-SERVER-CONTROL:") {
+            let attrs = parse_attributes(rest);
             pl.server_control = Some(ServerControl {
                 can_skip_until: attrs.get("CAN-SKIP-UNTIL").and_then(|v| v.parse().ok()),
                 hold_back: attrs.get("HOLD-BACK").and_then(|v| v.parse().ok()),
                 part_hold_back: attrs.get("PART-HOLD-BACK").and_then(|v| v.parse().ok()),
-                can_block_reload: attrs.get("CAN-BLOCK-RELOAD").map_or(false, |v| v == "YES"),
+                can_block_reload: attrs.get("CAN-BLOCK-RELOAD").is_some_and(|v| v == "YES"),
             });
-        } else if line.starts_with("#EXT-X-PART-INF:") {
-            let attrs = parse_attributes(&line["#EXT-X-PART-INF:".len()..]);
+        } else if let Some(rest) = line.strip_prefix("#EXT-X-PART-INF:") {
+            let attrs = parse_attributes(rest);
             pl.part_target = attrs.get("PART-TARGET").and_then(|v| v.parse().ok());
-        } else if line.starts_with("#EXT-X-PART:") {
-            let attrs = parse_attributes(&line["#EXT-X-PART:".len()..]);
+        } else if let Some(rest) = line.strip_prefix("#EXT-X-PART:") {
+            let attrs = parse_attributes(rest);
             if let Some(uri) = attrs.get("URI") {
                 pl.parts.push(PartialSegment {
                     uri: resolve_url(url, uri),
                     duration: attrs.get("DURATION").and_then(|v| v.parse().ok()).unwrap_or(0.0),
-                    independent: attrs.get("INDEPENDENT").map_or(false, |v| v == "YES"),
-                    gap: attrs.get("GAP").map_or(false, |v| v == "YES"),
+                    independent: attrs.get("INDEPENDENT").is_some_and(|v| v == "YES"),
+                    gap: attrs.get("GAP").is_some_and(|v| v == "YES"),
                 });
             }
-        } else if line.starts_with("#EXT-X-PRELOAD-HINT:") {
-            let attrs = parse_attributes(&line["#EXT-X-PRELOAD-HINT:".len()..]);
+        } else if let Some(rest) = line.strip_prefix("#EXT-X-PRELOAD-HINT:") {
+            let attrs = parse_attributes(rest);
             if let Some(uri) = attrs.get("URI") {
                 pl.preload_hint_uri = Some(resolve_url(url, uri));
             }
             pl.preload_hint_type = attrs.get("TYPE").cloned();
-        } else if line.starts_with("#EXT-X-RENDITION-REPORT:") {
-            let attrs = parse_attributes(&line["#EXT-X-RENDITION-REPORT:".len()..]);
+        } else if let Some(rest) = line.strip_prefix("#EXT-X-RENDITION-REPORT:") {
+            let attrs = parse_attributes(rest);
             let uri = attrs.get("URI").map(|u| resolve_url(url, u)).unwrap_or_default();
             let last_msn = attrs.get("LAST-MSN").and_then(|v| v.parse::<i64>().ok()).unwrap_or(-1);
             let last_part = attrs.get("LAST-PART").and_then(|v| v.parse::<i64>().ok()).unwrap_or(-1);
             pl.rendition_reports.push(super::types::RenditionReport { uri, last_msn, last_part });
-        } else if line.starts_with("#EXT-X-DEFINE:") {
-            let attrs = parse_attributes(&line["#EXT-X-DEFINE:".len()..]);
+        } else if let Some(rest) = line.strip_prefix("#EXT-X-DEFINE:") {
+            let attrs = parse_attributes(rest);
             // Only handle NAME+VALUE inline definitions; IMPORT and QUERYPARAM cannot be resolved here
             if let (Some(name), Some(value)) = (attrs.get("NAME"), attrs.get("VALUE")) {
                 pl.definitions.insert(name.clone(), value.clone());
             }
-        } else if line.starts_with("#EXT-X-SKIP:") {
-            let attrs = parse_attributes(&line["#EXT-X-SKIP:".len()..]);
+        } else if let Some(rest) = line.strip_prefix("#EXT-X-SKIP:") {
+            let attrs = parse_attributes(rest);
             if let Some(skipped) = attrs.get("SKIPPED-SEGMENTS").and_then(|v| v.parse::<u64>().ok()) {
                 pl.skipped_segments = skipped;
             }
@@ -271,11 +274,7 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
                     last_pdt = None;
                     cumulative_duration = 0.0;
                     None
-                } else if let Some(lp) = last_pdt {
-                    Some(lp + cumulative_duration)
-                } else {
-                    None
-                };
+                } else { last_pdt.map(|lp| lp + cumulative_duration) };
                 pl.segments.push(Segment {
                     uri: resolve_url(url, line),
                     duration: dur,
@@ -421,6 +420,24 @@ mod tests {
         assert_eq!(
             resolve_url(base, "video/1080p.m3u8"),
             "https://cdn.example.com/hls/video/1080p.m3u8"
+        );
+    }
+
+    #[test]
+    fn resolve_url_parent_directory_normalized() {
+        let base = "https://ads.com/1234/main/mvp.m3u8";
+        assert_eq!(
+            resolve_url(base, "../media/3.m3u8"),
+            "https://ads.com/1234/media/3.m3u8"
+        );
+    }
+
+    #[test]
+    fn resolve_url_root_relative() {
+        let base = "https://cdn.example.com/hls/master.m3u8";
+        assert_eq!(
+            resolve_url(base, "/abs/path.m3u8"),
+            "https://cdn.example.com/abs/path.m3u8"
         );
     }
 

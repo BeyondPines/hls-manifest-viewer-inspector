@@ -870,7 +870,7 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
 
         // 2. CAN-BLOCK-RELOAD=YES required when parts exist
         if has_parts {
-            let can_block = pl.server_control.as_ref().map_or(false, |sc| sc.can_block_reload);
+            let can_block = pl.server_control.as_ref().is_some_and(|sc| sc.can_block_reload);
             if !can_block {
                 issues.push(Issue {
                     severity: Severity::Error,
@@ -919,13 +919,13 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
             let mut seg_idx: usize = 0;
             for line in pl.raw_content.lines() {
                 let l = line.trim();
-                if l.starts_with("#EXT-X-PART:") {
-                    let attrs = super::parser::parse_attributes(&l["#EXT-X-PART:".len()..]);
-                    let indep = attrs.get("INDEPENDENT").map_or(false, |v| v == "YES");
+                if let Some(rest) = l.strip_prefix("#EXT-X-PART:") {
+                    let attrs = super::parser::parse_attributes(rest);
+                    let indep = attrs.get("INDEPENDENT").is_some_and(|v| v == "YES");
                     pending_independent.push(indep);
                 } else if l.starts_with("#EXTINF:") {
-                    if let Some(&first_indep) = pending_independent.first() {
-                        if !first_indep {
+                    if let Some(&first_indep) = pending_independent.first()
+                        && !first_indep {
                             issues.push(Issue {
                                 severity: Severity::Error,
                                 segment_index: seg_idx as i32,
@@ -942,7 +942,6 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
                                 count: 1, seg_first: -1, seg_last: -1,
                             });
                         }
-                    }
                     pending_independent.clear();
                     seg_idx += 1;
                 }
@@ -993,9 +992,9 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
         }
 
         // 7. SERVER-CONTROL: CAN-SKIP-UNTIL MUST be >= 6× TARGETDURATION (§4.4.3.8)
-        if let Some(sc) = &pl.server_control {
-            if let Some(csu) = sc.can_skip_until {
-                if pl.target_duration > 0.0 && csu < pl.target_duration * 6.0 - 0.001 {
+        if let Some(sc) = &pl.server_control
+            && let Some(csu) = sc.can_skip_until
+                && pl.target_duration > 0.0 && csu < pl.target_duration * 6.0 - 0.001 {
                     issues.push(Issue {
                         severity: Severity::Error,
                         segment_index: -1,
@@ -1014,8 +1013,6 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
                         count: 1, seg_first: -1, seg_last: -1,
                     });
                 }
-            }
-        }
 
         // 8. SERVER-CONTROL: PART-HOLD-BACK >= 2× PART-TARGET (MUST), >= 3× (SHOULD)
         if let Some(sc) = &pl.server_control {
@@ -1055,8 +1052,8 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
                 }
             }
             // HOLD-BACK >= 3× TARGETDURATION
-            if let Some(hb) = sc.hold_back {
-                if pl.target_duration > 0.0 && hb < pl.target_duration * 3.0 - 0.001 {
+            if let Some(hb) = sc.hold_back
+                && pl.target_duration > 0.0 && hb < pl.target_duration * 3.0 - 0.001 {
                     issues.push(Issue {
                         severity: Severity::Error,
                         segment_index: -1,
@@ -1075,7 +1072,6 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
                         count: 1, seg_first: -1, seg_last: -1,
                     });
                 }
-            }
         }
     }
 
@@ -1181,8 +1177,8 @@ pub fn check_media_sequence_continuity(playlists: &[MediaPlaylist]) -> Vec<Issue
                     pl.name
                 )));
             }
-            if let Some(uri_msn) = extract_msn_from_uri(&segs[0].uri) {
-                if uri_msn != 0 {
+            if let Some(uri_msn) = extract_msn_from_uri(&segs[0].uri)
+                && uri_msn != 0 {
                     issues.push(Issue {
                         severity: Severity::Error,
                         segment_index: 0,
@@ -1200,7 +1196,6 @@ pub fn check_media_sequence_continuity(playlists: &[MediaPlaylist]) -> Vec<Issue
                         count: 1, seg_first: -1, seg_last: -1,
                     });
                 }
-            }
         }
 
         // EXT-X-MEDIA-SEQUENCE MUST appear before the first Media Segment URI
@@ -1218,8 +1213,8 @@ pub fn check_media_sequence_continuity(playlists: &[MediaPlaylist]) -> Vec<Issue
                 }
                 after_extinf = l.starts_with("#EXTINF:");
             }
-            if let (Some(tl), Some(sl)) = (tag_line, first_seg_line) {
-                if tl > sl {
+            if let (Some(tl), Some(sl)) = (tag_line, first_seg_line)
+                && tl > sl {
                     issues.push(Issue {
                         severity: Severity::Error,
                         segment_index: -1,
@@ -1237,15 +1232,14 @@ pub fn check_media_sequence_continuity(playlists: &[MediaPlaylist]) -> Vec<Issue
                         count: 1, seg_first: -1, seg_last: -1,
                     });
                 }
-            }
         }
 
         // URI-embedded MSN consistency
         let base_msn = pl.media_sequence + pl.skipped_segments;
         for (idx, seg) in segs.iter().enumerate() {
             let expected = base_msn + idx as u64;
-            if let Some(actual) = extract_msn_from_uri(&seg.uri) {
-                if actual != expected {
+            if let Some(actual) = extract_msn_from_uri(&seg.uri)
+                && actual != expected {
                     issues.push(Issue {
                         severity: Severity::Warn,
                         segment_index: idx as i32,
@@ -1264,7 +1258,6 @@ pub fn check_media_sequence_continuity(playlists: &[MediaPlaylist]) -> Vec<Issue
                         count: 1, seg_first: -1, seg_last: -1,
                     });
                 }
-            }
         }
     }
     issues
@@ -1286,10 +1279,10 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
         let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for line in pl.raw_content.lines() {
             let line = line.trim();
-            if !line.starts_with("#EXT-X-DATERANGE:") {
+            let Some(rest) = line.strip_prefix("#EXT-X-DATERANGE:") else {
                 continue;
-            }
-            let attrs = super::parser::parse_attributes(&line["#EXT-X-DATERANGE:".len()..]);
+            };
+            let attrs = super::parser::parse_attributes(rest);
             let class = attrs.get("CLASS").cloned().unwrap_or_default();
             if !class.contains("com.apple.hls.interstitial") {
                 continue;
@@ -1430,8 +1423,8 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
             }
 
             // Validate X-CONTENT-MAY-VARY — §D.2: valid values "YES" and "NO"
-            if let Some(ref cmv) = attrs.get("X-CONTENT-MAY-VARY").cloned() {
-                if cmv != "YES" && cmv != "NO" {
+            if let Some(ref cmv) = attrs.get("X-CONTENT-MAY-VARY").cloned()
+                && cmv != "YES" && cmv != "NO" {
                     entry_errors.push(format!("X-CONTENT-MAY-VARY='{}' invalid (must be YES or NO)", cmv));
                     issues.push(Issue {
                         severity: Severity::Warn,
@@ -1449,11 +1442,10 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
                         count: 1, seg_first: -1, seg_last: -1,
                     });
                 }
-            }
 
             // Validate X-TIMELINE-OCCUPIES — §D.2: valid values "POINT" and "RANGE"
-            if let Some(ref to) = attrs.get("X-TIMELINE-OCCUPIES").cloned() {
-                if to != "POINT" && to != "RANGE" {
+            if let Some(ref to) = attrs.get("X-TIMELINE-OCCUPIES").cloned()
+                && to != "POINT" && to != "RANGE" {
                     entry_errors.push(format!("X-TIMELINE-OCCUPIES='{}' invalid (must be POINT or RANGE)", to));
                     issues.push(Issue {
                         severity: Severity::Warn,
@@ -1471,11 +1463,10 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
                         count: 1, seg_first: -1, seg_last: -1,
                     });
                 }
-            }
 
             // Validate X-TIMELINE-STYLE — §D.2: valid values "HIGHLIGHT" and "PRIMARY"
-            if let Some(ref ts) = attrs.get("X-TIMELINE-STYLE").cloned() {
-                if ts != "HIGHLIGHT" && ts != "PRIMARY" {
+            if let Some(ref ts) = attrs.get("X-TIMELINE-STYLE").cloned()
+                && ts != "HIGHLIGHT" && ts != "PRIMARY" {
                     entry_errors.push(format!("X-TIMELINE-STYLE='{}' invalid (must be HIGHLIGHT or PRIMARY)", ts));
                     issues.push(Issue {
                         severity: Severity::Warn,
@@ -1493,7 +1484,6 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
                         count: 1, seg_first: -1, seg_last: -1,
                     });
                 }
-            }
 
             // Validate X-SKIP-CONTROL-LABEL-ID — §D.3: characters must be [a-z][A-Z]'-''_' only
             if let Some(ref label_id) = attrs.get("X-SKIP-CONTROL-LABEL-ID").cloned() {
@@ -1556,10 +1546,10 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
     for pl in playlists {
         for line in pl.raw_content.lines() {
             let line = line.trim();
-            if !line.starts_with("#EXT-X-DATERANGE:") { continue; }
-            let attrs = super::parser::parse_attributes(&line["#EXT-X-DATERANGE:".len()..]);
+            let Some(rest) = line.strip_prefix("#EXT-X-DATERANGE:") else { continue; };
+            let attrs = super::parser::parse_attributes(rest);
             // Skip OUT tags (already processed above) — only want IN tags (no CLASS)
-            if attrs.get("CLASS").map_or(false, |c| c.contains("com.apple.hls.interstitial")) {
+            if attrs.get("CLASS").is_some_and(|c| c.contains("com.apple.hls.interstitial")) {
                 continue;
             }
             let id = attrs.get("ID").cloned().unwrap_or_default();
