@@ -678,194 +678,6 @@ fn classify_scte35_id(id: &str) -> String {
 }
 
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn seg(duration: f64, pdt: Option<f64>) -> types::Segment {
-        types::Segment {
-            uri: "seg.mp4".to_string(),
-            duration,
-            title: None,
-            pdt,
-            discontinuity: false,
-            byterange: None,
-            is_ad: false,
-            map_uri: None,
-        }
-    }
-
-    // ── is_master_playlist ────────────────────────────────────────────────────
-
-    #[test]
-    fn is_master_detects_stream_inf() {
-        assert!(is_master_playlist("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=3000000\nvideo.m3u8\n"));
-    }
-
-    #[test]
-    fn is_master_detects_iframe_stream_inf() {
-        assert!(is_master_playlist("#EXTM3U\n#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=1000000,URI=\"iframe.m3u8\"\n"));
-    }
-
-    #[test]
-    fn is_master_false_for_media_playlist() {
-        assert!(!is_master_playlist("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:4.0,\nseg0.mp4\n"));
-    }
-
-    // ── derive_color_info ─────────────────────────────────────────────────────
-
-    #[test]
-    fn derive_color_info_hdr10_from_pq() {
-        assert_eq!(derive_color_info(Some("PQ"), None), Some("HDR10".to_string()));
-    }
-
-    #[test]
-    fn derive_color_info_hlg() {
-        assert_eq!(derive_color_info(Some("HLG"), None), Some("HLG".to_string()));
-    }
-
-    #[test]
-    fn derive_color_info_sdr() {
-        assert_eq!(derive_color_info(Some("SDR"), None), Some("SDR".to_string()));
-    }
-
-    #[test]
-    fn derive_color_info_dolby_vision_hevc() {
-        let result = derive_color_info(None, Some("dvh1.08.07,hvc1.2.4.L153.B0"));
-        assert_eq!(result, Some("Dolby Vision (HEVC)".to_string()));
-    }
-
-    #[test]
-    fn derive_color_info_dolby_vision_av1() {
-        let result = derive_color_info(None, Some("av01.0.08M.10,dav1.0.09M.10"));
-        assert_eq!(result, Some("Dolby Vision (AV1)".to_string()));
-    }
-
-    #[test]
-    fn derive_color_info_no_range_no_dv_is_none() {
-        assert_eq!(derive_color_info(None, Some("avc1.64001f,mp4a.40.2")), None);
-    }
-
-    // ── pdt_span_or_extinf_sum ────────────────────────────────────────────────
-
-    #[test]
-    fn pdt_span_uses_pdt_when_available() {
-        let mut pl = MediaPlaylist::new("v".to_string(), "https://cdn.example.com/v.m3u8".to_string());
-        // 3 segments with explicit PDTs
-        let base = 1_700_000_000.0_f64;
-        pl.segments = vec![
-            seg(4.0, Some(base)),
-            seg(4.0, Some(base + 4.0)),
-            seg(4.0, Some(base + 8.0)),
-        ];
-        // span = (last_pdt - first_pdt) + last_dur = (base+8 - base) + 4 = 12
-        let span = pdt_span_or_extinf_sum(&pl);
-        assert!((span - 12.0).abs() < 0.001, "expected 12.0 got {span}");
-    }
-
-    #[test]
-    fn pdt_span_falls_back_to_extinf_sum_without_pdt() {
-        let mut pl = MediaPlaylist::new("v".to_string(), "https://cdn.example.com/v.m3u8".to_string());
-        pl.segments = vec![seg(4.0, None), seg(6.0, None), seg(4.0, None)];
-        let sum = pdt_span_or_extinf_sum(&pl);
-        assert!((sum - 14.0).abs() < 0.001, "expected 14.0 got {sum}");
-    }
-
-    #[test]
-    fn pdt_span_includes_skipped_segment_estimate() {
-        let mut pl = MediaPlaylist::new("v".to_string(), "https://cdn.example.com/v.m3u8".to_string());
-        pl.target_duration = 4.0;
-        pl.skipped_segments = 3;
-        pl.segments = vec![seg(4.0, None), seg(4.0, None)];
-        // sum = 8.0 + 3*4.0 = 20.0
-        let sum = pdt_span_or_extinf_sum(&pl);
-        assert!((sum - 20.0).abs() < 0.001, "expected 20.0 got {sum}");
-    }
-
-    // ── classify_scte35_id ────────────────────────────────────────────────────
-
-    #[test]
-    fn scte35_classify_ad_break() {
-        assert_eq!(classify_scte35_id("0x30-1-12345678"), "ad_break");
-        assert_eq!(classify_scte35_id("0x34-2-99999999"), "ad_break");
-    }
-
-    #[test]
-    fn scte35_classify_program() {
-        assert_eq!(classify_scte35_id("0x10-1-12345678"), "program");
-    }
-
-    #[test]
-    fn scte35_classify_chapter() {
-        assert_eq!(classify_scte35_id("0x20-1-12345678"), "chapter");
-    }
-
-    #[test]
-    fn scte35_classify_frame_ad() {
-        assert_eq!(classify_scte35_id("0x38-1-12345678"), "frame_ad");
-    }
-
-    #[test]
-    fn scte35_classify_network() {
-        assert_eq!(classify_scte35_id("0x50-1-12345678"), "network");
-    }
-
-    #[test]
-    fn scte35_classify_breakaway() {
-        assert_eq!(classify_scte35_id("0x40-1-12345678"), "breakaway");
-    }
-
-    #[test]
-    fn scte35_classify_unknown_is_other() {
-        assert_eq!(classify_scte35_id("unknown-id"), "other");
-        assert_eq!(classify_scte35_id(""), "other");
-    }
-
-    // ── apply_master_definitions ──────────────────────────────────────────────
-
-    #[test]
-    fn apply_master_definitions_copies_all_defs_as_fallback() {
-        let mut master_defs = std::collections::HashMap::new();
-        master_defs.insert("VAR_A".to_string(), "valueA".to_string());
-        master_defs.insert("VAR_B".to_string(), "valueB".to_string());
-
-        let mut pl_defs = std::collections::HashMap::new();
-        // No IMPORT lines in content; apply_master_definitions should copy everything
-        apply_master_definitions("", &master_defs, &mut pl_defs);
-
-        assert_eq!(pl_defs.get("VAR_A"), Some(&"valueA".to_string()));
-        assert_eq!(pl_defs.get("VAR_B"), Some(&"valueB".to_string()));
-    }
-
-    #[test]
-    fn apply_master_definitions_does_not_overwrite_existing_pl_def() {
-        let mut master_defs = std::collections::HashMap::new();
-        master_defs.insert("VAR_A".to_string(), "from_master".to_string());
-
-        let mut pl_defs = std::collections::HashMap::new();
-        pl_defs.insert("VAR_A".to_string(), "from_pl".to_string());
-
-        apply_master_definitions("", &master_defs, &mut pl_defs);
-
-        // Playlist's own definition must win
-        assert_eq!(pl_defs.get("VAR_A"), Some(&"from_pl".to_string()));
-    }
-
-    #[test]
-    fn resolve_imports_picks_up_explicit_import_tag() {
-        let mut master_defs = std::collections::HashMap::new();
-        master_defs.insert("TOKEN".to_string(), "abc123".to_string());
-        master_defs.insert("OTHER".to_string(), "ignored".to_string());
-
-        let content = "#EXT-X-DEFINE:IMPORT=\"TOKEN\"\n";
-        let mut pl_defs = std::collections::HashMap::new();
-        resolve_imports(content, &master_defs, &mut pl_defs);
-
-        // Only "TOKEN" should be imported (explicit IMPORT)
-        assert_eq!(pl_defs.get("TOKEN"), Some(&"abc123".to_string()));
-        assert!(pl_defs.get("OTHER").is_none(), "OTHER was not imported");
-    }
-}
 
 /// rfc8216bis §4.4.3.2 — MSN monotonicity: re-fetch live playlists and verify the
 /// EXT-X-MEDIA-SEQUENCE value does not decrease between fetches.
@@ -1079,4 +891,193 @@ async fn check_playlist_delta_updates(playlists: &[MediaPlaylist]) -> (Vec<Issue
     }
 
     (issues, reports)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seg(duration: f64, pdt: Option<f64>) -> types::Segment {
+        types::Segment {
+            uri: "seg.mp4".to_string(),
+            duration,
+            title: None,
+            pdt,
+            discontinuity: false,
+            byterange: None,
+            is_ad: false,
+            map_uri: None,
+        }
+    }
+
+    // ── is_master_playlist ────────────────────────────────────────────────────
+
+    #[test]
+    fn is_master_detects_stream_inf() {
+        assert!(is_master_playlist("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=3000000\nvideo.m3u8\n"));
+    }
+
+    #[test]
+    fn is_master_detects_iframe_stream_inf() {
+        assert!(is_master_playlist("#EXTM3U\n#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=1000000,URI=\"iframe.m3u8\"\n"));
+    }
+
+    #[test]
+    fn is_master_false_for_media_playlist() {
+        assert!(!is_master_playlist("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:4.0,\nseg0.mp4\n"));
+    }
+
+    // ── derive_color_info ─────────────────────────────────────────────────────
+
+    #[test]
+    fn derive_color_info_hdr10_from_pq() {
+        assert_eq!(derive_color_info(Some("PQ"), None), Some("HDR10".to_string()));
+    }
+
+    #[test]
+    fn derive_color_info_hlg() {
+        assert_eq!(derive_color_info(Some("HLG"), None), Some("HLG".to_string()));
+    }
+
+    #[test]
+    fn derive_color_info_sdr() {
+        assert_eq!(derive_color_info(Some("SDR"), None), Some("SDR".to_string()));
+    }
+
+    #[test]
+    fn derive_color_info_dolby_vision_hevc() {
+        let result = derive_color_info(None, Some("dvh1.08.07,hvc1.2.4.L153.B0"));
+        assert_eq!(result, Some("Dolby Vision (HEVC)".to_string()));
+    }
+
+    #[test]
+    fn derive_color_info_dolby_vision_av1() {
+        let result = derive_color_info(None, Some("av01.0.08M.10,dav1.0.09M.10"));
+        assert_eq!(result, Some("Dolby Vision (AV1)".to_string()));
+    }
+
+    #[test]
+    fn derive_color_info_no_range_no_dv_is_none() {
+        assert_eq!(derive_color_info(None, Some("avc1.64001f,mp4a.40.2")), None);
+    }
+
+    // ── pdt_span_or_extinf_sum ────────────────────────────────────────────────
+
+    #[test]
+    fn pdt_span_uses_pdt_when_available() {
+        let mut pl = MediaPlaylist::new("v".to_string(), "https://cdn.example.com/v.m3u8".to_string());
+        // 3 segments with explicit PDTs
+        let base = 1_700_000_000.0_f64;
+        pl.segments = vec![
+            seg(4.0, Some(base)),
+            seg(4.0, Some(base + 4.0)),
+            seg(4.0, Some(base + 8.0)),
+        ];
+        // span = (last_pdt - first_pdt) + last_dur = (base+8 - base) + 4 = 12
+        let span = pdt_span_or_extinf_sum(&pl);
+        assert!((span - 12.0).abs() < 0.001, "expected 12.0 got {span}");
+    }
+
+    #[test]
+    fn pdt_span_falls_back_to_extinf_sum_without_pdt() {
+        let mut pl = MediaPlaylist::new("v".to_string(), "https://cdn.example.com/v.m3u8".to_string());
+        pl.segments = vec![seg(4.0, None), seg(6.0, None), seg(4.0, None)];
+        let sum = pdt_span_or_extinf_sum(&pl);
+        assert!((sum - 14.0).abs() < 0.001, "expected 14.0 got {sum}");
+    }
+
+    #[test]
+    fn pdt_span_includes_skipped_segment_estimate() {
+        let mut pl = MediaPlaylist::new("v".to_string(), "https://cdn.example.com/v.m3u8".to_string());
+        pl.target_duration = 4.0;
+        pl.skipped_segments = 3;
+        pl.segments = vec![seg(4.0, None), seg(4.0, None)];
+        // sum = 8.0 + 3*4.0 = 20.0
+        let sum = pdt_span_or_extinf_sum(&pl);
+        assert!((sum - 20.0).abs() < 0.001, "expected 20.0 got {sum}");
+    }
+
+    // ── classify_scte35_id ────────────────────────────────────────────────────
+
+    #[test]
+    fn scte35_classify_ad_break() {
+        assert_eq!(classify_scte35_id("0x30-1-12345678"), "ad_break");
+        assert_eq!(classify_scte35_id("0x34-2-99999999"), "ad_break");
+    }
+
+    #[test]
+    fn scte35_classify_program() {
+        assert_eq!(classify_scte35_id("0x10-1-12345678"), "program");
+    }
+
+    #[test]
+    fn scte35_classify_chapter() {
+        assert_eq!(classify_scte35_id("0x20-1-12345678"), "chapter");
+    }
+
+    #[test]
+    fn scte35_classify_frame_ad() {
+        assert_eq!(classify_scte35_id("0x38-1-12345678"), "frame_ad");
+    }
+
+    #[test]
+    fn scte35_classify_network() {
+        assert_eq!(classify_scte35_id("0x50-1-12345678"), "network");
+    }
+
+    #[test]
+    fn scte35_classify_breakaway() {
+        assert_eq!(classify_scte35_id("0x40-1-12345678"), "breakaway");
+    }
+
+    #[test]
+    fn scte35_classify_unknown_is_other() {
+        assert_eq!(classify_scte35_id("unknown-id"), "other");
+        assert_eq!(classify_scte35_id(""), "other");
+    }
+
+    // ── apply_master_definitions ──────────────────────────────────────────────
+
+    #[test]
+    fn apply_master_definitions_copies_all_defs_as_fallback() {
+        let mut master_defs = std::collections::HashMap::new();
+        master_defs.insert("VAR_A".to_string(), "valueA".to_string());
+        master_defs.insert("VAR_B".to_string(), "valueB".to_string());
+
+        let mut pl_defs = std::collections::HashMap::new();
+        // No IMPORT lines in content; apply_master_definitions should copy everything
+        apply_master_definitions("", &master_defs, &mut pl_defs);
+
+        assert_eq!(pl_defs.get("VAR_A"), Some(&"valueA".to_string()));
+        assert_eq!(pl_defs.get("VAR_B"), Some(&"valueB".to_string()));
+    }
+
+    #[test]
+    fn apply_master_definitions_does_not_overwrite_existing_pl_def() {
+        let mut master_defs = std::collections::HashMap::new();
+        master_defs.insert("VAR_A".to_string(), "from_master".to_string());
+
+        let mut pl_defs = std::collections::HashMap::new();
+        pl_defs.insert("VAR_A".to_string(), "from_pl".to_string());
+
+        apply_master_definitions("", &master_defs, &mut pl_defs);
+
+        // Playlist's own definition must win
+        assert_eq!(pl_defs.get("VAR_A"), Some(&"from_pl".to_string()));
+    }
+
+    #[test]
+    fn resolve_imports_picks_up_explicit_import_tag() {
+        let mut master_defs = std::collections::HashMap::new();
+        master_defs.insert("TOKEN".to_string(), "abc123".to_string());
+        master_defs.insert("OTHER".to_string(), "ignored".to_string());
+
+        let content = "#EXT-X-DEFINE:IMPORT=\"TOKEN\"\n";
+        let mut pl_defs = std::collections::HashMap::new();
+        resolve_imports(content, &master_defs, &mut pl_defs);
+
+        // Only "TOKEN" should be imported (explicit IMPORT)
+        assert_eq!(pl_defs.get("TOKEN"), Some(&"abc123".to_string()));
+        assert!(!pl_defs.contains_key("OTHER"), "OTHER was not imported");
+    }
 }
