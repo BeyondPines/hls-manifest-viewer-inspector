@@ -10,7 +10,7 @@ use quick_m3u8::{
     HlsLine, Reader,
     tag::{KnownTag, HlsPlaylistType, hls::Tag},
 };
-use std::{collections::HashSet, io::Cursor};
+use std::{collections::{HashMap, HashSet}, io::Cursor};
 
 // ── WASM thread-safety shim ─────────────────────────────────────────────────────────────────────────
 // on_cleanup requires Send + Sync. Browser closures are !Send; WASM is single-threaded
@@ -124,7 +124,7 @@ pub struct DrmInfo {
     pub system_id: String,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Mp4ProbeInfo {
     major_brand: Option<String>,
     video_codec_override: Option<String>,
@@ -829,6 +829,93 @@ fn probe_mp4(data: Vec<u8>) -> Mp4ProbeInfo {
 
 // ── Main probe function ───────────────────────────────────────────────────────
 
+/// Cache key for an init-segment fetch: absolute URI plus optional byte range.
+type InitCacheKey = (String, Option<(u64, u64)>);
+
+/// Fetch a playlist body, returning a cached result when the same URI was
+/// already fetched earlier in this run (masters often repeat the same media
+/// playlist URI once per AUDIO group).
+async fn fetch_text_cached(
+    cache: &mut HashMap<String, Result<String, String>>,
+    url: String,
+) -> Result<String, String> {
+    if let Some(cached) = cache.get(&url) {
+        return cached.clone();
+    }
+    let result = match fetch_text(url.clone()).await {
+        Ok(r) => Ok(r.response_text),
+        Err(e) => Err(e.to_string()),
+    };
+    cache.insert(url, result.clone());
+    result
+}
+
+/// Fetch + probe an init segment, returning a cached result when the same
+/// `(url, byterange)` was already probed earlier in this run.
+async fn fetch_probe_init(
+    cache: &mut HashMap<InitCacheKey, Result<Mp4ProbeInfo, String>>,
+    url: String,
+    range: Option<RequestRange>,
+) -> Result<Mp4ProbeInfo, String> {
+    let key = (url.clone(), range.map(|r| (r.start, r.end)));
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+    let result = match fetch_array_buffer(url, range).await {
+        Ok(resp) => Ok(probe_mp4(resp.response_body)),
+        Err(e) => Err(e.to_string()),
+    };
+    cache.insert(key, result.clone());
+    result
+}
+
+fn apply_muxed_audio(at: &mut AudioTrackInfo, mp4: &Mp4ProbeInfo) {
+    if at.sample_rate.is_none() {
+        at.sample_rate = mp4.audio_sample_rate;
+    }
+    if at.bit_depth.is_none() {
+        at.bit_depth = mp4.audio_bit_depth;
+    }
+    if at.channels.is_none() {
+        at.channels = mp4.audio_channels.map(|c| c as u32);
+        if let Some(n) = at.channels {
+            at.channel_layout.replace(channels_to_layout(n));
+        }
+    }
+}
+
+fn apply_video_init(vt: &mut VideoTrackInfo, mp4: &Mp4ProbeInfo) {
+    if vt.codec.is_none()
+        && let Some(c) = mp4.video_codec_override.clone()
+    {
+        vt.codec = Some(c);
+    }
+    if vt.profile.is_none() {
+        vt.profile = mp4.video_profile.clone();
+    }
+    if vt.level.is_none() {
+        vt.level = mp4.video_level.clone();
+    }
+    if let Some(v) = mp4.video_bit_depth {
+        vt.bit_depth = Some(v);
+    }
+    if let Some(v) = mp4.video_color_primaries.clone() {
+        vt.color_primaries = Some(v);
+    }
+    if let Some(v) = mp4.video_transfer_char.clone() {
+        vt.transfer_characteristics = Some(v);
+    }
+    if let Some(v) = mp4.video_matrix_coefficients.clone() {
+        vt.matrix_coefficients = Some(v);
+    }
+    if let Some(v) = mp4.video_full_range {
+        vt.full_range = Some(v);
+    }
+    if let Some(v) = mp4.video_pixel_format.clone() {
+        vt.pixel_format = Some(v);
+    }
+}
+
 async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeReport, FetchError> {
     let mut r = ProbeReport { url: url.to_string(), ..Default::default() };
 
@@ -958,22 +1045,34 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
             });
         }
 
-        // Probe variant media playlists.
-        // Duration/LL-HLS metadata comes from the first variant only to keep fetch count low.
-        // Init segment is probed per-variant so each track gets its own codec/colr metadata.
+        // Probe each variant playlist once. Duration/encryption/LL-HLS come from
+        // the first successful fetch; init segments are cached by (url, byterange)
+        // so shared MAP targets (and the first-variant double-fetch) are avoided.
         let non_iframe_variants: Vec<_> = master.variants.iter().filter(|v| !v.is_iframe).collect();
-        if let Some(first) = non_iframe_variants.first()
-            && let Ok(mr) = fetch_text(first.uri.clone()).await {
-                let pl = parse_media_playlist(&first.uri, &mr.response_text);
+        let mut init_cache: HashMap<InitCacheKey, Result<Mp4ProbeInfo, String>> = HashMap::new();
+        let mut playlist_cache: HashMap<String, Result<String, String>> = HashMap::new();
+        let mut first_muxed_audio: Option<Mp4ProbeInfo> = None;
+
+        for (i, (vt, variant)) in r
+            .video_tracks
+            .iter_mut()
+            .zip(non_iframe_variants.iter())
+            .enumerate()
+        {
+            let Ok(body) = fetch_text_cached(&mut playlist_cache, variant.uri.clone()).await else {
+                continue;
+            };
+            let pl = parse_media_playlist(&variant.uri, &body);
+
+            if i == 0 {
                 r.target_duration = Some(pl.target_duration);
                 r.playlist_type = pl.playlist_type.clone();
                 r.is_live = !pl.has_endlist;
                 r.total_segments = pl.segments.len();
                 r.duration_s = Some(pl.segments.iter().map(|s| s.duration).sum());
-                let (methods, fmts) = parse_key_info(&mr.response_text);
+                let (methods, fmts) = parse_key_info(&body);
                 r.encryption_methods = methods;
                 r.key_formats = fmts.clone();
-                // Detect DRM from EXT-X-KEY KEYFORMAT (FairPlay carries no PSSH)
                 for d in drm_from_key_formats(&fmts) {
                     if !r.drm_systems.iter().any(|e| e.system_id == d.system_id) {
                         r.drm_systems.push(d);
@@ -986,100 +1085,81 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                         can_block_reload: sc.can_block_reload,
                     });
                 }
-                // Probe init segment of first variant for muxed-audio and DRM data.
-                // Each variant gets its own init probe below for per-track metadata.
-                if needs_init
-                    && let Some((iurl, irange)) = pl.init_segment()
-                        && let Ok(resp) = fetch_array_buffer(iurl, irange).await {
-                            let mp4 = probe_mp4(resp.response_body);
-                            r.major_brand = mp4.major_brand.clone();
-                            // Muxed streams: first init segment carries audio info
-                            for at in r.audio_tracks.iter_mut() {
-                                if at.sample_rate.is_none() { at.sample_rate = mp4.audio_sample_rate; }
-                                if at.bit_depth.is_none()   { at.bit_depth   = mp4.audio_bit_depth;   }
-                                if at.channels.is_none() {
-                                    at.channels = mp4.audio_channels.map(|c| c as u32);
-                                    if let Some(n) = at.channels {
-                                        at.channel_layout = Some(channels_to_layout(n));
-                                    }
-                                }
-                            }
-                            for d in mp4.drm_systems {
-                                if !r.drm_systems.iter().any(|e| e.system_id == d.system_id) {
-                                    r.drm_systems.push(d);
-                                }
-                            }
-                        }
             }
 
-        // Per-variant init segment probe: each video track gets its own metadata.
-        if needs_init {
-            for (vt, variant) in r.video_tracks.iter_mut().zip(non_iframe_variants.iter()) {
-                if let Ok(mr) = fetch_text(variant.uri.clone()).await {
-                    let pl = parse_media_playlist(&variant.uri, &mr.response_text);
-                    if let Some((iurl, irange)) = pl.init_segment() {
-                        match fetch_array_buffer(iurl, irange).await {
-                            Ok(resp) => {
-                                let mp4 = probe_mp4(resp.response_body);
-                                if r.major_brand.is_none() { r.major_brand = mp4.major_brand; }
-                                if vt.codec.is_none()
-                                    && let Some(c) = mp4.video_codec_override { vt.codec = Some(c); }
-                                if vt.profile.is_none()    { vt.profile = mp4.video_profile; }
-                                if vt.level.is_none()      { vt.level   = mp4.video_level;   }
-                                if let Some(v) = mp4.video_bit_depth               { vt.bit_depth               = Some(v); }
-                                if let Some(v) = mp4.video_color_primaries         { vt.color_primaries         = Some(v); }
-                                if let Some(v) = mp4.video_transfer_char           { vt.transfer_characteristics= Some(v); }
-                                if let Some(v) = mp4.video_matrix_coefficients     { vt.matrix_coefficients     = Some(v); }
-                                if let Some(v) = mp4.video_full_range              { vt.full_range              = Some(v); }
-                                if let Some(v) = mp4.video_pixel_format            { vt.pixel_format            = Some(v); }
-                                if vt.frame_rate.is_none() {
-                                    // FRAME-RATE is optional in EXT-X-STREAM-INF for ≤30 fps
-                                }
-                                r.init_segment_probed = true;
-                            }
-                            Err(e) => { r.probe_notes.push(format!("Init segment fetch failed for {}: {e}", vt.name)); }
-                        }
-                    } else if !r.init_segment_probed {
-                        r.probe_notes.push(format!("No EXT-X-MAP found in {} — skipping init-segment checks.", vt.name));
-                    }
-                }
+            if !needs_init {
+                continue;
             }
-            if !r.init_segment_probed && r.video_tracks.is_empty() {
-                r.probe_notes.push("No EXT-X-MAP init segment found — skipping init-segment checks.".into());
+
+            let Some((iurl, irange)) = pl.init_segment() else {
+                if !r.init_segment_probed {
+                    r.probe_notes.push(format!(
+                        "No EXT-X-MAP found in {} — skipping init-segment checks.",
+                        vt.name
+                    ));
+                }
+                continue;
+            };
+
+            match fetch_probe_init(&mut init_cache, iurl, irange).await {
+                Ok(mp4) => {
+                    if r.major_brand.is_none() {
+                        r.major_brand = mp4.major_brand.clone();
+                    }
+                    apply_video_init(vt, &mp4);
+                    if i == 0 {
+                        first_muxed_audio = Some(mp4.clone());
+                    }
+                    for d in mp4.drm_systems {
+                        if !r.drm_systems.iter().any(|e| e.system_id == d.system_id) {
+                            r.drm_systems.push(d);
+                        }
+                    }
+                    r.init_segment_probed = true;
+                }
+                Err(e) => {
+                    r.probe_notes
+                        .push(format!("Init segment fetch failed for {}: {e}", vt.name));
+                }
             }
         }
 
-        // Demuxed HLS audio probe: fetch the default audio rendition's media
-        // playlist and probe its EXT-X-MAP init segment to get sample rate,
-        // bit depth, and channel count for all audio tracks.
+        // Muxed audio lives in the video init — only fill tracks with no demuxed playlist.
+        if let Some(mp4) = first_muxed_audio {
+            for at in r.audio_tracks.iter_mut().filter(|a| a.playlist_uri.is_none()) {
+                apply_muxed_audio(at, &mp4);
+            }
+        }
+
+        if needs_init && !r.init_segment_probed && r.video_tracks.is_empty() {
+            r.probe_notes
+                .push("No EXT-X-MAP init segment found — skipping init-segment checks.".into());
+        }
+
+        // Demuxed audio: probe each rendition's own init so mixed sample rates stay accurate.
         if needs_init {
-            let needs_audio_probe = r.audio_tracks.iter()
-                .any(|at| at.sample_rate.is_none() || at.bit_depth.is_none());
-            if needs_audio_probe {
-                let audio_pl_url = master.media_renditions.iter()
-                    .filter(|rend| rend.media_type == "AUDIO" && rend.uri.is_some())
-                    .find(|rend| rend.is_default)
-                    .or_else(|| master.media_renditions.iter()
-                        .find(|rend| rend.media_type == "AUDIO" && rend.uri.is_some()))
-                    .and_then(|rend| rend.uri.clone());
-                if let Some(apl_url) = audio_pl_url
-                    && let Ok(apl_resp) = fetch_text(apl_url.clone()).await {
-                        let apl = parse_media_playlist(&apl_url, &apl_resp.response_text);
-                        if let Some((aiurl, airange)) = apl.init_segment()
-                            && let Ok(aresp) = fetch_array_buffer(aiurl, airange).await {
-                                let amp4 = probe_mp4(aresp.response_body);
-                                for at in r.audio_tracks.iter_mut() {
-                                    if at.sample_rate.is_none() { at.sample_rate = amp4.audio_sample_rate; }
-                                    if at.bit_depth.is_none()   { at.bit_depth   = amp4.audio_bit_depth;   }
-                                    if at.channels.is_none() {
-                                        at.channels = amp4.audio_channels.map(|c| c as u32);
-                                        if let Some(n) = at.channels {
-                                            at.channel_layout = Some(channels_to_layout(n));
-                                        }
-                                    }
-                                }
-                            }
+            for at in r.audio_tracks.iter_mut() {
+                let Some(apl_url) = at.playlist_uri.clone() else {
+                    continue;
+                };
+                if at.sample_rate.is_some() && at.bit_depth.is_some() {
+                    continue;
+                }
+                let Ok(body) = fetch_text_cached(&mut playlist_cache, apl_url.clone()).await else {
+                    continue;
+                };
+                let apl = parse_media_playlist(&apl_url, &body);
+                let Some((aiurl, airange)) = apl.init_segment() else {
+                    continue;
+                };
+                if let Ok(amp4) = fetch_probe_init(&mut init_cache, aiurl, airange).await {
+                    apply_muxed_audio(at, &amp4);
+                    for d in amp4.drm_systems {
+                        if !r.drm_systems.iter().any(|e| e.system_id == d.system_id) {
+                            r.drm_systems.push(d);
+                        }
                     }
+                }
             }
         }
     } else {
