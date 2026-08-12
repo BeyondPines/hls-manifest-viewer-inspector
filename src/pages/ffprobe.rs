@@ -446,7 +446,9 @@ fn playlist_type_str(pt: HlsPlaylistType) -> String {
 
 /// Returns `true` if the manifest text is a master (multivariant) playlist.
 fn is_master_playlist(content: &str) -> bool {
-    content.lines().any(|l| l.starts_with("#EXT-X-STREAM-INF"))
+    content.lines().any(|l| {
+        l.starts_with("#EXT-X-STREAM-INF") || l.starts_with("#EXT-X-I-FRAME-STREAM-INF")
+    })
 }
 
 /// Resolve a potentially-relative URI against a base URL string.
@@ -1819,9 +1821,14 @@ fn VideoTable(mut tracks: Vec<VideoTrackInfo>, selected: HashSet<String>) -> imp
                     drop(resize_cb);
                 }));
             } else {
+                // ResizeObserver unavailable — remove the scroll listener we already
+                // registered and run the check once immediately as a fallback.
+                el.remove_event_listener_with_callback(
+                    "scroll",
+                    scroll_cb.as_ref().unchecked_ref(),
+                ).ok();
                 drop(scroll_cb);
                 drop(resize_cb);
-                // Fallback: run once immediately if ResizeObserver isn't available
                 check();
             }
         }
