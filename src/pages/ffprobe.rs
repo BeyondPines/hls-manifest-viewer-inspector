@@ -60,6 +60,7 @@ pub struct VideoTrackInfo {
     pub resolution: Option<String>,
     pub frame_rate: Option<f64>,
     pub bitrate_bps: Option<u64>,
+    pub avg_bitrate_bps: Option<u64>,
     pub color_space: Option<String>,
     pub hdr_format: Option<String>,
     pub color_primaries: Option<String>,
@@ -163,6 +164,7 @@ pub static CATEGORIES: &[CheckCat] = &[
             CheckItem { id: "video_resolution",   label: "Resolution",               note: None },
             CheckItem { id: "video_frame_rate",   label: "Frame rate",               note: None },
             CheckItem { id: "video_bitrate",      label: "Bitrate",                  note: None },
+            CheckItem { id: "video_avg_bitrate",  label: "Avg Bitrate",              note: None },
             CheckItem { id: "video_color_space",  label: "Color space / HDR format", note: None },
             CheckItem { id: "video_aspect_ratio", label: "Aspect ratio (SAR / DAR)", note: None },
             CheckItem { id: "video_profile",  label: "Profile",                  note: Some("init seg") },
@@ -357,6 +359,7 @@ fn fmt_dur(secs: f64) -> String {
 struct VariantStream {
     uri: String,
     bandwidth: Option<u64>,
+    average_bandwidth: Option<u64>,
     codecs: Option<String>,
     resolution: Option<String>,
     frame_rate: Option<f64>,
@@ -466,6 +469,7 @@ fn parse_master_playlist(base_url: &str, content: &str) -> MasterPlaylist {
                     pending_stream_inf = Some(VariantStream {
                         uri: String::new(),
                         bandwidth: Some(si.bandwidth()),
+                        average_bandwidth: si.average_bandwidth(),
                         codecs,
                         resolution: res,
                         frame_rate: si.frame_rate(),
@@ -818,6 +822,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
         for variant in &master.variants {
             let mut vt = VideoTrackInfo::default();
             vt.bitrate_bps = variant.bandwidth;
+            vt.avg_bitrate_bps = variant.average_bandwidth;
             if let Some(res) = &variant.resolution {
                 vt.resolution = Some(res.clone());
                 let pts: Vec<&str> = res.split('x').collect();
@@ -1621,6 +1626,7 @@ const VIDEO_COL_DEFS: &[(&str, &str)] = &[
     ("video_resolution",   "Resolution"),
     ("video_frame_rate",   "Frame Rate"),
     ("video_bitrate",      "Bitrate"),
+    ("video_avg_bitrate",  "Avg Bitrate"),
     ("video_color_space",  "Color / HDR"),
     ("video_aspect_ratio", "DAR"),
     ("video_profile",      "Profile"),
@@ -1632,12 +1638,13 @@ const VIDEO_COL_DEFS: &[(&str, &str)] = &[
     ("video_pixel_fmt",    "Pixel format"),
 ];
 
-fn video_cells(t: &VideoTrackInfo) -> [Option<String>; 13] {
+fn video_cells(t: &VideoTrackInfo) -> [Option<String>; 14] {
     [
         t.codec_long.clone().or(t.codec.clone()),
         t.resolution.clone(),
         t.frame_rate.map(|f| format!("{:.3} fps", f)),
         t.bitrate_bps.map(fmt_bps),
+        t.avg_bitrate_bps.map(fmt_bps),
         match (&t.color_space, &t.hdr_format) {
             (Some(cs), Some(hdr)) => Some(format!("{} / {}", cs, hdr)),
             (Some(cs), None) => Some(cs.clone()),
