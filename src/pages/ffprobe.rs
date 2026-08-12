@@ -12,6 +12,27 @@ use quick_m3u8::{
 };
 use std::{collections::HashSet, io::Cursor};
 
+// ── WASM thread-safety shim ─────────────────────────────────────────────────────────────────────────
+// WASM is single-threaded so !Send types never cross thread boundaries.
+// WasmSend<T> satisfies `Send + Sync` bounds (e.g. from on_cleanup) safely.
+struct WasmSend<T>(T);
+// SAFETY: WASM targets are single-threaded; no other thread can access these.
+#[allow(clippy::non_send_fields_in_send_ty)]
+unsafe impl<T> Send for WasmSend<T> {}
+unsafe impl<T> Sync for WasmSend<T> {}
+
+// run_wasm_cleanup wraps a !Send FnOnce into a Send+Sync closure via raw ptr.
+// SAFETY: WASM is single-threaded; the pointer is only ever accessed on the
+// same thread it was created on.
+fn run_wasm_cleanup<F: FnOnce() + 'static>(f: F) -> impl FnOnce() + Send + Sync + 'static {
+    let ptr = Box::into_raw(Box::new(f)) as usize; // usize is Send+Sync
+    move || {
+        // SAFETY: ptr was created on the same thread; WASM is single-threaded.
+        let f = unsafe { Box::from_raw(ptr as *mut F) };
+        f();
+    }
+}
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 
@@ -365,6 +386,7 @@ struct VariantStream {
     frame_rate: Option<f64>,
     video_range: Option<String>,
     audio_group: Option<String>,
+    is_iframe: bool,
 }
 
 /// A media rendition from an EXT-X-MEDIA tag.
@@ -475,6 +497,22 @@ fn parse_master_playlist(base_url: &str, content: &str) -> MasterPlaylist {
                         frame_rate: si.frame_rate(),
                         video_range,
                         audio_group,
+                        is_iframe: false,
+                    });
+                }
+                HlsLine::KnownTag(KnownTag::Hls(Tag::IFrameStreamInf(isi))) => {
+                    // I-frame playlists have their URI inline (not on the next line)
+                    let uri = resolve_uri(base_url, isi.uri());
+                    master.variants.push(VariantStream {
+                        uri,
+                        bandwidth: Some(isi.bandwidth()),
+                        average_bandwidth: isi.average_bandwidth(),
+                        codecs: isi.codecs().map(|c| c.to_string()),
+                        resolution: isi.resolution().map(|r| format!("{}x{}", r.width, r.height)),
+                        frame_rate: None,
+                        video_range: isi.video_range().map(|vr| vr.to_string()),
+                        audio_group: None,
+                        is_iframe: true,
                     });
                 }
                 HlsLine::Uri(uri) => {
@@ -806,7 +844,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
         let master = parse_master_playlist(url, content);
         r.hls_version = Some(master.version);
         r.session_tags = parse_session_data(content);
-        r.stream_count = master.variants.len() + master.media_renditions.len();
+        r.stream_count = master.variants.iter().filter(|v| !v.is_iframe).count() + master.media_renditions.len();
 
         // Collect audio codec mappings (group_id → codec)
         let audio_codec_map: std::collections::HashMap<String, String> = master.variants.iter()
@@ -818,8 +856,8 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
             })
             .collect();
 
-        // Video tracks
-        for variant in &master.variants {
+        // Video tracks — skip I-frame-only playlists (EXT-X-I-FRAME-STREAM-INF)
+        for variant in master.variants.iter().filter(|v| !v.is_iframe) {
             let mut vt = VideoTrackInfo::default();
             vt.bitrate_bps = variant.bandwidth;
             vt.avg_bitrate_bps = variant.average_bandwidth;
@@ -904,8 +942,11 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
             });
         }
 
-        // Probe first variant media playlist
-        if let Some(first) = master.variants.first() {
+        // Probe variant media playlists.
+        // Duration/LL-HLS metadata comes from the first variant only to keep fetch count low.
+        // Init segment is probed per-variant so each track gets its own codec/colr metadata.
+        let non_iframe_variants: Vec<_> = master.variants.iter().filter(|v| !v.is_iframe).collect();
+        if let Some(first) = non_iframe_variants.first() {
             if let Ok(mr) = fetch_text(first.uri.clone()).await {
                 let pl = parse_media_playlist(&first.uri, &mr.response_text);
                 r.target_duration = Some(pl.target_duration);
@@ -929,102 +970,99 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                         can_block_reload: sc.can_block_reload,
                     });
                 }
-                // Init segment probe
+                // Probe init segment of first variant for muxed-audio and DRM data.
+                // Each variant gets its own init probe below for per-track metadata.
                 if needs_init {
-                    let init_url = pl.segments.iter().find_map(|s| s.map_uri.clone());
-                    if let Some(iurl) = init_url {
+                    if let Some(iurl) = pl.segments.iter().find_map(|s| s.map_uri.clone()) {
+                        if let Ok(resp) = fetch_array_buffer(iurl, None).await {
+                            let mp4 = probe_mp4(resp.response_body);
+                            r.major_brand = mp4.major_brand.clone();
+                            // Muxed streams: first init segment carries audio info
+                            for at in r.audio_tracks.iter_mut() {
+                                if at.sample_rate.is_none() { at.sample_rate = mp4.audio_sample_rate; }
+                                if at.bit_depth.is_none()   { at.bit_depth   = mp4.audio_bit_depth;   }
+                                if at.channels.is_none() {
+                                    at.channels = mp4.audio_channels.map(|c| c as u32);
+                                    if let Some(n) = at.channels {
+                                        at.channel_layout = Some(channels_to_layout(n));
+                                    }
+                                }
+                            }
+                            for d in mp4.drm_systems {
+                                if !r.drm_systems.iter().any(|e| e.system_id == d.system_id) {
+                                    r.drm_systems.push(d);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Per-variant init segment probe: each video track gets its own metadata.
+        if needs_init {
+            for (vt, variant) in r.video_tracks.iter_mut().zip(non_iframe_variants.iter()) {
+                if let Ok(mr) = fetch_text(variant.uri.clone()).await {
+                    let pl = parse_media_playlist(&variant.uri, &mr.response_text);
+                    if let Some(iurl) = pl.segments.iter().find_map(|s| s.map_uri.clone()) {
                         match fetch_array_buffer(iurl, None).await {
                             Ok(resp) => {
                                 let mp4 = probe_mp4(resp.response_body);
-                                r.major_brand = mp4.major_brand;
-
-                                // Colour space / HDR properties and bit depth are stream-level
-                                // (same encoding settings across all renditions). Propagate to
-                                // every video track so no rendition shows "—" for these fields.
-                                for vt in r.video_tracks.iter_mut() {
-                                    // Codec override only if CODECS string didn't already resolve it
-                                    if vt.codec.is_none() {
-                                        if let Some(c) = &mp4.video_codec_override { vt.codec = Some(c.clone()); }
-                                    }
-                                    // Profile / level: fill from init segment only when the
-                                    // CODECS attribute didn't supply them
-                                    if vt.profile.is_none() { vt.profile = mp4.video_profile.clone(); }
-                                    if vt.level.is_none()   { vt.level   = mp4.video_level.clone();   }
-                                    // Override defaults only when the colr box was present —
-                                    // use if-let so a missing colr box doesn't erase the
-                                    // VIDEO-RANGE defaults set when building the track list.
-                                    if let Some(v) = mp4.video_bit_depth               { vt.bit_depth               = Some(v); }
-                                    if let Some(v) = mp4.video_color_primaries.clone()  { vt.color_primaries         = Some(v); }
-                                    if let Some(v) = mp4.video_transfer_char.clone()    { vt.transfer_characteristics= Some(v); }
-                                    if let Some(v) = mp4.video_matrix_coefficients.clone() { vt.matrix_coefficients = Some(v); }
-                                    if let Some(v) = mp4.video_full_range               { vt.full_range              = Some(v); }
-                                    if let Some(v) = mp4.video_pixel_format.clone()     { vt.pixel_format            = Some(v); }
+                                if r.major_brand.is_none() { r.major_brand = mp4.major_brand; }
+                                if vt.codec.is_none() {
+                                    if let Some(c) = mp4.video_codec_override { vt.codec = Some(c); }
                                 }
-
-                                // Frame rate: fill in from the probed rendition for any track
-                                // missing it (FRAME-RATE is optional in EXT-X-STREAM-INF for ≤30 fps)
-                                let probed_fps = r.video_tracks.first().and_then(|vt| vt.frame_rate);
-                                if let Some(fps) = probed_fps {
-                                    for vt in r.video_tracks.iter_mut().skip(1) {
-                                        if vt.frame_rate.is_none() { vt.frame_rate = Some(fps); }
-                                    }
-                                }
-
-                                // Muxed streams: video init segment may also carry audio
-                                // (applies if audio_* fields are populated from the probe above)
-                                for at in r.audio_tracks.iter_mut() {
-                                    if at.sample_rate.is_none() { at.sample_rate = mp4.audio_sample_rate; }
-                                    if at.bit_depth.is_none()   { at.bit_depth   = mp4.audio_bit_depth;   }
-                                    if at.channels.is_none() {
-                                        at.channels = mp4.audio_channels.map(|c| c as u32);
-                                        if let Some(n) = at.channels {
-                                            at.channel_layout = Some(channels_to_layout(n));
-                                        }
-                                    }
-                                }
-                                // Merge PSSH-based findings; don't overwrite EXT-X-KEY derived ones
-                                for d in mp4.drm_systems {
-                                    if !r.drm_systems.iter().any(|e| e.system_id == d.system_id) {
-                                        r.drm_systems.push(d);
-                                    }
+                                if vt.profile.is_none()    { vt.profile = mp4.video_profile; }
+                                if vt.level.is_none()      { vt.level   = mp4.video_level;   }
+                                if let Some(v) = mp4.video_bit_depth               { vt.bit_depth               = Some(v); }
+                                if let Some(v) = mp4.video_color_primaries         { vt.color_primaries         = Some(v); }
+                                if let Some(v) = mp4.video_transfer_char           { vt.transfer_characteristics= Some(v); }
+                                if let Some(v) = mp4.video_matrix_coefficients     { vt.matrix_coefficients     = Some(v); }
+                                if let Some(v) = mp4.video_full_range              { vt.full_range              = Some(v); }
+                                if let Some(v) = mp4.video_pixel_format            { vt.pixel_format            = Some(v); }
+                                if vt.frame_rate.is_none() {
+                                    // FRAME-RATE is optional in EXT-X-STREAM-INF for ≤30 fps
                                 }
                                 r.init_segment_probed = true;
                             }
-                            Err(e) => { r.probe_notes.push(format!("Init segment fetch failed: {e}")); }
+                            Err(e) => { r.probe_notes.push(format!("Init segment fetch failed for {}: {e}", vt.name)); }
                         }
-                    } else {
-                        r.probe_notes.push("No EXT-X-MAP init segment found — skipping init-segment checks.".into());
+                    } else if !r.init_segment_probed {
+                        r.probe_notes.push(format!("No EXT-X-MAP found in {} — skipping init-segment checks.", vt.name));
                     }
+                }
+            }
+            if !r.init_segment_probed && r.video_tracks.is_empty() {
+                r.probe_notes.push("No EXT-X-MAP init segment found — skipping init-segment checks.".into());
+            }
+        }
 
-                    // Demuxed HLS: the video init segment carries no audio data.
-                    // Fetch the default audio rendition's own media playlist and
-                    // probe its EXT-X-MAP init segment to get sample rate, bit
-                    // depth, and channel count for all audio tracks.
-                    let needs_audio_probe = r.audio_tracks.iter()
-                        .any(|at| at.sample_rate.is_none() || at.bit_depth.is_none());
-                    if needs_audio_probe {
-                        let audio_pl_url = master.media_renditions.iter()
-                            .filter(|rend| rend.media_type == "AUDIO" && rend.uri.is_some())
-                            .find(|rend| rend.is_default)
-                            .or_else(|| master.media_renditions.iter()
-                                .find(|rend| rend.media_type == "AUDIO" && rend.uri.is_some()))
-                            .and_then(|rend| rend.uri.clone());
-                        if let Some(apl_url) = audio_pl_url {
-                            if let Ok(apl_resp) = fetch_text(apl_url.clone()).await {
-                                let apl = parse_media_playlist(&apl_url, &apl_resp.response_text);
-                                let audio_init_url = apl.segments.iter().find_map(|s| s.map_uri.clone());
-                                if let Some(aiurl) = audio_init_url {
-                                    if let Ok(aresp) = fetch_array_buffer(aiurl, None).await {
-                                        let amp4 = probe_mp4(aresp.response_body);
-                                        for at in r.audio_tracks.iter_mut() {
-                                            if at.sample_rate.is_none() { at.sample_rate = amp4.audio_sample_rate; }
-                                            if at.bit_depth.is_none()   { at.bit_depth   = amp4.audio_bit_depth;   }
-                                            if at.channels.is_none() {
-                                                at.channels = amp4.audio_channels.map(|c| c as u32);
-                                                if let Some(n) = at.channels {
-                                                    at.channel_layout = Some(channels_to_layout(n));
-                                                }
-                                            }
+        // Demuxed HLS audio probe: fetch the default audio rendition's media
+        // playlist and probe its EXT-X-MAP init segment to get sample rate,
+        // bit depth, and channel count for all audio tracks.
+        if needs_init {
+            let needs_audio_probe = r.audio_tracks.iter()
+                .any(|at| at.sample_rate.is_none() || at.bit_depth.is_none());
+            if needs_audio_probe {
+                let audio_pl_url = master.media_renditions.iter()
+                    .filter(|rend| rend.media_type == "AUDIO" && rend.uri.is_some())
+                    .find(|rend| rend.is_default)
+                    .or_else(|| master.media_renditions.iter()
+                        .find(|rend| rend.media_type == "AUDIO" && rend.uri.is_some()))
+                    .and_then(|rend| rend.uri.clone());
+                if let Some(apl_url) = audio_pl_url {
+                    if let Ok(apl_resp) = fetch_text(apl_url.clone()).await {
+                        let apl = parse_media_playlist(&apl_url, &apl_resp.response_text);
+                        if let Some(aiurl) = apl.segments.iter().find_map(|s| s.map_uri.clone()) {
+                            if let Ok(aresp) = fetch_array_buffer(aiurl, None).await {
+                                let amp4 = probe_mp4(aresp.response_body);
+                                for at in r.audio_tracks.iter_mut() {
+                                    if at.sample_rate.is_none() { at.sample_rate = amp4.audio_sample_rate; }
+                                    if at.bit_depth.is_none()   { at.bit_depth   = amp4.audio_bit_depth;   }
+                                    if at.channels.is_none() {
+                                        at.channels = amp4.audio_channels.map(|c| c as u32);
+                                        if let Some(n) = at.channels {
+                                            at.channel_layout = Some(channels_to_layout(n));
                                         }
                                     }
                                 }
@@ -1061,6 +1099,51 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
         }
         r.stream_count = 1;
         r.session_tags = parse_session_data(content);
+        // Init segment probe for direct media playlist URLs
+        if needs_init {
+            if let Some(iurl) = pl.segments.iter().find_map(|s| s.map_uri.clone()) {
+                match fetch_array_buffer(iurl, None).await {
+                    Ok(resp) => {
+                        let mp4 = probe_mp4(resp.response_body);
+                        r.major_brand = mp4.major_brand;
+                        // Synthesise a single video track from what the init segment tells us
+                        let mut vt = VideoTrackInfo::default();
+                        vt.name = url.split('/').last().unwrap_or("stream").to_string();
+                        if let Some(c) = mp4.video_codec_override { vt.codec = Some(c); }
+                        vt.profile = mp4.video_profile;
+                        vt.level   = mp4.video_level;
+                        if let Some(v) = mp4.video_bit_depth           { vt.bit_depth               = Some(v); }
+                        if let Some(v) = mp4.video_color_primaries      { vt.color_primaries         = Some(v); }
+                        if let Some(v) = mp4.video_transfer_char        { vt.transfer_characteristics= Some(v); }
+                        if let Some(v) = mp4.video_matrix_coefficients  { vt.matrix_coefficients     = Some(v); }
+                        if let Some(v) = mp4.video_full_range           { vt.full_range              = Some(v); }
+                        if let Some(v) = mp4.video_pixel_format         { vt.pixel_format            = Some(v); }
+                        if vt.codec.is_some() || vt.profile.is_some() {
+                            r.video_tracks.push(vt);
+                        }
+                        // Audio from muxed init
+                        if let Some(sr) = mp4.audio_sample_rate {
+                            let mut at = AudioTrackInfo::default();
+                            at.name = "Audio".into();
+                            at.sample_rate = Some(sr);
+                            at.bit_depth   = mp4.audio_bit_depth;
+                            at.channels    = mp4.audio_channels.map(|c| c as u32);
+                            if let Some(n) = at.channels { at.channel_layout = Some(channels_to_layout(n)); }
+                            r.audio_tracks.push(at);
+                        }
+                        for d in mp4.drm_systems {
+                            if !r.drm_systems.iter().any(|e| e.system_id == d.system_id) {
+                                r.drm_systems.push(d);
+                            }
+                        }
+                        r.init_segment_probed = true;
+                    }
+                    Err(e) => { r.probe_notes.push(format!("Init segment fetch failed: {e}")); }
+                }
+            } else {
+                r.probe_notes.push("No EXT-X-MAP init segment found — skipping init-segment checks.".into());
+            }
+        }
     }
 
     Ok(r)
@@ -1711,27 +1794,33 @@ fn VideoTable(mut tracks: Vec<VideoTrackInfo>, selected: HashSet<String>) -> imp
                 }
             };
 
-            // Scroll listener
+            // Scroll listener — stored so on_cleanup can drop it properly.
             let check_scroll = check.clone();
             let scroll_cb = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || check_scroll());
             el.add_event_listener_with_callback("scroll", scroll_cb.as_ref().unchecked_ref()).ok();
-            scroll_cb.forget();
 
             // ResizeObserver fires on mount and on every size change (window resize,
             // column toggle, etc.) so the hint stays in sync without a separate
             // window "resize" listener.
             let check_resize = check.clone();
-            let resize_cb = wasm_bindgen::closure::Closure::<dyn Fn()>::new(
-                move || check_resize(),
-            );
+            let resize_cb = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || check_resize());
             if let Ok(observer) = web_sys::ResizeObserver::new(resize_cb.as_ref().unchecked_ref()) {
                 observer.observe(&el);
-                // Keep observer alive for the lifetime of the component
-                resize_cb.forget();
-                // We intentionally leak the observer too — it lives as long as the element.
-                std::mem::forget(observer);
+                // Register cleanup: disconnect the observer and drop closures when
+                // the component is removed, preventing memory leaks.
+                let el_clone = el.clone();
+                // run_wasm_cleanup satisfies on_cleanup's Send+Sync bound safely in WASM.
+                on_cleanup(run_wasm_cleanup(move || {
+                    observer.disconnect();
+                    el_clone.remove_event_listener_with_callback(
+                        "scroll",
+                        scroll_cb.as_ref().unchecked_ref(),
+                    ).ok();
+                    drop(resize_cb);
+                }));
             } else {
-                resize_cb.forget();
+                drop(scroll_cb);
+                drop(resize_cb);
                 // Fallback: run once immediately if ResizeObserver isn't available
                 check();
             }
