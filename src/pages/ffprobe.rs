@@ -13,17 +13,8 @@ use quick_m3u8::{
 use std::{collections::HashSet, io::Cursor};
 
 // ── WASM thread-safety shim ─────────────────────────────────────────────────────────────────────────
-// WASM is single-threaded so !Send types never cross thread boundaries.
-// WasmSend<T> satisfies `Send + Sync` bounds (e.g. from on_cleanup) safely.
-struct WasmSend<T>(T);
-// SAFETY: WASM targets are single-threaded; no other thread can access these.
-#[allow(clippy::non_send_fields_in_send_ty)]
-unsafe impl<T> Send for WasmSend<T> {}
-unsafe impl<T> Sync for WasmSend<T> {}
-
-// run_wasm_cleanup wraps a !Send FnOnce into a Send+Sync closure via raw ptr.
-// SAFETY: WASM is single-threaded; the pointer is only ever accessed on the
-// same thread it was created on.
+// on_cleanup requires Send + Sync. Browser closures are !Send; WASM is single-threaded
+// so wrapping via a raw pointer is safe — the cleanup only runs on this thread.
 fn run_wasm_cleanup<F: FnOnce() + 'static>(f: F) -> impl FnOnce() + Send + Sync + 'static {
     let ptr = Box::into_raw(Box::new(f)) as usize; // usize is Send+Sync
     move || {
@@ -765,9 +756,8 @@ fn probe_mp4(data: Vec<u8>) -> Mp4ProbeInfo {
                 if let Some(l) = get("avc_level_indication").and_then(|s| s.parse::<u8>().ok()) {
                     info.video_level = Some(format!("{:.1}", l as f32 / 10.0));
                 }
-                if let Some(bd) = get("ext_bit_depth_luma").and_then(|s| s.parse::<u8>().ok()) {
-                    if bd > 0 { info.video_bit_depth = Some(bd); }
-                }
+                if let Some(bd) = get("ext_bit_depth_luma").and_then(|s| s.parse::<u8>().ok())
+                    && bd > 0 { info.video_bit_depth = Some(bd); }
                 if info.video_bit_depth.is_none() { info.video_bit_depth = Some(8); }
                 if info.video_pixel_format.is_none() { info.video_pixel_format = Some("yuv420p".into()); }
             }
@@ -860,68 +850,80 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
 
         // Video tracks — skip I-frame-only playlists (EXT-X-I-FRAME-STREAM-INF)
         for variant in master.variants.iter().filter(|v| !v.is_iframe) {
-            let mut vt = VideoTrackInfo::default();
-            vt.bitrate_bps = variant.bandwidth;
-            vt.avg_bitrate_bps = variant.average_bandwidth;
+            let mut dar = None;
+            let mut sar = None;
             if let Some(res) = &variant.resolution {
-                vt.resolution = Some(res.clone());
                 let pts: Vec<&str> = res.split('x').collect();
-                if pts.len() == 2 {
-                    if let (Ok(w), Ok(h)) = (pts[0].parse::<u32>(), pts[1].parse::<u32>()) {
+                if pts.len() == 2
+                    && let (Ok(w), Ok(h)) = (pts[0].parse::<u32>(), pts[1].parse::<u32>()) {
                         let g = gcd(w, h);
-                        vt.dar = Some(format!("{}:{}", w/g, h/g));
-                        vt.sar = Some("1:1".into());
+                        dar = Some(format!("{}:{}", w / g, h / g));
+                        sar = Some("1:1".into());
                     }
-                }
             }
-            vt.frame_rate = variant.frame_rate;
-            if let Some(codecs) = &variant.codecs {
-                let (short, long, prof, lev) = parse_video_codec(codecs);
-                vt.codec = short; vt.codec_long = long;
-                vt.profile = prof; vt.level = lev;
-            }
-            vt.color_space = variant.video_range.clone();
-            vt.hdr_format = match variant.video_range.as_deref() {
+            let (codec, codec_long, profile, level) = variant
+                .codecs
+                .as_deref()
+                .map(parse_video_codec)
+                .unwrap_or((None, None, None, None));
+            let hdr_format = match variant.video_range.as_deref() {
                 Some("PQ") => Some("HDR10 / Dolby Vision".into()),
                 Some("HLG") => Some("HLG".into()),
                 _ => None,
             };
-            // Set colour defaults inferred from VIDEO-RANGE.  The init-segment
-            // probe will override these with exact colr-box values when present;
-            // when the init segment omits the colr box (common for SDR BT.709
-            // content) these defaults remain and are still correct.
+            // Colour defaults inferred from VIDEO-RANGE. Init-segment probe overrides
+            // these when a colr box is present; otherwise they remain correct for SDR.
             let (primaries, transfer, matrix) = match variant.video_range.as_deref() {
-                Some("PQ")  => ("BT.2020", "PQ (ST 2084 / HDR10)", "BT.2020 NCL"),
-                Some("HLG") => ("BT.2020", "HLG (ARIB STD-B67)",   "BT.2020 NCL"),
-                _           => ("BT.709",  "BT.709",                "BT.709"),
+                Some("PQ") => ("BT.2020", "PQ (ST 2084 / HDR10)", "BT.2020 NCL"),
+                Some("HLG") => ("BT.2020", "HLG (ARIB STD-B67)", "BT.2020 NCL"),
+                _ => ("BT.709", "BT.709", "BT.709"),
             };
-            vt.color_primaries          = Some(primaries.into());
-            vt.transfer_characteristics = Some(transfer.into());
-            vt.matrix_coefficients      = Some(matrix.into());
-            vt.name = vt.resolution.clone()
-                .unwrap_or_else(|| vt.bitrate_bps.map(|b| format!("{}k", b/1000)).unwrap_or_default());
-            vt.init_uri = Some(variant.uri.clone());
-            r.video_tracks.push(vt);
+            let name = variant.resolution.clone().unwrap_or_else(|| {
+                variant
+                    .bandwidth
+                    .map(|b| format!("{}k", b / 1000))
+                    .unwrap_or_default()
+            });
+            r.video_tracks.push(VideoTrackInfo {
+                name,
+                codec,
+                codec_long,
+                profile,
+                level,
+                resolution: variant.resolution.clone(),
+                frame_rate: variant.frame_rate,
+                bitrate_bps: variant.bandwidth,
+                avg_bitrate_bps: variant.average_bandwidth,
+                color_space: variant.video_range.clone(),
+                hdr_format,
+                color_primaries: Some(primaries.into()),
+                transfer_characteristics: Some(transfer.into()),
+                matrix_coefficients: Some(matrix.into()),
+                sar,
+                dar,
+                init_uri: Some(variant.uri.clone()),
+                ..Default::default()
+            });
         }
 
         // Audio tracks
         for rend in master.media_renditions.iter().filter(|r| r.media_type == "AUDIO") {
-            let mut at = AudioTrackInfo::default();
-            at.name = rend.name.clone();
-            at.group_id = rend.group_id.clone();
-            at.language = rend.language.clone();
-            at.is_default = rend.is_default;
-            at.playlist_uri = rend.uri.clone();
-            if let Some(n) = rend.channels {
-                at.channels = Some(n);
-                at.channel_layout = Some(channels_to_layout(n));
-            }
-            // Codec from stream-inf codecs map
-            if let Some(raw) = audio_codec_map.get(&rend.group_id) {
-                let (s, l) = parse_audio_codec(raw);
-                at.codec = s; at.codec_long = l;
-            }
-            r.audio_tracks.push(at);
+            let (codec, codec_long) = audio_codec_map
+                .get(&rend.group_id)
+                .map(|raw| parse_audio_codec(raw))
+                .unwrap_or((None, None));
+            r.audio_tracks.push(AudioTrackInfo {
+                name: rend.name.clone(),
+                group_id: rend.group_id.clone(),
+                codec,
+                codec_long,
+                channels: rend.channels,
+                channel_layout: rend.channels.map(channels_to_layout),
+                language: rend.language.clone(),
+                is_default: rend.is_default,
+                playlist_uri: rend.uri.clone(),
+                ..Default::default()
+            });
         }
 
         // Subtitle tracks
@@ -930,7 +932,6 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                 name: rend.name.clone(),
                 language: rend.language.clone(),
                 is_default: rend.is_default,
-                ..Default::default()
             });
         }
 
@@ -948,8 +949,8 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
         // Duration/LL-HLS metadata comes from the first variant only to keep fetch count low.
         // Init segment is probed per-variant so each track gets its own codec/colr metadata.
         let non_iframe_variants: Vec<_> = master.variants.iter().filter(|v| !v.is_iframe).collect();
-        if let Some(first) = non_iframe_variants.first() {
-            if let Ok(mr) = fetch_text(first.uri.clone()).await {
+        if let Some(first) = non_iframe_variants.first()
+            && let Ok(mr) = fetch_text(first.uri.clone()).await {
                 let pl = parse_media_playlist(&first.uri, &mr.response_text);
                 r.target_duration = Some(pl.target_duration);
                 r.playlist_type = pl.playlist_type.clone();
@@ -974,9 +975,9 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                 }
                 // Probe init segment of first variant for muxed-audio and DRM data.
                 // Each variant gets its own init probe below for per-track metadata.
-                if needs_init {
-                    if let Some(iurl) = pl.segments.iter().find_map(|s| s.map_uri.clone()) {
-                        if let Ok(resp) = fetch_array_buffer(iurl, None).await {
+                if needs_init
+                    && let Some(iurl) = pl.segments.iter().find_map(|s| s.map_uri.clone())
+                        && let Ok(resp) = fetch_array_buffer(iurl, None).await {
                             let mp4 = probe_mp4(resp.response_body);
                             r.major_brand = mp4.major_brand.clone();
                             // Muxed streams: first init segment carries audio info
@@ -996,10 +997,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                                 }
                             }
                         }
-                    }
-                }
             }
-        }
 
         // Per-variant init segment probe: each video track gets its own metadata.
         if needs_init {
@@ -1011,9 +1009,8 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                             Ok(resp) => {
                                 let mp4 = probe_mp4(resp.response_body);
                                 if r.major_brand.is_none() { r.major_brand = mp4.major_brand; }
-                                if vt.codec.is_none() {
-                                    if let Some(c) = mp4.video_codec_override { vt.codec = Some(c); }
-                                }
+                                if vt.codec.is_none()
+                                    && let Some(c) = mp4.video_codec_override { vt.codec = Some(c); }
                                 if vt.profile.is_none()    { vt.profile = mp4.video_profile; }
                                 if vt.level.is_none()      { vt.level   = mp4.video_level;   }
                                 if let Some(v) = mp4.video_bit_depth               { vt.bit_depth               = Some(v); }
@@ -1052,11 +1049,11 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                     .or_else(|| master.media_renditions.iter()
                         .find(|rend| rend.media_type == "AUDIO" && rend.uri.is_some()))
                     .and_then(|rend| rend.uri.clone());
-                if let Some(apl_url) = audio_pl_url {
-                    if let Ok(apl_resp) = fetch_text(apl_url.clone()).await {
+                if let Some(apl_url) = audio_pl_url
+                    && let Ok(apl_resp) = fetch_text(apl_url.clone()).await {
                         let apl = parse_media_playlist(&apl_url, &apl_resp.response_text);
-                        if let Some(aiurl) = apl.segments.iter().find_map(|s| s.map_uri.clone()) {
-                            if let Ok(aresp) = fetch_array_buffer(aiurl, None).await {
+                        if let Some(aiurl) = apl.segments.iter().find_map(|s| s.map_uri.clone())
+                            && let Ok(aresp) = fetch_array_buffer(aiurl, None).await {
                                 let amp4 = probe_mp4(aresp.response_body);
                                 for at in r.audio_tracks.iter_mut() {
                                     if at.sample_rate.is_none() { at.sample_rate = amp4.audio_sample_rate; }
@@ -1069,9 +1066,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                                     }
                                 }
                             }
-                        }
                     }
-                }
             }
         }
     } else {
@@ -1109,29 +1104,33 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                         let mp4 = probe_mp4(resp.response_body);
                         r.major_brand = mp4.major_brand;
                         // Synthesise a single video track from what the init segment tells us
-                        let mut vt = VideoTrackInfo::default();
-                        vt.name = url.split('/').last().unwrap_or("stream").to_string();
-                        if let Some(c) = mp4.video_codec_override { vt.codec = Some(c); }
-                        vt.profile = mp4.video_profile;
-                        vt.level   = mp4.video_level;
-                        if let Some(v) = mp4.video_bit_depth           { vt.bit_depth               = Some(v); }
-                        if let Some(v) = mp4.video_color_primaries      { vt.color_primaries         = Some(v); }
-                        if let Some(v) = mp4.video_transfer_char        { vt.transfer_characteristics= Some(v); }
-                        if let Some(v) = mp4.video_matrix_coefficients  { vt.matrix_coefficients     = Some(v); }
-                        if let Some(v) = mp4.video_full_range           { vt.full_range              = Some(v); }
-                        if let Some(v) = mp4.video_pixel_format         { vt.pixel_format            = Some(v); }
+                        let vt = VideoTrackInfo {
+                            name: url.split('/').next_back().unwrap_or("stream").to_string(),
+                            codec: mp4.video_codec_override,
+                            profile: mp4.video_profile,
+                            level: mp4.video_level,
+                            bit_depth: mp4.video_bit_depth,
+                            color_primaries: mp4.video_color_primaries,
+                            transfer_characteristics: mp4.video_transfer_char,
+                            matrix_coefficients: mp4.video_matrix_coefficients,
+                            full_range: mp4.video_full_range,
+                            pixel_format: mp4.video_pixel_format,
+                            ..Default::default()
+                        };
                         if vt.codec.is_some() || vt.profile.is_some() {
                             r.video_tracks.push(vt);
                         }
                         // Audio from muxed init
                         if let Some(sr) = mp4.audio_sample_rate {
-                            let mut at = AudioTrackInfo::default();
-                            at.name = "Audio".into();
-                            at.sample_rate = Some(sr);
-                            at.bit_depth   = mp4.audio_bit_depth;
-                            at.channels    = mp4.audio_channels.map(|c| c as u32);
-                            if let Some(n) = at.channels { at.channel_layout = Some(channels_to_layout(n)); }
-                            r.audio_tracks.push(at);
+                            let channels = mp4.audio_channels.map(|c| c as u32);
+                            r.audio_tracks.push(AudioTrackInfo {
+                                name: "Audio".into(),
+                                sample_rate: Some(sr),
+                                bit_depth: mp4.audio_bit_depth,
+                                channels,
+                                channel_layout: channels.map(channels_to_layout),
+                                ..Default::default()
+                            });
                         }
                         for d in mp4.drm_systems {
                             if !r.drm_systems.iter().any(|e| e.system_id == d.system_id) {
@@ -1798,14 +1797,14 @@ fn VideoTable(mut tracks: Vec<VideoTrackInfo>, selected: HashSet<String>) -> imp
 
             // Scroll listener — stored so on_cleanup can drop it properly.
             let check_scroll = check.clone();
-            let scroll_cb = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || check_scroll());
+            let scroll_cb = wasm_bindgen::closure::Closure::<dyn Fn()>::new(check_scroll);
             el.add_event_listener_with_callback("scroll", scroll_cb.as_ref().unchecked_ref()).ok();
 
             // ResizeObserver fires on mount and on every size change (window resize,
             // column toggle, etc.) so the hint stays in sync without a separate
             // window "resize" listener.
             let check_resize = check.clone();
-            let resize_cb = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || check_resize());
+            let resize_cb = wasm_bindgen::closure::Closure::<dyn Fn()>::new(check_resize);
             if let Ok(observer) = web_sys::ResizeObserver::new(resize_cb.as_ref().unchecked_ref()) {
                 observer.observe(&el);
                 // Register cleanup: disconnect the observer and drop closures when
@@ -1928,7 +1927,12 @@ fn AudioTable(tracks: Vec<AudioTrackInfo>, selected: HashSet<String>) -> impl In
             let row_cells = vis.iter()
                 .map(|&i| cells[i].clone().unwrap_or_else(|| "—".into()))
                 .collect();
-            (t.name.clone(), t.is_default, t.bitrate_bps, row_cells)
+            let track_label = if t.group_id.is_empty() {
+                t.name.clone()
+            } else {
+                format!("{} ({})", t.name, t.group_id)
+            };
+            (track_label, t.is_default, t.bitrate_bps, row_cells)
         })
         .collect();
 
