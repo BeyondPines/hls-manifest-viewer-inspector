@@ -201,6 +201,7 @@ pub static CATEGORIES: &[CheckCat] = &[
             CheckItem { id: "audio_channels", label: "Channels",       note: None },
             CheckItem { id: "audio_layout",   label: "Channel layout", note: None },
             CheckItem { id: "audio_language", label: "Language",       note: None },
+            CheckItem { id: "audio_bitrate", label: "Bitrate",   note: Some("init seg") },
             CheckItem { id: "audio_rate",  label: "Sample rate", note: Some("init seg") },
             CheckItem { id: "audio_depth", label: "Bit depth",   note: Some("init seg") },
         ],
@@ -340,6 +341,11 @@ fn fscod_to_hz(fscod: u8) -> Option<u32> {
 
 fn parse_sample_rate_prop(raw: &str) -> Option<u32> {
     raw.split('.').next()?.parse().ok()
+}
+
+/// Read a bitrate property, treating a declared 0 as "unknown" rather than a real rate.
+fn positive_bps(get: &impl Fn(&str) -> Option<String>, key: &str) -> Option<u64> {
+    get(key).and_then(|s| s.parse::<u64>().ok()).filter(|&b| b > 0)
 }
 
 fn channels_to_layout(n: u32) -> String {
@@ -835,6 +841,21 @@ fn probe_mp4(data: Vec<u8>) -> Mp4ProbeInfo {
                     info.audio_sample_rate = parse_sample_rate_prop(&sr);
                 }
             }
+            "ElementaryStreamDescriptorBox" if in_audio => {
+                // AAC declares its bitrate in the DecoderConfigDescriptor, in bits/sec.
+                // avg_bitrate is 0 for VBR streams, in which case max_bitrate is the
+                // only figure available.
+                if info.audio_bitrate_bps.is_none() {
+                    info.audio_bitrate_bps = positive_bps(&get, "decoder_config_avg_bitrate")
+                        .or_else(|| positive_bps(&get, "decoder_config_max_bitrate"));
+                }
+            }
+            "BitRateBox" if in_audio => {
+                if info.audio_bitrate_bps.is_none() {
+                    info.audio_bitrate_bps = positive_bps(&get, "avg_bitrate")
+                        .or_else(|| positive_bps(&get, "max_bitrate"));
+                }
+            }
             "AC3SpecificBox" => {
                 if info.audio_sample_rate.is_none()
                     && let Some(hz) = get("fscod").and_then(|s| s.parse::<u8>().ok()).and_then(fscod_to_hz)
@@ -843,10 +864,8 @@ fn probe_mp4(data: Vec<u8>) -> Mp4ProbeInfo {
                 }
                 if info.audio_bitrate_bps.is_none() {
                     // AC3SpecificBox bit_rate is in kbps.
-                    info.audio_bitrate_bps = get("bit_rate")
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .filter(|&b| b > 0)
-                        .map(|kbps| kbps.saturating_mul(1000));
+                    info.audio_bitrate_bps =
+                        positive_bps(&get, "bit_rate").map(|kbps| kbps.saturating_mul(1000));
                 }
                 if info.audio_codec_override.is_none() {
                     info.audio_codec_override = Some("AC-3".into());
@@ -857,10 +876,8 @@ fn probe_mp4(data: Vec<u8>) -> Mp4ProbeInfo {
                 // fscod lives in nested independent_substream tables; data_rate is top-level.
                 if info.audio_bitrate_bps.is_none() {
                     // EC3SpecificBox data_rate is in kbps.
-                    info.audio_bitrate_bps = get("data_rate")
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .filter(|&b| b > 0)
-                        .map(|kbps| kbps.saturating_mul(1000));
+                    info.audio_bitrate_bps =
+                        positive_bps(&get, "data_rate").map(|kbps| kbps.saturating_mul(1000));
                 }
                 if info.audio_codec_override.is_none() {
                     info.audio_codec_override = Some("E-AC-3".into());
@@ -993,6 +1010,24 @@ async fn fetch_inits_parallel(
     futures::future::join_all(futs).await.into_iter().collect()
 }
 
+/// Map audio-only variant URIs to their declared BANDWIDTH, so a rendition pointing at the
+/// same playlist can report a bitrate without fetching an init segment. Variants carrying
+/// video are excluded because their BANDWIDTH covers the muxed video too.
+fn audio_only_bandwidths(master: &MasterPlaylist) -> HashMap<&str, u64> {
+    master
+        .variants
+        .iter()
+        .filter(|v| {
+            !v.is_iframe
+                && v.resolution.is_none()
+                && v.codecs
+                    .as_deref()
+                    .is_none_or(|c| parse_video_codec(c).0.is_none())
+        })
+        .filter_map(|v| Some((v.uri.as_str(), v.bandwidth?)))
+        .collect()
+}
+
 fn apply_audio_init(at: &mut AudioTrackInfo, mp4: &Mp4ProbeInfo) {
     if at.codec.is_none() {
         at.codec = mp4.audio_codec_override.clone();
@@ -1097,7 +1132,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
         matches!(id.as_str(),
             "video_profile"|"video_level"|"video_bit_depth"|"video_primaries"|
             "video_transfer"|"video_matrix"|"video_pixel_fmt"|
-            "audio_rate"|"audio_depth"|"drm_systems")
+            "audio_rate"|"audio_depth"|"audio_bitrate"|"drm_systems")
     });
 
     let resp = fetch_text(url.to_string()).await?;
@@ -1189,12 +1224,18 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
             .filter_map(|v| v.bandwidth)
             .max();
 
+        let audio_only_bandwidth = audio_only_bandwidths(&master);
+
         // Audio tracks
         for rend in master.media_renditions.iter().filter(|r| r.media_type == "AUDIO") {
             let (codec, codec_long) = audio_codec_map
                 .get(&rend.group_id)
                 .map(|raw| parse_audio_codec(raw))
                 .unwrap_or((None, None));
+            let bitrate_bps = rend
+                .uri
+                .as_deref()
+                .and_then(|u| audio_only_bandwidth.get(u).copied());
             r.audio_tracks.push(AudioTrackInfo {
                 name: rend.name.clone(),
                 group_id: rend.group_id.clone(),
@@ -1202,6 +1243,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                 codec_long,
                 channels: rend.channels,
                 channel_layout: rend.channels.map(channels_to_layout),
+                bitrate_bps,
                 language: rend.language.clone(),
                 is_default: rend.is_default,
                 playlist_uri: rend.uri.clone(),
@@ -1359,7 +1401,10 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                 r.audio_tracks
                     .iter()
                     .filter(|at| {
-                        at.sample_rate.is_none() || at.bit_depth.is_none() || at.codec.is_none()
+                        at.sample_rate.is_none()
+                            || at.bit_depth.is_none()
+                            || at.codec.is_none()
+                            || at.bitrate_bps.is_none()
                     })
                     .filter_map(|at| at.playlist_uri.clone()),
             );
@@ -2257,16 +2302,18 @@ const AUDIO_COL_DEFS: &[(&str, &str)] = &[
     ("audio_language", "Language"),
     ("audio_channels", "Channels"),
     ("audio_layout",   "Channel Layout"),
+    ("audio_bitrate",  "Bitrate"),
     ("audio_rate",     "Sample Rate"),
     ("audio_depth",    "Bit Depth"),
 ];
 
-fn audio_cells(t: &AudioTrackInfo) -> [Option<String>; 6] {
+fn audio_cells(t: &AudioTrackInfo) -> [Option<String>; 7] {
     [
         t.codec_long.clone().or(t.codec.clone()),
         t.language.clone(),
         t.channels.map(|c| c.to_string()),
         t.channel_layout.clone(),
+        t.bitrate_bps.map(fmt_bps),
         t.sample_rate.map(|r| format!("{} Hz", r)),
         t.bit_depth.map(|b| format!("{}-bit", b)),
     ]
@@ -2280,7 +2327,7 @@ fn AudioTable(tracks: Vec<AudioTrackInfo>, selected: HashSet<String>) -> impl In
 
     let headers: Vec<&'static str> = vis.iter().map(|&i| AUDIO_COL_DEFS[i].1).collect();
 
-    let table_rows: Vec<(String, bool, Option<u64>, Vec<String>)> = tracks.iter()
+    let table_rows: Vec<(String, bool, Vec<String>)> = tracks.iter()
         .map(|t| {
             let cells = audio_cells(t);
             let row_cells = vis.iter()
@@ -2291,7 +2338,7 @@ fn AudioTable(tracks: Vec<AudioTrackInfo>, selected: HashSet<String>) -> impl In
             } else {
                 format!("{} ({})", t.name, t.group_id)
             };
-            (track_label, t.is_default, t.bitrate_bps, row_cells)
+            (track_label, t.is_default, row_cells)
         })
         .collect();
 
@@ -2320,7 +2367,7 @@ fn AudioTable(tracks: Vec<AudioTrackInfo>, selected: HashSet<String>) -> impl In
                     </tr>
                 </thead>
                 <tbody>
-                    {table_rows.into_iter().enumerate().map(|(ri, (name, is_default, bitrate_bps, row))| {
+                    {table_rows.into_iter().enumerate().map(|(ri, (name, is_default, row))| {
                         let bg = if ri % 2 == 0 { "var(--color-white)" } else { "var(--color-sky-50)" };
                         view! {
                             <tr style=format!("background: {}; transition: background .1s;", bg)>
@@ -2336,11 +2383,6 @@ fn AudioTable(tracks: Vec<AudioTrackInfo>, selected: HashSet<String>) -> impl In
                                                          border: 1px solid rgba(34,197,94,.3); \
                                                          border-radius: 4px; padding: var(--spacing) calc(var(--spacing) * 1.25);">
                                                 "DEFAULT"
-                                            </span>
-                                        })}
-                                        {bitrate_bps.map(|bps| view! {
-                                            <span style="font-size: .72rem; color: var(--color-sky-300);">
-                                                {format!("({})", fmt_bps(bps))}
                                             </span>
                                         })}
                                     </div>
@@ -2493,6 +2535,36 @@ mod tests {
         assert!(
             pl.segments.iter().all(|s| s.map_uri.as_deref() == Some("https://example.com/sdr/fileSequence0.mp4")),
             "all segments must carry the resolved map_uri"
+        );
+    }
+
+    #[test]
+    fn audio_only_variant_supplies_rendition_bitrate() {
+        const MASTER: &str = "#EXTM3U\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud1\",NAME=\"English\",DEFAULT=YES,URI=\"a1/prog_index.m3u8\"\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=160000,CODECS=\"mp4a.40.2\"\n\
+            a1/prog_index.m3u8\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=3000000,CODECS=\"avc1.64002a,mp4a.40.2\",RESOLUTION=1280x720,AUDIO=\"aud1\"\n\
+            v1/prog_index.m3u8\n";
+        let master = parse_master_playlist("https://example.com/master.m3u8", MASTER);
+        let map = audio_only_bandwidths(&master);
+        assert_eq!(
+            map.get("https://example.com/a1/prog_index.m3u8").copied(),
+            Some(160_000),
+            "audio-only variant BANDWIDTH should be available to the matching rendition"
+        );
+        assert!(
+            !map.contains_key("https://example.com/v1/prog_index.m3u8"),
+            "a variant carrying video must not be treated as an audio bitrate source"
+        );
+    }
+
+    #[test]
+    fn audio_columns_and_cells_stay_aligned() {
+        assert_eq!(
+            AUDIO_COL_DEFS.len(),
+            audio_cells(&AudioTrackInfo::default()).len(),
+            "every audio column needs a matching cell"
         );
     }
 
