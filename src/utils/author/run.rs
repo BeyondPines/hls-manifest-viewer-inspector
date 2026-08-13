@@ -16,6 +16,8 @@ use super::run_authoring_checks;
 
 /// How many segments per playlist are sampled when deep checks are enabled.
 const MAX_DEEP_SEGMENT_SAMPLES_PER_PLAYLIST: usize = 3;
+/// Extra samples for video playlists (better measured bitrate / IDR interval).
+const MAX_DEEP_VIDEO_SEGMENT_SAMPLES: usize = 5;
 /// Phase B light samples: one segment from each I-frame playlist (for §6.10 moof).
 const MAX_IFRAME_LIGHT_SAMPLES: usize = 4;
 /// Phase B: max subtitle playlists / VTT files to fetch for §5.3.
@@ -66,7 +68,7 @@ pub async fn run_author_report(url: &str, options: AuthorOptions) -> Result<Auth
         deep_checks: options.deep_checks,
     };
     let (init_probes, segment_samples, webvtt_samples) =
-        collect_phase_b_samples(&playlists, options.deep_checks).await;
+        collect_media_samples(&playlists, options.deep_checks).await;
     let ctx = AuthoringContext::new(
         stream.master.as_ref(),
         &playlists,
@@ -166,8 +168,8 @@ async fn fetch_subtitle_playlists(
     (playlists, issues)
 }
 
-/// Fetch unique init segments, light I-frame/WebVTT samples, and optional deep segment samples.
-async fn collect_phase_b_samples(
+/// Fetch unique init segments, Phase B light samples, and optional Phase C deep segment samples.
+async fn collect_media_samples(
     playlists: &[MediaPlaylist],
     deep: bool,
 ) -> (Vec<InitProbeEntry>, Vec<SegmentSample>, Vec<WebVttSample>) {
@@ -250,22 +252,15 @@ async fn collect_phase_b_samples(
         for (job, result) in ranged_jobs.iter().zip(fetches) {
             if let Ok(resp) = result {
                 let scan = scan_segment_bytes(&resp.response_body);
-                segment_samples.push(SegmentSample {
-                    playlist_name: job.0.clone(),
-                    segment_index: job.1,
-                    uri: job.2.clone(),
-                    extinf_s: job.3,
-                    bytes: resp.response_body.len(),
-                    is_iframe_playlist: job.5,
-                    looks_like_ts: scan.looks_like_ts,
-                    looks_like_fmp4: scan.looks_like_fmp4,
-                    has_moof: scan.has_moof,
-                    has_idr_nal_hint: scan.has_idr_nal_hint,
-                    has_tfdt: scan.has_tfdt,
-                    has_senc: scan.has_senc,
-                    has_saiz: scan.has_saiz,
-                    has_saio: scan.has_saio,
-                });
+                segment_samples.push(SegmentSample::from_scan(
+                    job.0.clone(),
+                    job.1,
+                    job.2.clone(),
+                    job.3,
+                    resp.response_body.len(),
+                    job.5,
+                    &scan,
+                ));
             }
         }
     }
@@ -275,12 +270,12 @@ async fn collect_phase_b_samples(
         let mut ranged_jobs: Vec<(String, usize, String, f64, Option<RequestRange>, bool)> =
             Vec::new();
         for pl in playlists {
-            for (idx, seg) in pl
-                .segments
-                .iter()
-                .take(MAX_DEEP_SEGMENT_SAMPLES_PER_PLAYLIST)
-                .enumerate()
-            {
+            let limit = if pl.media_type == "VIDEO" && !pl.is_iframe {
+                MAX_DEEP_VIDEO_SEGMENT_SAMPLES
+            } else {
+                MAX_DEEP_SEGMENT_SAMPLES_PER_PLAYLIST
+            };
+            for (idx, seg) in pl.segments.iter().take(limit).enumerate() {
                 // Skip duplicates already sampled as iframe light probes.
                 if pl.is_iframe && idx == 0 {
                     continue;
@@ -310,22 +305,15 @@ async fn collect_phase_b_samples(
         for (job, result) in ranged_jobs.iter().zip(fetches) {
             if let Ok(resp) = result {
                 let scan = scan_segment_bytes(&resp.response_body);
-                segment_samples.push(SegmentSample {
-                    playlist_name: job.0.clone(),
-                    segment_index: job.1,
-                    uri: job.2.clone(),
-                    extinf_s: job.3,
-                    bytes: resp.response_body.len(),
-                    is_iframe_playlist: job.5,
-                    looks_like_ts: scan.looks_like_ts,
-                    looks_like_fmp4: scan.looks_like_fmp4,
-                    has_moof: scan.has_moof,
-                    has_idr_nal_hint: scan.has_idr_nal_hint,
-                    has_tfdt: scan.has_tfdt,
-                    has_senc: scan.has_senc,
-                    has_saiz: scan.has_saiz,
-                    has_saio: scan.has_saio,
-                });
+                segment_samples.push(SegmentSample::from_scan(
+                    job.0.clone(),
+                    job.1,
+                    job.2.clone(),
+                    job.3,
+                    resp.response_body.len(),
+                    job.5,
+                    &scan,
+                ));
             }
         }
     }

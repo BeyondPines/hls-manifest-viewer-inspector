@@ -118,6 +118,13 @@
       margin-inline: auto;
     }
 
+    /* Long page titles that must stay on a single line within .body-content. */
+    .page-title-single-line {
+      font-size: clamp(1.5rem, 4.4vw, 2.25rem);
+      line-height: var(--leading-tight);
+      margin-block: calc(var(--spacing) * 4);
+    }
+
     .body-text {
       color: var(--color-stone-900);
       line-height: 1.5;

@@ -48,10 +48,51 @@ pub struct SegmentSample {
     pub looks_like_fmp4: bool,
     pub has_moof: bool,
     pub has_idr_nal_hint: bool,
+    pub idr_at_start: bool,
+    pub idr_count: usize,
     pub has_tfdt: bool,
+    pub tfdt_base_media_decode_time: Option<u64>,
     pub has_senc: bool,
     pub has_saiz: bool,
     pub has_saio: bool,
+    pub ts_continuity_ok: Option<bool>,
+    pub has_cc_sei_hint: bool,
+    pub has_asp_hint: bool,
+}
+
+impl SegmentSample {
+    pub fn from_scan(
+        playlist_name: String,
+        segment_index: usize,
+        uri: String,
+        extinf_s: f64,
+        bytes: usize,
+        is_iframe_playlist: bool,
+        scan: &crate::utils::mp4_probe::SegmentScan,
+    ) -> Self {
+        Self {
+            playlist_name,
+            segment_index,
+            uri,
+            extinf_s,
+            bytes,
+            is_iframe_playlist,
+            looks_like_ts: scan.looks_like_ts,
+            looks_like_fmp4: scan.looks_like_fmp4,
+            has_moof: scan.has_moof,
+            has_idr_nal_hint: scan.has_idr_nal_hint,
+            idr_at_start: scan.idr_at_start,
+            idr_count: scan.idr_count,
+            has_tfdt: scan.has_tfdt,
+            tfdt_base_media_decode_time: scan.tfdt_base_media_decode_time,
+            has_senc: scan.has_senc,
+            has_saiz: scan.has_saiz,
+            has_saio: scan.has_saio,
+            ts_continuity_ok: scan.ts_continuity_ok,
+            has_cc_sei_hint: scan.has_cc_sei_hint,
+            has_asp_hint: scan.has_asp_hint,
+        }
+    }
 }
 
 /// WebVTT cue file sample for §5.3.
@@ -104,14 +145,19 @@ impl<'a> AuthoringContext<'a> {
                 .to_string(),
         );
         notes.push(format!(
-            "Phase B init probes: {} unique init(s), {} light segment sample(s), {} WebVTT sample(s).",
+            "Phase B/C probes: {} unique init(s), {} segment sample(s), {} WebVTT sample(s).",
             init_probes.len(),
             segment_samples.len(),
             webvtt_samples.len(),
         ));
         if !options.deep_checks {
             notes.push(
-                "Deep Author checks (full segment sampling) are off — enable for measured bandwidth / IDR / continuity."
+                "Deep Author checks are off — enable to measure bandwidth, IDR interval, tfdt/TS continuity, and CC SEI."
+                    .to_string(),
+            );
+        } else {
+            notes.push(
+                "Deep Author checks are on — sampled media segments for measured bitrate and bitstream heuristics."
                     .to_string(),
             );
         }
