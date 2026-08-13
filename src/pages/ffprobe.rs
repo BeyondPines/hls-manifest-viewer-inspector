@@ -168,11 +168,12 @@ pub static CATEGORIES: &[CheckCat] = &[
     CheckCat {
         id: "format", icon: "📦", label: "Format & Container",
         items: &[
-            CheckItem { id: "format_name",  label: "Format / Container type", note: None },
-            CheckItem { id: "duration",     label: "Duration",                note: None },
-            CheckItem { id: "bitrate",      label: "Overall bitrate",         note: None },
-            CheckItem { id: "stream_count", label: "Number of streams",       note: None },
-            CheckItem { id: "session_tags", label: "Tags / metadata",         note: None },
+            CheckItem { id: "format_name",    label: "Format / Container type", note: None },
+            CheckItem { id: "container_ftyp", label: "Container brand (ftyp)",  note: Some("init seg") },
+            CheckItem { id: "duration",       label: "Duration",                note: None },
+            CheckItem { id: "bitrate",        label: "Overall bitrate",         note: None },
+            CheckItem { id: "stream_count",   label: "Number of streams",       note: None },
+            CheckItem { id: "session_tags",   label: "Tags / metadata",         note: None },
         ],
     },
     CheckCat {
@@ -210,7 +211,6 @@ pub static CATEGORIES: &[CheckCat] = &[
         id: "subtitles", icon: "📝", label: "Subtitles & Captions",
         items: &[
             CheckItem { id: "subtitle_tracks", label: "Subtitle tracks",       note: None },
-            CheckItem { id: "subtitle_lang",   label: "Subtitle languages",    note: None },
             CheckItem { id: "caption_tracks",  label: "Closed caption tracks", note: None },
         ],
     },
@@ -496,20 +496,18 @@ fn is_master_playlist(content: &str) -> bool {
 }
 
 /// Resolve a potentially-relative URI against a base URL string.
+/// Resolve a potentially-relative URI against a base URL, normalizing `..` / `.` segments.
 fn resolve_uri(base: &str, uri: &str) -> String {
-    if uri.starts_with("http://") || uri.starts_with("https://") {
-        return uri.to_string();
+    if let Ok(abs) = Url::parse(uri) {
+        return abs.to_string();
     }
-    // Strip everything after the last '/' from the base to get the directory.
-    let base_dir = base.rfind('/').map(|i| &base[..=i]).unwrap_or(base);
-    if uri.starts_with('/') {
-        // Protocol-relative or absolute path — reuse the origin of the base.
-        let origin_end = base_dir.find("://")
-            .and_then(|p| base_dir[p + 3..].find('/').map(|q| p + 3 + q))
-            .unwrap_or(base_dir.len());
-        format!("{}{}", &base_dir[..origin_end], uri)
-    } else {
-        format!("{}{}", base_dir, uri)
+    match Url::parse(base).and_then(|b| b.join(uri)) {
+        Ok(joined) => joined.to_string(),
+        Err(_) => {
+            // Last-resort fallback for malformed bases — keep previous behaviour.
+            let base_dir = base.rfind('/').map(|i| &base[..=i]).unwrap_or(base);
+            format!("{base_dir}{uri}")
+        }
     }
 }
 
@@ -1050,6 +1048,13 @@ fn apply_audio_init(at: &mut AudioTrackInfo, mp4: &Mp4ProbeInfo) {
     }
 }
 
+fn mp4_has_audio(mp4: &Mp4ProbeInfo) -> bool {
+    mp4.audio_sample_rate.is_some()
+        || mp4.audio_codec_override.is_some()
+        || mp4.audio_channels.is_some()
+        || mp4.audio_bitrate_bps.is_some()
+}
+
 fn apply_video_init(vt: &mut VideoTrackInfo, mp4: &Mp4ProbeInfo) {
     if vt.codec.is_none()
         && let Some(c) = mp4.video_codec_override.clone()
@@ -1130,6 +1135,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
 
     let needs_init = selected.iter().any(|id| {
         matches!(id.as_str(),
+            "container_ftyp"|
             "video_profile"|"video_level"|"video_bit_depth"|"video_primaries"|
             "video_transfer"|"video_matrix"|"video_pixel_fmt"|
             "audio_rate"|"audio_depth"|"audio_bitrate"|"drm_systems")
@@ -1383,10 +1389,21 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                 }
             }
 
-            // Muxed audio lives in the video init — only fill tracks with no demuxed playlist.
+            // Muxed audio lives in the video init — fill tracks with no demuxed playlist,
+            // or synthesise a track when the master declares no EXT-X-MEDIA:AUDIO at all.
             if let Some(mp4) = first_muxed_audio {
+                let mut applied = false;
                 for at in r.audio_tracks.iter_mut().filter(|a| a.playlist_uri.is_none()) {
                     apply_audio_init(at, &mp4);
+                    applied = true;
+                }
+                if !applied && mp4_has_audio(&mp4) {
+                    let mut at = AudioTrackInfo {
+                        name: "Audio (muxed)".into(),
+                        ..Default::default()
+                    };
+                    apply_audio_init(&mut at, &mp4);
+                    r.audio_tracks.push(at);
                 }
             }
 
@@ -1527,10 +1544,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                             r.video_tracks.push(vt);
                         }
                         // Audio from muxed init
-                        if mp4.audio_sample_rate.is_some()
-                            || mp4.audio_codec_override.is_some()
-                            || mp4.audio_channels.is_some()
-                        {
+                        if mp4_has_audio(&mp4) {
                             let mut at = AudioTrackInfo {
                                 name: "Audio".into(),
                                 ..Default::default()
@@ -1752,6 +1766,7 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
 
     // Pre-compute all selection booleans before view! to avoid move issues
     let s_format_name   = selected.contains("format_name");
+    let s_container     = selected.contains("container_ftyp");
     let s_duration      = selected.contains("duration");
     let s_overall_br    = selected.contains("bitrate");
     let s_stream_count  = selected.contains("stream_count");
@@ -1765,13 +1780,12 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
     let s_key_format    = selected.contains("key_format");
     let s_drm_systems   = selected.contains("drm_systems");
     let s_sub_tracks    = selected.contains("subtitle_tracks");
-    let s_sub_lang      = selected.contains("subtitle_lang");
     let s_cap_tracks    = selected.contains("caption_tracks");
 
-    let show_format  = s_format_name || s_duration || s_overall_br || s_stream_count || s_session_tags;
+    let show_format  = s_format_name || s_container || s_duration || s_overall_br || s_stream_count || s_session_tags;
     let show_hls     = s_hls_version || s_target_dur || s_playlist_type || s_ll_hls || s_segment_count;
     let show_drm     = s_enc_method || s_key_format || s_drm_systems;
-    let show_subs    = s_sub_tracks || s_sub_lang || s_cap_tracks;
+    let show_subs    = s_sub_tracks || s_cap_tracks;
 
     let tags = report.session_tags.clone();
     let ll   = report.ll_hls.clone();
@@ -1896,7 +1910,7 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                 <div style="flex: 1; min-width: 280px;">
                     <ProbeSection title="📦 Format & Container" show=show_format>
                         <ProbeRow label="Format" value=report.format_name.clone() show=s_format_name />
-                        <ProbeRow label="Container (init ftyp)" value=report.major_brand.clone() show=s_format_name />
+                        <ProbeRow label="Container (ftyp)" value=report.major_brand.clone() show=s_container />
                         <ProbeRow label="Duration" value=report.duration_s.map(fmt_dur) show=s_duration />
                         <ProbeRow label="Overall bitrate" value=report.overall_bitrate_bps.map(fmt_bps) show=s_overall_br />
                         <ProbeRow label="Streams" value=Some(report.stream_count.to_string()) show=s_stream_count />
@@ -2613,5 +2627,64 @@ mod tests {
     fn is_master_with_iframe_only_stream_inf() {
         let content = "#EXTM3U\n#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=1000,URI=\"iframe.m3u8\"\n";
         assert!(is_master_playlist(content));
+    }
+
+    #[test]
+    fn resolve_uri_normalizes_parent_and_root_relative() {
+        let base = "https://ex.com/hls/v1/master.m3u8";
+        assert_eq!(
+            resolve_uri(base, "../a1/prog_index.m3u8"),
+            "https://ex.com/hls/a1/prog_index.m3u8"
+        );
+        assert_eq!(
+            resolve_uri(base, "./seg/init.mp4"),
+            "https://ex.com/hls/v1/seg/init.mp4"
+        );
+        assert_eq!(
+            resolve_uri(base, "/root/a.m3u8"),
+            "https://ex.com/root/a.m3u8"
+        );
+        assert_eq!(
+            resolve_uri(base, "https://cdn.example/x.m3u8"),
+            "https://cdn.example/x.m3u8"
+        );
+    }
+
+    #[test]
+    fn mp4_has_audio_detects_codec_or_channels() {
+        assert!(!mp4_has_audio(&Mp4ProbeInfo::default()));
+        assert!(mp4_has_audio(&Mp4ProbeInfo {
+            audio_codec_override: Some("AAC".into()),
+            ..Default::default()
+        }));
+        assert!(mp4_has_audio(&Mp4ProbeInfo {
+            audio_channels: Some(2),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn apply_audio_init_fills_missing_fields_only() {
+        let mp4 = Mp4ProbeInfo {
+            audio_codec_override: Some("AAC".into()),
+            audio_codec_long: Some("AAC-LC".into()),
+            audio_sample_rate: Some(48_000),
+            audio_channels: Some(2),
+            audio_bit_depth: Some(16),
+            audio_bitrate_bps: Some(160_000),
+            ..Default::default()
+        };
+        let mut at = AudioTrackInfo {
+            codec: Some("HE-AAC".into()),
+            sample_rate: Some(44_100),
+            ..Default::default()
+        };
+        apply_audio_init(&mut at, &mp4);
+        assert_eq!(at.codec.as_deref(), Some("HE-AAC"), "existing codec must win");
+        assert_eq!(at.sample_rate, Some(44_100), "existing sample rate must win");
+        assert_eq!(at.bit_depth, Some(16));
+        assert_eq!(at.bitrate_bps, Some(160_000));
+        assert_eq!(at.channels, Some(2));
+        assert_eq!(at.channel_layout.as_deref(), Some("stereo"));
     }
 }
