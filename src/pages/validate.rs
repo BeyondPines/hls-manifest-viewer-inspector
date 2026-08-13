@@ -71,6 +71,26 @@ fn colour_badge_html(color_info: &str) -> (String, String, String) {
     }
 }
 
+/// Definitions to pass into the manifest viewer for a validation report.
+/// Prefer the master playlist's EXT-X-DEFINE map; fall back to the first media playlist
+/// when the input was a media-only URL.
+fn report_definitions(report: &ValidationReport) -> std::collections::HashMap<String, String> {
+    if let Some(master) = &report.master {
+        master.definitions.clone()
+    } else {
+        report
+            .playlists
+            .first()
+            .map(|p| p.definitions.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// True for duration-drift issues that should link to the compared renditions in the viewer.
+fn is_drift_issue_message(message: &str) -> bool {
+    message.starts_with("EXTINF drift") || message.starts_with("Cumulative EXTINF drift")
+}
+
 /// Build an absolute manifest-viewer URL for `playlist_url`, applying HLS variable substitution
 /// and appending `imported_definitions` when the definitions map is non-empty.
 fn manifest_viewer_href(
@@ -148,7 +168,7 @@ pub fn Validate() -> impl IntoView {
                 "Validate HLS streams instantly"
             </h1>
             <p class="body-content body-text">
-                "Enter a master playlist URL to run 20+ compliance checks against RFC 8216 and the HLS bis draft — structural integrity, alignment, LL-HLS, encryption and more."
+                "Enter a master or media playlist URL to run 20+ compliance checks against RFC 8216 and the HLS bis draft — structural integrity, alignment, LL-HLS, encryption and more. Media-only URLs run a reduced set of checks on that playlist alone."
             </p>
             <div style="background: var(--color-white); border: 1px solid var(--color-sky-200); border-radius: 12px; padding: calc(var(--spacing) * 7); box-shadow: 0 2px 12px rgba(0,0,0,.06); margin-top: calc(var(--spacing) * 6);">
                 <form on:submit=on_submit>
@@ -185,10 +205,8 @@ pub fn Validate() -> impl IntoView {
                         </div>
                         // Inspect manifest link (shown after validation)
                         {move || report.get().map(|r| {
-                            let viewer_url = format!(
-                                "/hls-manifest-viewer/?playlist_url={}",
-                                utf8_percent_encode(&r.master_url, NON_ALPHANUMERIC)
-                            );
+                            let defs = report_definitions(&r);
+                            let viewer_url = manifest_viewer_href(&r.master_url, &defs);
                             view! {
                                 <a href=viewer_url target="_blank" rel="noopener noreferrer"
                                     style="display: inline-flex; align-items: center; gap: calc(var(--spacing) * 1.5); font-size: .82rem; font-weight: 700; color: var(--color-white); background: linear-gradient(135deg, var(--color-sky-300), var(--color-sky-500)); border-radius: 6px; padding: calc(var(--spacing) * 1.75) calc(var(--spacing) * 3.5); text-decoration: none; white-space: nowrap; margin-left: auto;">
@@ -237,6 +255,7 @@ fn ValidationResults(report: ValidationReport) -> impl IntoView {
 
     let playlist_window_s = report.playlist_window_s;
     let latency_info = compute_latency(&renditions);
+    let definitions = report_definitions(&report);
     let rend_count = renditions.len();
     let error_color: &'static str = if errors > 0 { "#ef4444" } else { "#22c55e" };
     let warn_color: &'static str = if warnings > 0 { "#f59e0b" } else { "#22c55e" };
@@ -267,7 +286,7 @@ fn ValidationResults(report: ValidationReport) -> impl IntoView {
             // Section: Renditions
             {has_renditions.then(|| view! {
                 <SectionTitle label="📼 Renditions" />
-                <RenditionsTable renditions=renditions.clone() />
+                <RenditionsTable renditions=renditions.clone() definitions=definitions.clone() />
             })}
 
             // Section: Interstitials
@@ -286,7 +305,7 @@ fn ValidationResults(report: ValidationReport) -> impl IntoView {
             // Section: Delta Updates
             {has_deltas.then(|| view! {
                 <SectionTitle label="⏩ Playlist Delta Updates" />
-                <DeltaSection deltas=delta_report.clone() />
+                <DeltaSection deltas=delta_report.clone() definitions=definitions.clone() />
             })}
             {(!has_deltas).then(|| view! {
                 <SectionTitle label="⏩ Playlist Delta Updates" />
@@ -297,7 +316,12 @@ fn ValidationResults(report: ValidationReport) -> impl IntoView {
 
             // Section: Check Results
             <SectionTitle label="🔍 Check Results" />
-            <CheckResultsTable groups=check_groups has_interstitials_data=has_interstitials_data renditions=renditions.clone() />
+            <CheckResultsTable
+                groups=check_groups
+                has_interstitials_data=has_interstitials_data
+                renditions=renditions.clone()
+                definitions=definitions
+            />
 
             <div style="text-align: center; padding: calc(var(--spacing) * 8) calc(var(--spacing) * 5) 0; font-size: .8rem; color: var(--color-sky-700);">
                 "HLS Validator · Based on "
@@ -397,7 +421,10 @@ fn StatCard(value: String, label: &'static str, color: &'static str) -> impl Int
 // ── Renditions Table ─────────────────────────────────────────────────────────
 
 #[component]
-fn RenditionsTable(renditions: Vec<Rendition>) -> impl IntoView {
+fn RenditionsTable(
+    renditions: Vec<Rendition>,
+    definitions: std::collections::HashMap<String, String>,
+) -> impl IntoView {
     let mut sorted = renditions;
     sorted.sort_by(|a, b| {
         if a.media_type != b.media_type {
@@ -444,10 +471,7 @@ fn RenditionsTable(renditions: Vec<Rendition>) -> impl IntoView {
                         let group_label = if is_audio { "Group" } else { "Audio ref" };
                         let group_id = rn.group_id.clone().unwrap_or_default();
                         let cc = if is_audio { "—".to_string() } else { rn.closed_captions.clone().unwrap_or_else(|| "—".to_string()) };
-                        let viewer_url = format!(
-                            "/hls-manifest-viewer/?playlist_url={}",
-                            utf8_percent_encode(&rn.url, NON_ALPHANUMERIC)
-                        );
+                        let viewer_url = manifest_viewer_href(&rn.url, &definitions);
 
                         // Colour badge
                         let colour_view = if is_audio {
@@ -994,7 +1018,10 @@ fn Scte35Section(ad_breaks: Vec<AdBreak>, playlist_window_s: f64) -> impl IntoVi
 // ── Delta Updates Section ───────────────────────────────────────────────────
 
 #[component]
-fn DeltaSection(deltas: Vec<DeltaReport>) -> impl IntoView {
+fn DeltaSection(
+    deltas: Vec<DeltaReport>,
+    definitions: std::collections::HashMap<String, String>,
+) -> impl IntoView {
     view! {
         <div style="display: flex; flex-direction: column; gap: calc(var(--spacing) * 2.5); margin-bottom: calc(var(--spacing) * 7);">
             {deltas.into_iter().map(|d| {
@@ -1017,10 +1044,7 @@ fn DeltaSection(deltas: Vec<DeltaReport>) -> impl IntoView {
                 } else {
                     "background: rgba(56,189,248,.15); color: #38bdf8; border: 1px solid rgba(56,189,248,.3); border-radius: 6px; padding: 3px 9px; font-size: .72rem; font-weight: 700;"
                 };
-                let viewer_url = format!(
-                    "/hls-manifest-viewer/?playlist_url={}",
-                    utf8_percent_encode(&d.delta_url, NON_ALPHANUMERIC)
-                );
+                let viewer_url = manifest_viewer_href(&d.delta_url, &definitions);
 
                 view! {
                     <div style="background: var(--color-sky-50); border: 1px solid var(--color-sky-200); border-radius: 10px; padding: calc(var(--spacing) * 4) calc(var(--spacing) * 4.5);">
@@ -1070,7 +1094,12 @@ fn DeltaSection(deltas: Vec<DeltaReport>) -> impl IntoView {
 // ── Check Results Table ──────────────────────────────────────────────────────
 
 #[component]
-fn CheckResultsTable(groups: Vec<CheckGroup>, has_interstitials_data: bool, renditions: Vec<Rendition>) -> impl IntoView {
+fn CheckResultsTable(
+    groups: Vec<CheckGroup>,
+    has_interstitials_data: bool,
+    renditions: Vec<Rendition>,
+    definitions: std::collections::HashMap<String, String>,
+) -> impl IntoView {
     // Build rendition name → URL map for viewer links in drift issues
     let rend_url_map: std::collections::HashMap<String, String> = renditions.iter()
         .filter(|r| !r.url.is_empty())
@@ -1110,6 +1139,7 @@ fn CheckResultsTable(groups: Vec<CheckGroup>, has_interstitials_data: bool, rend
                     };
                     let (expanded, set_expanded) = signal(false);
                     let rend_url_map = rend_url_map.clone();
+                    let definitions = definitions.clone();
 
                     view! {
                         <tr
@@ -1156,6 +1186,7 @@ fn CheckResultsTable(groups: Vec<CheckGroup>, has_interstitials_data: bool, rend
                         {move || expanded.get().then(|| {
                             let issues = g.issues.clone();
                             let rend_url_map = rend_url_map.clone();
+                            let definitions = definitions.clone();
                             view! {
                                 <tr>
                                     <td colspan="5" style="padding: 0 14px 10px;">
@@ -1174,23 +1205,16 @@ fn CheckResultsTable(groups: Vec<CheckGroup>, has_interstitials_data: bool, rend
                                                     "Global".to_string()
                                                 };
                                                 // Check if this is a drift issue that should show viewer links
-                                                let is_drift = iss.message.starts_with("EXTINF duration drift")
-                                                    || iss.message.starts_with("Cumulative EXTINF drift");
+                                                let is_drift = is_drift_issue_message(&iss.message);
                                                 let viewer_links: Vec<(String, String)> = if is_drift {
                                                     let mut links = Vec::new();
                                                     if let Some(ref ra) = iss.rendition_a
                                                         && let Some(url) = rend_url_map.get(ra) {
-                                                            links.push((ra.clone(), format!(
-                                                                "/hls-manifest-viewer/?playlist_url={}",
-                                                                utf8_percent_encode(url, NON_ALPHANUMERIC)
-                                                            )));
+                                                            links.push((ra.clone(), manifest_viewer_href(url, &definitions)));
                                                         }
                                                     if let Some(ref rb) = iss.rendition_b
                                                         && let Some(url) = rend_url_map.get(rb) {
-                                                            links.push((rb.clone(), format!(
-                                                                "/hls-manifest-viewer/?playlist_url={}",
-                                                                utf8_percent_encode(url, NON_ALPHANUMERIC)
-                                                            )));
+                                                            links.push((rb.clone(), manifest_viewer_href(url, &definitions)));
                                                         }
                                                     links
                                                 } else {
@@ -1349,6 +1373,53 @@ mod tests {
     }
 
     // ── manifest_viewer_href ──────────────────────────────────────────────────
+
+    #[test]
+    fn is_drift_issue_message_matches_check_output() {
+        assert!(is_drift_issue_message(
+            "EXTINF drift at MSN 42: 'hi' has 6.006s vs 'lo' has 6.000s (diff=0.006s)"
+        ));
+        assert!(is_drift_issue_message(
+            "Cumulative EXTINF drift across renditions: 0.120s (tolerance=0.100s)"
+        ));
+        assert!(
+            !is_drift_issue_message("EXTINF duration must be ≤ TARGETDURATION"),
+            "unrelated EXTINF messages must not get drift viewer links"
+        );
+    }
+
+    #[test]
+    fn report_definitions_prefers_master_then_media() {
+        let mut master_defs = HashMap::new();
+        master_defs.insert("TOKEN".into(), "from-master".into());
+        let mut media_defs = HashMap::new();
+        media_defs.insert("TOKEN".into(), "from-media".into());
+
+        let mut with_master = ValidationReport::new();
+        with_master.master_url = "https://ex.com/master.m3u8".into();
+        with_master.master = Some(MasterPlaylist {
+            url: "https://ex.com/master.m3u8".into(),
+            raw_content: String::new(),
+            version: 6,
+            variants: Vec::new(),
+            media_renditions: Vec::new(),
+            definitions: master_defs,
+        });
+        assert_eq!(
+            report_definitions(&with_master).get("TOKEN").map(String::as_str),
+            Some("from-master")
+        );
+
+        let mut media_only = ValidationReport::new();
+        media_only.master_url = "https://ex.com/media.m3u8".into();
+        let mut pl = MediaPlaylist::new("media".into(), "https://ex.com/media.m3u8".into());
+        pl.definitions = media_defs;
+        media_only.playlists.push(pl);
+        assert_eq!(
+            report_definitions(&media_only).get("TOKEN").map(String::as_str),
+            Some("from-media")
+        );
+    }
 
     #[test]
     fn manifest_viewer_href_no_definitions() {
