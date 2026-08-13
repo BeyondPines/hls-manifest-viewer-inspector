@@ -33,6 +33,10 @@ pub struct InitSegmentProbe {
     pub has_clli: bool,
     /// True when an encrypted sample entry (`encv`/`enca`) was observed before `frma`.
     pub had_encrypted_sample_entry: bool,
+    /// Media timescale from `mdhd` (prefer video track).
+    pub timescale: Option<u32>,
+    /// Movie timescale from `mvhd`.
+    pub movie_timescale: Option<u32>,
 }
 
 fn prop_str(val: &AtomPropertyValue) -> String {
@@ -139,6 +143,17 @@ pub fn probe_init_segment(data: &[u8]) -> InitSegmentProbe {
                     }
                 }
             }
+            "MediaHeaderBox" => {
+                if let Some(ts) = get("timescale").and_then(|s| s.parse().ok()) {
+                    // Prefer video track timescale when in vide handler; otherwise first seen.
+                    if in_video || info.timescale.is_none() {
+                        info.timescale = Some(ts);
+                    }
+                }
+            }
+            "MovieHeaderBox" if info.movie_timescale.is_none() => {
+                info.movie_timescale = get("timescale").and_then(|s| s.parse().ok());
+            }
             "AVCConfigurationBox" if info.video_profile.is_none() => {
                 info.video_profile = get("profile");
                 info.video_level = get("level");
@@ -230,59 +245,227 @@ impl InitSegmentProbe {
     }
 }
 
-/// Best-effort scan of a media segment for Author Phase C flags.
+/// Best-effort scan of a media segment for Author Phase B/C flags.
 pub fn scan_segment_bytes(data: &[u8]) -> SegmentScan {
+    use std::collections::HashMap;
+
     let mut scan = SegmentScan::default();
-    if data.len() >= 4 && data[0] == 0x47 {
+
+    // MPEG-TS path
+    if data.len() >= 188 && data[0] == 0x47 {
         scan.looks_like_ts = true;
-        // Look for IDR NAL hint in PES (0x00 0x00 0x01 0x65 / 0x25 etc.) — very rough
-        for w in data.windows(4) {
-            if w[0] == 0 && w[1] == 0 && w[2] == 1 {
-                let nal = w[3] & 0x1f;
-                if nal == 5 {
-                    scan.has_idr_nal_hint = true;
-                    break;
+        let mut last_cc: HashMap<u16, u8> = HashMap::new();
+        let mut cc_ok = true;
+        let mut offset = 0usize;
+        while offset + 188 <= data.len() {
+            if data[offset] != 0x47 {
+                offset += 1;
+                continue;
+            }
+            let pid = (((data[offset + 1] as u16) & 0x1f) << 8) | data[offset + 2] as u16;
+            let adaptation = (data[offset + 3] >> 4) & 0x3;
+            let cc = data[offset + 3] & 0x0f;
+            // Continuity only increments when payload is present (adaptation != 0b10)
+            if adaptation != 0b10 && pid != 0x1fff {
+                if let Some(prev) = last_cc.get(&pid).copied() {
+                    let expect = (prev + 1) & 0x0f;
+                    if cc != expect {
+                        cc_ok = false;
+                    }
+                }
+                last_cc.insert(pid, cc);
+            }
+            offset += 188;
+        }
+        scan.ts_continuity_ok = Some(cc_ok);
+        scan_nal_hints(data, &mut scan);
+        return scan;
+    }
+
+    // ISOBMFF: size-based box walk with recursion into containers that hold tfdt/mdat.
+    walk_boxes(data, 0, data.len(), &mut scan, 0);
+
+    if scan.looks_like_fmp4 && !scan.has_idr_nal_hint {
+        scan_nal_hints(data, &mut scan);
+    }
+
+    scan
+}
+
+fn walk_boxes(data: &[u8], start: usize, end: usize, scan: &mut SegmentScan, depth: usize) {
+    if depth > 12 {
+        return;
+    }
+    let mut i = start;
+    while i + 8 <= end {
+        let mut size =
+            u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
+        let typ = &data[i + 4..i + 8];
+        let mut header = 8usize;
+        if size == 1 {
+            // 64-bit largesize
+            if i + 16 > end {
+                break;
+            }
+            size = u64::from_be_bytes([
+                data[i + 8],
+                data[i + 9],
+                data[i + 10],
+                data[i + 11],
+                data[i + 12],
+                data[i + 13],
+                data[i + 14],
+                data[i + 15],
+            ]) as usize;
+            header = 16;
+        } else if size == 0 {
+            size = end.saturating_sub(i);
+        }
+        if size < header || i + size > end {
+            break;
+        }
+        let body_start = i + header;
+        let body_end = i + size;
+
+        match typ {
+            b"ftyp" | b"moov" | b"sidx" => scan.looks_like_fmp4 = true,
+            b"moof" => {
+                scan.looks_like_fmp4 = true;
+                scan.has_moof = true;
+                walk_boxes(data, body_start, body_end, scan, depth + 1);
+            }
+            b"traf" | b"trak" | b"mdia" | b"minf" | b"stbl" => {
+                walk_boxes(data, body_start, body_end, scan, depth + 1);
+            }
+            b"mdat" => {
+                scan.looks_like_fmp4 = true;
+                scan_nal_hints(&data[body_start..body_end], scan);
+            }
+            b"senc" => scan.has_senc = true,
+            b"saiz" => scan.has_saiz = true,
+            b"saio" => scan.has_saio = true,
+            b"tfdt" => {
+                scan.has_tfdt = true;
+                scan.looks_like_fmp4 = true;
+                if scan.tfdt_base_media_decode_time.is_none() && body_start + 8 <= body_end {
+                    let version = data[body_start];
+                    if version == 1 && body_start + 12 <= body_end {
+                        scan.tfdt_base_media_decode_time = Some(u64::from_be_bytes([
+                            data[body_start + 4],
+                            data[body_start + 5],
+                            data[body_start + 6],
+                            data[body_start + 7],
+                            data[body_start + 8],
+                            data[body_start + 9],
+                            data[body_start + 10],
+                            data[body_start + 11],
+                        ]));
+                    } else if body_start + 8 <= body_end {
+                        scan.tfdt_base_media_decode_time = Some(u32::from_be_bytes([
+                            data[body_start + 4],
+                            data[body_start + 5],
+                            data[body_start + 6],
+                            data[body_start + 7],
+                        ]) as u64);
+                    }
                 }
             }
-            if w[0] == 0 && w[1] == 0 && w[2] == 0 && w.get(3) == Some(&1) {
-                // Annex-B start; check next byte if present
+            _ => {}
+        }
+
+        i += size;
+    }
+}
+
+fn scan_nal_hints(data: &[u8], scan: &mut SegmentScan) {
+    let early_limit = data.len().min(256 * 1024);
+    let early = &data[..early_limit];
+
+    let mut idr_positions: Vec<usize> = Vec::new();
+    let mut i = 0usize;
+    while i + 4 < early.len() {
+        let (sc_len, nal_off) = if early[i] == 0 && early[i + 1] == 0 && early[i + 2] == 1 {
+            (3usize, i + 3)
+        } else if i + 4 < early.len()
+            && early[i] == 0
+            && early[i + 1] == 0
+            && early[i + 2] == 0
+            && early[i + 3] == 1
+        {
+            (4usize, i + 4)
+        } else {
+            i += 1;
+            continue;
+        };
+        if nal_off >= early.len() {
+            break;
+        }
+        let b0 = early[nal_off];
+        let h264_type = b0 & 0x1f;
+        if h264_type == 5 {
+            idr_positions.push(i);
+            scan.has_idr_nal_hint = true;
+        }
+        if h264_type == 6 {
+            let sei_end = (nal_off + 64).min(early.len());
+            let sei = &early[nal_off..sei_end];
+            if sei.windows(4).any(|w| w == b"GA94") {
+                scan.has_cc_sei_hint = true;
             }
         }
-        // Also search for 00 00 00 01 65
-        for w in data.windows(5) {
-            if w[0] == 0 && w[1] == 0 && w[2] == 0 && w[3] == 1 {
-                let nal = w[4] & 0x1f;
-                if nal == 5 {
-                    scan.has_idr_nal_hint = true;
-                    break;
+        let hevc_type = (b0 >> 1) & 0x3f;
+        if hevc_type == 19 || hevc_type == 20 {
+            idr_positions.push(i);
+            scan.has_idr_nal_hint = true;
+        }
+        i += sc_len;
+    }
+
+    // Length-prefixed NALs (common in fMP4 mdat)
+    if !scan.has_idr_nal_hint {
+        let mut off = 0usize;
+        while off + 4 < early.len() {
+            let nalu_len =
+                u32::from_be_bytes([early[off], early[off + 1], early[off + 2], early[off + 3]])
+                    as usize;
+            if nalu_len == 0 || nalu_len > early.len().saturating_sub(off + 4) || nalu_len > 8_000_000
+            {
+                off += 1;
+                continue;
+            }
+            let nal_off = off + 4;
+            let b0 = early[nal_off];
+            let h264_type = b0 & 0x1f;
+            if h264_type == 5 {
+                idr_positions.push(off);
+                scan.has_idr_nal_hint = true;
+            }
+            if h264_type == 6 {
+                let sei_end = (nal_off + 64).min(early.len());
+                let sei = &early[nal_off..sei_end];
+                if sei.windows(4).any(|w| w == b"GA94") {
+                    scan.has_cc_sei_hint = true;
                 }
             }
+            let hevc_type = (b0 >> 1) & 0x3f;
+            if hevc_type == 19 || hevc_type == 20 {
+                idr_positions.push(off);
+                scan.has_idr_nal_hint = true;
+            }
+            off += 4 + nalu_len;
         }
     }
 
-    // fMP4: look for moof/ftyp/mdat fourccs
-    for w in data.windows(8) {
-        let typ = &w[4..8];
-        if typ == b"moof" || typ == b"ftyp" || typ == b"mdat" {
-            scan.looks_like_fmp4 = true;
-        }
-        if typ == b"moof" {
-            scan.has_moof = true;
-        }
-        if typ == b"tfdt" {
-            scan.has_tfdt = true;
-        }
-        if typ == b"senc" {
-            scan.has_senc = true;
-        }
-        if typ == b"saiz" {
-            scan.has_saiz = true;
-        }
-        if typ == b"saio" {
-            scan.has_saio = true;
+    if !idr_positions.is_empty() {
+        scan.idr_count = scan.idr_count.max(idr_positions.len());
+        if !scan.idr_at_start {
+            scan.idr_at_start = idr_positions.first().is_some_and(|&p| p < 8 * 1024);
         }
     }
-    scan
+
+    if early.windows(4).any(|w| w == b"asp ") {
+        scan.has_asp_hint = true;
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -291,11 +474,22 @@ pub struct SegmentScan {
     pub looks_like_fmp4: bool,
     pub has_moof: bool,
     pub has_idr_nal_hint: bool,
+    /// IDR found near the start of the segment payload.
+    pub idr_at_start: bool,
+    pub idr_count: usize,
     pub has_tfdt: bool,
+    pub tfdt_base_media_decode_time: Option<u64>,
     pub has_senc: bool,
     pub has_saiz: bool,
     pub has_saio: bool,
+    /// `Some(false)` when a continuity counter discontinuity was observed in-sample.
+    pub ts_continuity_ok: Option<bool>,
+    /// Best-effort CEA-608/708 SEI / GA94 hint.
+    pub has_cc_sei_hint: bool,
+    /// Best-effort APAC ASP marker hint.
+    pub has_asp_hint: bool,
 }
+
 
 #[cfg(test)]
 mod tests {

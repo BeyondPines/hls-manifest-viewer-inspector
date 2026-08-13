@@ -211,4 +211,81 @@ https://example.com/v.m3u8
             issues.iter().map(|i| &i.message).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn author_1_26_flags_vod_avg_bitrate_drift() {
+        let master = master_from(
+            r#"#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,AVERAGE-BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.4d401e,mp4a.40.2",FRAME-RATE=30
+https://example.com/v.m3u8
+"#,
+        );
+        let mut pl = MediaPlaylist::new("video/640x360 · 1000k".into(), "https://example.com/v.m3u8".into());
+        pl.media_type = "VIDEO".into();
+        pl.bandwidth = Some(1_000_000);
+        pl.average_bandwidth = Some(800_000);
+        pl.has_endlist = true;
+        pl.playlist_type = Some("VOD".into());
+        let segs = vec![
+            SegmentSample {
+                playlist_name: pl.name.clone(),
+                segment_index: 0,
+                uri: "https://example.com/0.m4s".into(),
+                extinf_s: 2.0,
+                // 800kbps * 2s = 1_600_000 bits = 200_000 bytes would match; use 400_000 bytes → 1.6 Mbps
+                bytes: 400_000,
+                is_iframe_playlist: false,
+                looks_like_fmp4: true,
+                has_moof: true,
+                has_idr_nal_hint: true,
+                idr_at_start: true,
+                idr_count: 1,
+                has_tfdt: true,
+                tfdt_base_media_decode_time: Some(0),
+                looks_like_ts: false,
+                has_senc: false,
+                has_saiz: false,
+                has_saio: false,
+                ts_continuity_ok: None,
+                has_cc_sei_hint: false,
+                has_asp_hint: false,
+            },
+            SegmentSample {
+                playlist_name: pl.name.clone(),
+                segment_index: 1,
+                uri: "https://example.com/1.m4s".into(),
+                extinf_s: 2.0,
+                bytes: 400_000,
+                is_iframe_playlist: false,
+                looks_like_fmp4: true,
+                has_moof: true,
+                has_idr_nal_hint: true,
+                idr_at_start: true,
+                idr_count: 1,
+                has_tfdt: true,
+                tfdt_base_media_decode_time: Some(60_000),
+                looks_like_ts: false,
+                has_senc: false,
+                has_saiz: false,
+                has_saio: false,
+                ts_continuity_ok: None,
+                has_cc_sei_hint: false,
+                has_asp_hint: false,
+            },
+        ];
+        let opts = ValidateAuthorOptions {
+            deep_checks: true,
+            ..Default::default()
+        };
+        let playlists = vec![pl];
+        let inits = Vec::new();
+        let vtts = Vec::new();
+        let ctx = AuthoringContext::new(Some(&master), &playlists, &opts, &inits, &segs, &vtts);
+        let issues = run_authoring_checks(&ctx);
+        assert!(
+            issues.iter().any(|i| i.message.contains("§1.26")),
+            "expected §1.26 issue, got: {:?}",
+            issues.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+    }
 }
