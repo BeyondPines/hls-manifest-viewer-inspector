@@ -39,9 +39,9 @@ pub fn Author() -> impl IntoView {
 
     view! {
         <div class="body-content" style="margin-bottom: 2em;">
-            <h1 class="body-content">"Check against the Apple HLS Authoring Spec"</h1>
+            <h1 class="body-content page-title-single-line">"Apple HLS Authoring Spec Validation"</h1>
             <p class="body-content body-text">
-                "Enter a master or media playlist URL to run the Apple HLS Authoring Specification rules — codecs, bitrate ladders, segmentation, trick play, accessibility, content protection and more. Phase B always probes init segments (and samples I-frame/WebVTT lightly). Pick a platform profile to apply its amendments, and enable deep checks to sample more media segments for measured bitrate and bitstream heuristics."
+                "Enter a master or media playlist URL to run the Apple HLS Authoring Specification rules — codecs, bitrate ladders, segmentation, trick play, accessibility, content protection and more. Phase B always probes init segments (and samples I-frame/WebVTT lightly). Enable Deep checks for Phase C: measured bitrate vs BANDWIDTH/AVERAGE-BANDWIDTH, IDR interval, tfdt/TS continuity, and closed-caption SEI hints."
             </p>
             <div style="background: var(--color-white); border: 1px solid var(--color-sky-200); border-radius: 12px; padding: calc(var(--spacing) * 7); box-shadow: 0 2px 12px rgba(0,0,0,.06); margin-top: calc(var(--spacing) * 6);">
                 <form on:submit=on_submit>
@@ -91,7 +91,7 @@ pub fn Author() -> impl IntoView {
                                     }
                                 }
                             />
-                            <label for="deep-author">"Deep checks (downloads media segments)"</label>
+                            <label for="deep-author">"Deep checks — Phase C measured bitrate / bitstream (downloads segments)"</label>
                         </div>
                     </div>
                 </form>
