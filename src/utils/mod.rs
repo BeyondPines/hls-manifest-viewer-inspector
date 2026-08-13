@@ -1,3 +1,4 @@
+pub mod author;
 pub mod bitter;
 pub mod hex;
 pub mod href;

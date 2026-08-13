@@ -440,12 +440,6 @@ pub struct ValidationReport {
     pub has_scte35_data: bool,
     /// Duration of the best video playlist window in seconds (PDT-based; for SCTE timeline)
     pub playlist_window_s: f64,
-    /// Authoring profile used for Apple Authoring Spec overlays
-    pub author_profile: String,
-    /// Whether deep Author segment sampling was enabled
-    pub deep_author_checks: bool,
-    /// Notes for known in-browser Author probe limitations
-    pub author_probe_notes: Vec<String>,
 }
 
 impl ValidationReport {
@@ -469,9 +463,6 @@ impl ValidationReport {
             has_interstitials_data: false,
             has_scte35_data: false,
             playlist_window_s: 0.0,
-            author_profile: "None".to_string(),
-            deep_author_checks: false,
-            author_probe_notes: Vec::new(),
         }
     }
 

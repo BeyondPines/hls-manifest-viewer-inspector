@@ -1,20 +1,12 @@
 pub mod types;
 pub mod parser;
 pub mod checks;
-pub mod authoring;
 
 use types::*;
 use parser::*;
-use authoring::{
-    AuthoringContext, InitProbeEntry, SegmentSample, ValidateAuthorOptions,
-    run_authoring_checks,
-};
 use crate::utils::href::replace_hls_variables;
-use crate::utils::mp4_probe::{probe_init_segment, scan_segment_bytes};
-use crate::utils::network::{fetch_array_buffer, fetch_text, FetchError, RequestRange};
-use std::collections::{HashMap, HashSet};
-
-pub use authoring::AuthorProfile;
+use crate::utils::network::{fetch_text, FetchError};
+use std::collections::HashMap;
 
 /// Substitute EXT-X-DEFINE variables in `uri`, then resolve against `base`.
 pub fn absolute_fetch_uri(base: &str, uri: &str, defs: &HashMap<String, String>) -> String {
@@ -27,26 +19,8 @@ pub fn is_master_playlist(content: &str) -> bool {
     content.contains("#EXT-X-STREAM-INF:") || content.contains("#EXT-X-I-FRAME-STREAM-INF:")
 }
 
-/// Options for [`validate_hls_with_options`].
-#[derive(Debug, Clone)]
-pub struct ValidateOptions {
-    pub tolerance_ms: f64,
-    pub author_profile: AuthorProfile,
-    pub deep_author_checks: bool,
-}
-
-impl Default for ValidateOptions {
-    fn default() -> Self {
-        Self {
-            tolerance_ms: 100.0,
-            author_profile: AuthorProfile::None,
-            deep_author_checks: false,
-        }
-    }
-}
-
 /// Get current time in milliseconds (browser performance.now() or Date.now())
-fn now_ms() -> f64 {
+pub(crate) fn now_ms() -> f64 {
     web_sys::window()
         .and_then(|w| w.performance())
         .map(|p| p.now())
@@ -63,209 +37,225 @@ fn http_meta_from_fetch(request_url: &str, resp: &crate::utils::network::FetchTe
     }
 }
 
-fn parse_map_byterange(br: &str) -> Option<RequestRange> {
-    // HLS BYTERANGE is `n` or `n@o`
-    let (length, offset) = if let Some((n, o)) = br.split_once('@') {
-        (n.parse::<u64>().ok()?, o.parse::<u64>().ok()?)
-    } else {
-        (br.parse::<u64>().ok()?, 0)
-    };
-    Some(RequestRange::from_length_with_offset(length, offset))
+/// Master and media playlists fetched for one stream. Shared by the Validate
+/// and Author sections so both parse the stream the same way.
+pub struct CollectedStream {
+    pub master: Option<MasterPlaylist>,
+    pub playlists: Vec<MediaPlaylist>,
+    /// Warnings raised while fetching renditions.
+    pub fetch_issues: Vec<Issue>,
 }
 
-/// Main validation entry point with tolerance / Author options
-pub async fn validate_hls_with_options(
-    url: &str,
-    options: ValidateOptions,
-) -> Result<ValidationReport, FetchError> {
-    let start = now_ms();
+/// Fetch a master (and all of its media playlists) or a single media playlist.
+pub async fn collect_stream(url: &str) -> Result<CollectedStream, FetchError> {
     let response = fetch_text(url.to_string()).await?;
     let content = &response.response_text;
+    let mut fetch_issues = Vec::new();
+
+    if !is_master_playlist(content) {
+        let mut pl = MediaPlaylist::new("media".to_string(), url.to_string());
+        pl.http_meta = http_meta_from_fetch(url, &response);
+        parse_media_playlist(url, content, &mut pl);
+        return Ok(CollectedStream {
+            master: None,
+            playlists: vec![pl],
+            fetch_issues,
+        });
+    }
+
+    let mut master = parse_master_playlist(url, content);
+    master.http_meta = http_meta_from_fetch(url, &response);
+
+    let mut playlists = Vec::new();
+    let mut seen_urls = std::collections::HashSet::new();
+
+    // Collect variant info including closed_captions and video_range
+    struct VariantInfo {
+        uri: String,
+        bandwidth: Option<u64>,
+        average_bandwidth: Option<u64>,
+        codecs: Option<String>,
+        resolution: Option<String>,
+        frame_rate: Option<f64>,
+        audio_group: Option<String>,
+        closed_captions: Option<String>,
+        video_range: Option<String>,
+        is_iframe: bool,
+        score: Option<f64>,
+        hdcp_level: Option<String>,
+        pathway_id: Option<String>,
+        req_video_layout: Option<String>,
+    }
+    let variant_infos: Vec<VariantInfo> = master.variants.iter().map(|v| VariantInfo {
+        uri: v.uri.clone(),
+        bandwidth: v.bandwidth,
+        average_bandwidth: v.average_bandwidth,
+        codecs: v.codecs.clone(),
+        resolution: v.resolution.clone(),
+        frame_rate: v.frame_rate,
+        audio_group: v.audio_group.clone(),
+        closed_captions: v.closed_captions.clone(),
+        video_range: v.video_range.clone(),
+        is_iframe: v.is_iframe,
+        score: v.score,
+        hdcp_level: v.hdcp_level.clone(),
+        pathway_id: v.pathway_id.clone(),
+        req_video_layout: v.req_video_layout.clone(),
+    }).collect();
+
+    // Build audio group → codec lookup from STREAM-INF CODECS strings
+    // (each STREAM-INF CODECS is "videocodec,audiocodec"; take the audio portion)
+    let audio_group_codec: std::collections::HashMap<String, String> = master.variants.iter()
+        .filter_map(|v| {
+            let grp = v.audio_group.as_ref()?;
+            let codecs = v.codecs.as_ref()?;
+            let audio_codec = codecs.split(',').nth(1).map(|c| c.trim().to_string())?;
+            Some((grp.clone(), audio_codec))
+        })
+        .collect();
+
+    // Carry channels along with each audio rendition for naming/display
+    let audio_uris: Vec<(String, String, String, Option<String>)> = master.media_renditions.iter()
+        .filter(|r| r.media_type == "AUDIO" && r.uri.is_some())
+        .map(|r| (r.uri.clone().unwrap(), r.name.clone(), r.group_id.clone(), r.channels.clone()))
+        .collect();
+
+    // Fetch variant playlists in parallel (unique absolute URIs only).
+    let mut variant_jobs: Vec<(usize, String)> = Vec::new();
+    for (idx, vi) in variant_infos.iter().enumerate() {
+        let fetch_uri = absolute_fetch_uri(url, &vi.uri, &master.definitions);
+        if !seen_urls.insert(fetch_uri.clone()) {
+            continue;
+        }
+        variant_jobs.push((idx, fetch_uri));
+    }
+    let variant_fetches = futures::future::join_all(
+        variant_jobs.iter().map(|(_, fetch_uri)| {
+            let fetch_uri = fetch_uri.clone();
+            async move { fetch_text(fetch_uri).await }
+        }),
+    )
+    .await;
+
+    for ((idx, fetch_uri), result) in variant_jobs.iter().zip(variant_fetches) {
+        let vi = &variant_infos[*idx];
+        // Include bandwidth in name to disambiguate renditions that share a resolution
+        // (e.g. two 1920×1080 tiers at different bitrates).
+        let name = if let Some(r) = &vi.resolution {
+            if let Some(b) = vi.bandwidth {
+                format!("video/{} · {}k", r, b / 1000)
+            } else {
+                format!("video/{}", r)
+            }
+        } else if let Some(b) = vi.bandwidth {
+            format!("video/{}k", b / 1000)
+        } else {
+            fetch_uri
+                .split('/')
+                .next_back()
+                .unwrap_or("unknown")
+                .to_string()
+        };
+        match result {
+            Ok(resp) => {
+                let mut pl = MediaPlaylist::new(name, fetch_uri.clone());
+                pl.media_type = "VIDEO".to_string();
+                pl.bandwidth = vi.bandwidth;
+                pl.average_bandwidth = vi.average_bandwidth;
+                pl.codecs = vi.codecs.clone();
+                pl.resolution = vi.resolution.clone();
+                pl.frame_rate = vi.frame_rate;
+                pl.audio_group = vi.audio_group.clone();
+                pl.closed_captions = vi.closed_captions.clone();
+                pl.video_range = vi.video_range.clone();
+                pl.color_info = derive_color_info(vi.video_range.as_deref(), vi.codecs.as_deref());
+                pl.is_iframe = vi.is_iframe;
+                pl.score = vi.score;
+                pl.hdcp_level = vi.hdcp_level.clone();
+                pl.pathway_id = vi.pathway_id.clone();
+                pl.req_video_layout = vi.req_video_layout.clone();
+                pl.http_meta = http_meta_from_fetch(fetch_uri, &resp);
+                parse_media_playlist(fetch_uri, &resp.response_text, &mut pl);
+                apply_master_definitions(&resp.response_text, &master.definitions, &mut pl.definitions);
+                playlists.push(pl);
+            }
+            Err(e) => {
+                fetch_issues.push(Issue::warn(format!(
+                    "Could not fetch media playlist '{}': {}", fetch_uri, e
+                )));
+            }
+        }
+    }
+
+    // Fetch audio renditions in parallel (unique absolute URIs only).
+    let mut audio_jobs: Vec<(usize, String)> = Vec::new();
+    for (idx, (uri, _, _, _)) in audio_uris.iter().enumerate() {
+        let fetch_uri = absolute_fetch_uri(url, uri, &master.definitions);
+        if !seen_urls.insert(fetch_uri.clone()) {
+            continue;
+        }
+        audio_jobs.push((idx, fetch_uri));
+    }
+    let audio_fetches = futures::future::join_all(
+        audio_jobs.iter().map(|(_, fetch_uri)| {
+            let fetch_uri = fetch_uri.clone();
+            async move { fetch_text(fetch_uri).await }
+        }),
+    )
+    .await;
+
+    for ((idx, fetch_uri), result) in audio_jobs.iter().zip(audio_fetches) {
+        let (_, name, group_id, channels) = &audio_uris[*idx];
+        // Build a unique, human-readable name.
+        // "ENG (audio1) · 2ch" disambiguates entries that share the same NAME.
+        let channel_suffix = channels.as_deref()
+            .map(|c| format!(" · {}ch", c.split('/').next().unwrap_or(c)))
+            .unwrap_or_default();
+        let audio_name = format!("audio/{} ({}){}", name, group_id, channel_suffix);
+
+        match result {
+            Ok(resp) => {
+                let mut pl = MediaPlaylist::new(audio_name, fetch_uri.clone());
+                pl.media_type = "AUDIO".to_string();
+                pl.group_id = Some(group_id.clone());
+                // Derive audio codec from the STREAM-INF entry that references this group
+                pl.codecs = audio_group_codec.get(group_id.as_str()).cloned();
+                pl.http_meta = http_meta_from_fetch(fetch_uri, &resp);
+                parse_media_playlist(fetch_uri, &resp.response_text, &mut pl);
+                apply_master_definitions(&resp.response_text, &master.definitions, &mut pl.definitions);
+                playlists.push(pl);
+            }
+            Err(e) => {
+                fetch_issues.push(Issue::warn(format!(
+                    "Could not fetch audio rendition '{}': {}", fetch_uri, e
+                )));
+            }
+        }
+    }
+
+    Ok(CollectedStream {
+        master: Some(master),
+        playlists,
+        fetch_issues,
+    })
+}
+
+/// Main validation entry point with tolerance option
+pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<ValidationReport, FetchError> {
+    let start = now_ms();
+    let stream = collect_stream(url).await?;
     let mut report = ValidationReport::new();
 
-    report.tolerance_ms = options.tolerance_ms;
+    report.tolerance_ms = tolerance_ms;
     report.master_url = url.to_string();
-    report.author_profile = options.author_profile.as_str().to_string();
-    report.deep_author_checks = options.deep_author_checks;
+    report.issues.extend(stream.fetch_issues);
 
-    let author_opts = ValidateAuthorOptions {
-        profile: options.author_profile,
-        deep_checks: options.deep_author_checks,
-    };
+    let playlists = stream.playlists;
 
-    if is_master_playlist(content) {
-        let mut master = parse_master_playlist(url, content);
-        master.http_meta = http_meta_from_fetch(url, &response);
+    if let Some(master) = stream.master {
         report.issues.extend(checks::check_codecs_attribute(&master));
         report.issues.extend(checks::check_bandwidth_required(&master));
         report.issues.extend(checks::check_media_group_membership(&master));
-
-        let mut playlists = Vec::new();
-        let mut seen_urls = std::collections::HashSet::new();
-
-        // Collect variant info including closed_captions and video_range
-        struct VariantInfo {
-            uri: String,
-            bandwidth: Option<u64>,
-            average_bandwidth: Option<u64>,
-            codecs: Option<String>,
-            resolution: Option<String>,
-            frame_rate: Option<f64>,
-            audio_group: Option<String>,
-            closed_captions: Option<String>,
-            video_range: Option<String>,
-            is_iframe: bool,
-            score: Option<f64>,
-            hdcp_level: Option<String>,
-            pathway_id: Option<String>,
-            req_video_layout: Option<String>,
-        }
-        let variant_infos: Vec<VariantInfo> = master.variants.iter().map(|v| VariantInfo {
-            uri: v.uri.clone(),
-            bandwidth: v.bandwidth,
-            average_bandwidth: v.average_bandwidth,
-            codecs: v.codecs.clone(),
-            resolution: v.resolution.clone(),
-            frame_rate: v.frame_rate,
-            audio_group: v.audio_group.clone(),
-            closed_captions: v.closed_captions.clone(),
-            video_range: v.video_range.clone(),
-            is_iframe: v.is_iframe,
-            score: v.score,
-            hdcp_level: v.hdcp_level.clone(),
-            pathway_id: v.pathway_id.clone(),
-            req_video_layout: v.req_video_layout.clone(),
-        }).collect();
-
-        // Build audio group → codec lookup from STREAM-INF CODECS strings
-        // (each STREAM-INF CODECS is "videocodec,audiocodec"; take the audio portion)
-        let audio_group_codec: std::collections::HashMap<String, String> = master.variants.iter()
-            .filter_map(|v| {
-                let grp = v.audio_group.as_ref()?;
-                let codecs = v.codecs.as_ref()?;
-                let audio_codec = codecs.split(',').nth(1).map(|c| c.trim().to_string())?;
-                Some((grp.clone(), audio_codec))
-            })
-            .collect();
-
-        // Carry channels along with each audio rendition for naming/display
-        let audio_uris: Vec<(String, String, String, Option<String>)> = master.media_renditions.iter()
-            .filter(|r| r.media_type == "AUDIO" && r.uri.is_some())
-            .map(|r| (r.uri.clone().unwrap(), r.name.clone(), r.group_id.clone(), r.channels.clone()))
-            .collect();
-
-        // Fetch variant playlists in parallel (unique absolute URIs only).
-        let mut variant_jobs: Vec<(usize, String)> = Vec::new();
-        for (idx, vi) in variant_infos.iter().enumerate() {
-            let fetch_uri = absolute_fetch_uri(url, &vi.uri, &master.definitions);
-            if !seen_urls.insert(fetch_uri.clone()) {
-                continue;
-            }
-            variant_jobs.push((idx, fetch_uri));
-        }
-        let variant_fetches = futures::future::join_all(
-            variant_jobs.iter().map(|(_, fetch_uri)| {
-                let fetch_uri = fetch_uri.clone();
-                async move { fetch_text(fetch_uri).await }
-            }),
-        )
-        .await;
-
-        for ((idx, fetch_uri), result) in variant_jobs.iter().zip(variant_fetches) {
-            let vi = &variant_infos[*idx];
-            // Include bandwidth in name to disambiguate renditions that share a resolution
-            // (e.g. two 1920×1080 tiers at different bitrates).
-            let name = if let Some(r) = &vi.resolution {
-                if let Some(b) = vi.bandwidth {
-                    format!("video/{} · {}k", r, b / 1000)
-                } else {
-                    format!("video/{}", r)
-                }
-            } else if let Some(b) = vi.bandwidth {
-                format!("video/{}k", b / 1000)
-            } else {
-                fetch_uri
-                    .split('/')
-                    .next_back()
-                    .unwrap_or("unknown")
-                    .to_string()
-            };
-            match result {
-                Ok(resp) => {
-                    let mut pl = MediaPlaylist::new(name, fetch_uri.clone());
-                    pl.media_type = "VIDEO".to_string();
-                    pl.bandwidth = vi.bandwidth;
-                    pl.average_bandwidth = vi.average_bandwidth;
-                    pl.codecs = vi.codecs.clone();
-                    pl.resolution = vi.resolution.clone();
-                    pl.frame_rate = vi.frame_rate;
-                    pl.audio_group = vi.audio_group.clone();
-                    pl.closed_captions = vi.closed_captions.clone();
-                    pl.video_range = vi.video_range.clone();
-                    pl.color_info = derive_color_info(vi.video_range.as_deref(), vi.codecs.as_deref());
-                    pl.is_iframe = vi.is_iframe;
-                    pl.score = vi.score;
-                    pl.hdcp_level = vi.hdcp_level.clone();
-                    pl.pathway_id = vi.pathway_id.clone();
-                    pl.req_video_layout = vi.req_video_layout.clone();
-                    pl.http_meta = http_meta_from_fetch(fetch_uri, &resp);
-                    parse_media_playlist(fetch_uri, &resp.response_text, &mut pl);
-                    apply_master_definitions(&resp.response_text, &master.definitions, &mut pl.definitions);
-                    playlists.push(pl);
-                }
-                Err(e) => {
-                    report.issues.push(Issue::warn(format!(
-                        "Could not fetch media playlist '{}': {}", fetch_uri, e
-                    )));
-                }
-            }
-        }
-
-        // Fetch audio renditions in parallel (unique absolute URIs only).
-        let mut audio_jobs: Vec<(usize, String)> = Vec::new();
-        for (idx, (uri, _, _, _)) in audio_uris.iter().enumerate() {
-            let fetch_uri = absolute_fetch_uri(url, uri, &master.definitions);
-            if !seen_urls.insert(fetch_uri.clone()) {
-                continue;
-            }
-            audio_jobs.push((idx, fetch_uri));
-        }
-        let audio_fetches = futures::future::join_all(
-            audio_jobs.iter().map(|(_, fetch_uri)| {
-                let fetch_uri = fetch_uri.clone();
-                async move { fetch_text(fetch_uri).await }
-            }),
-        )
-        .await;
-
-        for ((idx, fetch_uri), result) in audio_jobs.iter().zip(audio_fetches) {
-            let (_, name, group_id, channels) = &audio_uris[*idx];
-            // Build a unique, human-readable name.
-            // "ENG (audio1) · 2ch" disambiguates entries that share the same NAME.
-            let channel_suffix = channels.as_deref()
-                .map(|c| format!(" · {}ch", c.split('/').next().unwrap_or(c)))
-                .unwrap_or_default();
-            let audio_name = format!("audio/{} ({}){}", name, group_id, channel_suffix);
-
-            match result {
-                Ok(resp) => {
-                    let mut pl = MediaPlaylist::new(audio_name, fetch_uri.clone());
-                    pl.media_type = "AUDIO".to_string();
-                    pl.group_id = Some(group_id.clone());
-                    // Derive audio codec from the STREAM-INF entry that references this group
-                    pl.codecs = audio_group_codec.get(group_id.as_str()).cloned();
-                    pl.http_meta = http_meta_from_fetch(fetch_uri, &resp);
-                    parse_media_playlist(fetch_uri, &resp.response_text, &mut pl);
-                    apply_master_definitions(&resp.response_text, &master.definitions, &mut pl.definitions);
-                    playlists.push(pl);
-                }
-                Err(e) => {
-                    report.issues.push(Issue::warn(format!(
-                        "Could not fetch audio rendition '{}': {}", fetch_uri, e
-                    )));
-                }
-            }
-        }
 
         // Run checks and parse interstitials
         run_media_checks(&playlists, &mut report);
@@ -306,130 +296,20 @@ pub async fn validate_hls_with_options(
         let msn_issues = check_media_sequence_monotonicity(&playlists).await;
         report.issues.extend(msn_issues);
 
-        // Author: init probes (Phase B) + optional deep segment samples (Phase C)
-        let (init_probes, segment_samples) =
-            collect_author_media_samples(&playlists, options.deep_author_checks).await;
-        let author_ctx = AuthoringContext::new(
-            Some(&master),
-            &playlists,
-            &author_opts,
-            &init_probes,
-            &segment_samples,
-        );
-        report.author_probe_notes = author_ctx.probe_notes.clone();
-        report.issues.extend(run_authoring_checks(&author_ctx));
-
         // Build renditions for UI
         report.renditions = build_renditions(&playlists);
         report.playlists = playlists;
         report.master = Some(master);
     } else {
-        let mut pl = MediaPlaylist::new("media".to_string(), url.to_string());
-        pl.http_meta = http_meta_from_fetch(url, &response);
-        parse_media_playlist(url, content, &mut pl);
-        run_media_checks(&[pl.clone()], &mut report);
-        let (init_probes, segment_samples) =
-            collect_author_media_samples(std::slice::from_ref(&pl), options.deep_author_checks).await;
-        let author_ctx = AuthoringContext::new(
-            None,
-            std::slice::from_ref(&pl),
-            &author_opts,
-            &init_probes,
-            &segment_samples,
-        );
-        report.author_probe_notes = author_ctx.probe_notes.clone();
-        report.issues.extend(run_authoring_checks(&author_ctx));
-        report.renditions = build_renditions(&[pl.clone()]);
-        report.playlists = vec![pl];
+        run_media_checks(&playlists, &mut report);
+        report.renditions = build_renditions(&playlists);
+        report.playlists = playlists;
     }
 
     report.finalize();
     report.check_groups = categorize_issues(&report.issues);
     report.elapsed_ms = (now_ms() - start) as u64;
     Ok(report)
-}
-
-/// Fetch unique init segments and (optionally) a few media segments for Author checks.
-async fn collect_author_media_samples(
-    playlists: &[MediaPlaylist],
-    deep: bool,
-) -> (Vec<InitProbeEntry>, Vec<SegmentSample>) {
-    let mut init_jobs: Vec<(String, Option<String>, Option<RequestRange>)> = Vec::new();
-    let mut seen_init: HashSet<String> = HashSet::new();
-    for pl in playlists {
-        let Some(map_uri) = pl.segments.iter().find_map(|s| s.map_uri.clone()) else {
-            continue;
-        };
-        let br = pl.map_byterange.clone();
-        let key = format!("{}|{}", map_uri, br.as_deref().unwrap_or(""));
-        if !seen_init.insert(key) {
-            continue;
-        }
-        let range = br.as_deref().and_then(parse_map_byterange);
-        init_jobs.push((map_uri, br, range));
-    }
-
-    let init_fetches = futures::future::join_all(init_jobs.iter().map(|(uri, _, range)| {
-        let uri = uri.clone();
-        let range = *range;
-        async move { fetch_array_buffer(uri, range).await }
-    }))
-    .await;
-
-    let mut init_probes = Vec::new();
-    for ((uri, br, _), result) in init_jobs.iter().zip(init_fetches) {
-        if let Ok(resp) = result {
-            init_probes.push(InitProbeEntry {
-                uri: uri.clone(),
-                byterange: br.clone(),
-                probe: probe_init_segment(&resp.response_body),
-            });
-        }
-    }
-
-    let mut segment_samples = Vec::new();
-    if deep {
-        const MAX_PER_PLAYLIST: usize = 3;
-        let mut ranged_jobs: Vec<(String, usize, String, f64, Option<RequestRange>)> = Vec::new();
-        for pl in playlists {
-            for (idx, seg) in pl.segments.iter().take(MAX_PER_PLAYLIST).enumerate() {
-                let uri = if seg.uri.contains("://") {
-                    seg.uri.clone()
-                } else {
-                    absolute_fetch_uri(&pl.url, &seg.uri, &pl.definitions)
-                };
-                let range = seg.byterange.as_deref().and_then(parse_map_byterange);
-                ranged_jobs.push((pl.name.clone(), idx, uri, seg.duration, range));
-            }
-        }
-        let fetches = futures::future::join_all(ranged_jobs.iter().map(|(_, _, uri, _, range)| {
-            let uri = uri.clone();
-            let range = *range;
-            async move { fetch_array_buffer(uri, range).await }
-        }))
-        .await;
-        for (job, result) in ranged_jobs.iter().zip(fetches) {
-            if let Ok(resp) = result {
-                let scan = scan_segment_bytes(&resp.response_body);
-                segment_samples.push(SegmentSample {
-                    playlist_name: job.0.clone(),
-                    segment_index: job.1,
-                    uri: job.2.clone(),
-                    extinf_s: job.3,
-                    bytes: resp.response_body.len(),
-                    looks_like_ts: scan.looks_like_ts,
-                    looks_like_fmp4: scan.looks_like_fmp4,
-                    has_idr_nal_hint: scan.has_idr_nal_hint,
-                    has_tfdt: scan.has_tfdt,
-                    has_senc: scan.has_senc,
-                    has_saiz: scan.has_saiz,
-                    has_saio: scan.has_saio,
-                });
-            }
-        }
-    }
-
-    (init_probes, segment_samples)
 }
 
 /// Resolve EXT-X-DEFINE:IMPORT references in a media playlist against the parent (master)
@@ -592,21 +472,6 @@ const CHECK_DEFS: &[CheckDef] = &[
     CheckDef { name: "LL-HLS Compliance", section: "LL-HLS", reference: "rfc8216bis §4.4.3–4.4.5", keywords: &["LL-HLS", "rfc8216bis §4.4.3.8", "rfc8216bis §4.4.4.9", "rfc8216bis §4.4.5"] },
     // Appendix D
     CheckDef { name: "HLS Interstitials", section: "Interstitials", reference: "rfc8216bis Appendix D", keywords: &["Interstitial:"] },
-    // Apple HLS Authoring Specification
-    CheckDef { name: "Video Codecs", section: "Author", reference: "Apple Authoring Spec §1", keywords: &["Apple Authoring Spec §1."] },
-    CheckDef { name: "Audio Codecs", section: "Author", reference: "Apple Authoring Spec §2", keywords: &["Apple Authoring Spec §2."] },
-    CheckDef { name: "Ads", section: "Author", reference: "Apple Authoring Spec §3", keywords: &["Apple Authoring Spec §3."] },
-    CheckDef { name: "Accessibility / Subtitles", section: "Author", reference: "Apple Authoring Spec §4–5", keywords: &["Apple Authoring Spec §4.", "Apple Authoring Spec §5."] },
-    CheckDef { name: "Trick Play", section: "Author", reference: "Apple Authoring Spec §6", keywords: &["Apple Authoring Spec §6."] },
-    CheckDef { name: "Segmentation", section: "Author", reference: "Apple Authoring Spec §7", keywords: &["Apple Authoring Spec §7."] },
-    CheckDef { name: "Media Playlists", section: "Author", reference: "Apple Authoring Spec §8", keywords: &["Apple Authoring Spec §8."] },
-    CheckDef { name: "Multivariant", section: "Author", reference: "Apple Authoring Spec §9", keywords: &["Apple Authoring Spec §9."] },
-    CheckDef { name: "Delivery", section: "Author", reference: "Apple Authoring Spec §10", keywords: &["Apple Authoring Spec §10."] },
-    CheckDef { name: "Privacy", section: "Author", reference: "Apple Authoring Spec §11", keywords: &["Apple Authoring Spec §11."] },
-    CheckDef { name: "Security", section: "Author", reference: "Apple Authoring Spec §12", keywords: &["Apple Authoring Spec §12."] },
-    CheckDef { name: "Protection", section: "Author", reference: "Apple Authoring Spec §13", keywords: &["Apple Authoring Spec §13.", "Apple Authoring Spec §1.41"] },
-    CheckDef { name: "LL-HLS Author", section: "Author", reference: "Apple Authoring Spec §14", keywords: &["Apple Authoring Spec §14."] },
-    CheckDef { name: "SharePlay / Spatial", section: "Author", reference: "Apple Authoring Spec §15–16", keywords: &["Apple Authoring Spec §15.", "Apple Authoring Spec §16."] },
 ];
 
 /// Categorize issues into named check groups (matches Go categorizeIssues)

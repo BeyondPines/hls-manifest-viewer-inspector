@@ -1,10 +1,11 @@
-//! Apple HLS Authoring Specification checks (Validate "Author" section).
+//! Apple HLS Authoring Specification checks (the "Author" section).
 
 #![allow(clippy::collapsible_if)]
 
 mod context;
 mod helpers;
 mod profile;
+mod run;
 mod severity;
 
 mod rules_a11y_subs;
@@ -21,10 +22,9 @@ mod rules_shareplay_spatial;
 mod rules_trickplay;
 mod rules_video;
 
-pub use context::{
-    AuthoringContext, InitProbeEntry, SegmentSample, ValidateAuthorOptions,
-};
+pub use context::AuthoringContext;
 pub use profile::AuthorProfile;
+pub use run::{run_author_report, AuthorOptions, AuthorReport};
 
 use crate::utils::validator::types::Issue;
 
@@ -52,6 +52,7 @@ mod tests {
     use super::*;
     use crate::utils::validator::parser::parse_master_playlist;
     use crate::utils::validator::types::*;
+    use context::{InitProbeEntry, SegmentSample, ValidateAuthorOptions};
     use profile::AuthorPolicy;
 
     fn master_from(content: &str) -> MasterPlaylist {

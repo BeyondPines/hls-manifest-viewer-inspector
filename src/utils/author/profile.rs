@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-/// Platform profile selected in the Validate UI. General rules always apply;
+/// Platform profile selected in the Author UI. General rules always apply;
 /// amendments replace or add rules for the selected platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AuthorProfile {
