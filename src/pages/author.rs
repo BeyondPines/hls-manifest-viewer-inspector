@@ -41,7 +41,7 @@ pub fn Author() -> impl IntoView {
         <div class="body-content" style="margin-bottom: 2em;">
             <h1 class="body-content">"Check against the Apple HLS Authoring Spec"</h1>
             <p class="body-content body-text">
-                "Enter a master or media playlist URL to run the Apple HLS Authoring Specification rules — codecs, bitrate ladders, segmentation, trick play, accessibility, content protection and more. Pick a platform profile to apply its amendments, and enable deep checks to sample media segments for measured bitrate and bitstream heuristics."
+                "Enter a master or media playlist URL to run the Apple HLS Authoring Specification rules — codecs, bitrate ladders, segmentation, trick play, accessibility, content protection and more. Phase B always probes init segments (and samples I-frame/WebVTT lightly). Pick a platform profile to apply its amendments, and enable deep checks to sample more media segments for measured bitrate and bitstream heuristics."
             </p>
             <div style="background: var(--color-white); border: 1px solid var(--color-sky-200); border-radius: 12px; padding: calc(var(--spacing) * 7); box-shadow: 0 2px 12px rgba(0,0,0,.06); margin-top: calc(var(--spacing) * 6);">
                 <form on:submit=on_submit>
@@ -124,13 +124,15 @@ fn AuthorResults(report: AuthorReport) -> impl IntoView {
         ("#ef4444", "rgba(239,68,68,.12)", "✗ FAIL")
     };
     let summary = format!(
-        "{} playlist{} · {} init probe{} · {} segment sample{} · deep checks {} · {} ms",
+        "{} playlist{} · {} init probe{} · {} segment sample{} · {} WebVTT sample{} · deep checks {} · {} ms",
         report.playlist_count,
         if report.playlist_count == 1 { "" } else { "s" },
         report.init_probe_count,
         if report.init_probe_count == 1 { "" } else { "s" },
         report.segment_sample_count,
         if report.segment_sample_count == 1 { "" } else { "s" },
+        report.webvtt_sample_count,
+        if report.webvtt_sample_count == 1 { "" } else { "s" },
         if report.deep_checks { "on" } else { "off" },
         report.elapsed_ms,
     );
@@ -295,3 +297,4 @@ fn AuthorCheckTable(groups: Vec<CheckGroup>) -> impl IntoView {
         </table>
     }
 }
+

@@ -15,11 +15,24 @@ pub struct InitSegmentProbe {
     pub audio_sample_fourcc: Option<String>,
     pub video_profile: Option<String>,
     pub video_level: Option<String>,
+    /// HEVC general_tier_flag when available ("Main" / "High").
+    pub video_tier: Option<String>,
     pub has_ludt: bool,
     pub has_senc: bool,
     pub has_saiz: bool,
     pub has_saio: bool,
     pub has_vexu: bool,
+    pub has_tenc: bool,
+    /// CENC scheme_type from `schm` (e.g. "cenc", "cbcs").
+    pub scheme_type: Option<String>,
+    /// From `tenc` version ≥1 pattern encryption fields.
+    pub crypt_byte_block: Option<u8>,
+    pub skip_byte_block: Option<u8>,
+    /// HDR10 static metadata boxes / SEI containers often signaled near hvcC.
+    pub has_mdcv: bool,
+    pub has_clli: bool,
+    /// True when an encrypted sample entry (`encv`/`enca`) was observed before `frma`.
+    pub had_encrypted_sample_entry: bool,
 }
 
 fn prop_str(val: &AtomPropertyValue) -> String {
@@ -69,6 +82,9 @@ pub fn probe_init_segment(data: &[u8]) -> InitSegmentProbe {
             "saiz" => info.has_saiz = true,
             "saio" => info.has_saio = true,
             "vexu" => info.has_vexu = true,
+            "tenc" => info.has_tenc = true,
+            "mdcv" => info.has_mdcv = true,
+            "clli" => info.has_clli = true,
             _ => {}
         }
 
@@ -130,6 +146,19 @@ pub fn probe_init_segment(data: &[u8]) -> InitSegmentProbe {
             "HEVCConfigurationBox" if info.video_profile.is_none() => {
                 info.video_profile = get("general_profile_idc").or_else(|| get("profile"));
                 info.video_level = get("general_level_idc").or_else(|| get("level"));
+                info.video_tier = get("general_tier_flag").or_else(|| get("tier"));
+            }
+            "TrackEncryptionBox" => {
+                info.has_tenc = true;
+                if let Some(c) = get("default_crypt_byte_block") {
+                    info.crypt_byte_block = c.split_whitespace().next().and_then(|s| s.parse().ok());
+                }
+                if let Some(s) = get("default_skip_byte_block") {
+                    info.skip_byte_block = s.split_whitespace().next().and_then(|x| x.parse().ok());
+                }
+            }
+            "SchemeTypeBox" if info.scheme_type.is_none() => {
+                info.scheme_type = get("scheme_type");
             }
             _ => {}
         }
@@ -138,16 +167,67 @@ pub fn probe_init_segment(data: &[u8]) -> InitSegmentProbe {
         if VIDEO_SAMPLE_ENTRIES.iter().any(|e| e.eq_ignore_ascii_case(&kind))
             && (in_video || info.video_sample_fourcc.is_none())
         {
+            if kind.eq_ignore_ascii_case("encv") {
+                info.had_encrypted_sample_entry = true;
+            }
             info.video_sample_fourcc = Some(kind.clone());
         }
         if AUDIO_SAMPLE_ENTRIES.iter().any(|e| e.eq_ignore_ascii_case(&kind))
             && (in_audio || info.audio_sample_fourcc.is_none())
         {
+            if kind.eq_ignore_ascii_case("enca") {
+                info.had_encrypted_sample_entry = true;
+            }
             info.audio_sample_fourcc = Some(kind.clone());
         }
     }
 
+    // Byte scan fallback for boxes our property walker may skip.
+    for w in data.windows(8) {
+        let typ = &w[4..8];
+        match typ {
+            b"mdcv" => info.has_mdcv = true,
+            b"clli" => info.has_clli = true,
+            b"ludt" => info.has_ludt = true,
+            b"vexu" => info.has_vexu = true,
+            b"tenc" => info.has_tenc = true,
+            _ => {}
+        }
+    }
+
     info
+}
+
+impl InitSegmentProbe {
+    /// Brands declared on this init (major + compatible).
+    pub fn all_brands(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        if let Some(m) = &self.major_brand {
+            out.push(m.as_str());
+        }
+        for b in &self.compatible_brands {
+            out.push(b.as_str());
+        }
+        out
+    }
+
+    /// HLS requires fMP4 init brands compatible with `iso6` or higher / CMAF.
+    pub fn has_iso6_compatible_brand(&self) -> bool {
+        self.all_brands().iter().any(|b| {
+            let b = b.to_ascii_lowercase();
+            matches!(
+                b.as_str(),
+                "iso6" | "iso7" | "iso8" | "iso9" | "cmfc" | "cmfs" | "cfsd" | "msdh" | "msix"
+            )
+        })
+    }
+
+    pub fn looks_like_fmp4_init(&self) -> bool {
+        self.major_brand.is_some()
+            || self.video_sample_fourcc.is_some()
+            || self.audio_sample_fourcc.is_some()
+            || !self.compatible_brands.is_empty()
+    }
 }
 
 /// Best-effort scan of a media segment for Author Phase C flags.
@@ -186,6 +266,9 @@ pub fn scan_segment_bytes(data: &[u8]) -> SegmentScan {
         if typ == b"moof" || typ == b"ftyp" || typ == b"mdat" {
             scan.looks_like_fmp4 = true;
         }
+        if typ == b"moof" {
+            scan.has_moof = true;
+        }
         if typ == b"tfdt" {
             scan.has_tfdt = true;
         }
@@ -206,6 +289,7 @@ pub fn scan_segment_bytes(data: &[u8]) -> SegmentScan {
 pub struct SegmentScan {
     pub looks_like_ts: bool,
     pub looks_like_fmp4: bool,
+    pub has_moof: bool,
     pub has_idr_nal_hint: bool,
     pub has_tfdt: bool,
     pub has_senc: bool,

@@ -154,6 +154,24 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         }
     }
 
+    // §6.10 — fMP4 I-frame segments MUST include moof
+    for sample in ctx.segment_samples.iter().filter(|s| s.is_iframe_playlist) {
+        let pl_has_map = ctx
+            .iframe_playlists()
+            .find(|p| p.name == sample.playlist_name)
+            .is_some_and(playlist_has_map)
+            || sample.looks_like_fmp4;
+        if pl_has_map && !sample.has_moof {
+            issues.push(author_error(
+                "6.10",
+                format!(
+                    "fMP4 I-frame segment '{}' missing moof header",
+                    sample.uri
+                ),
+            ));
+        }
+    }
+
     // visionOS 6.18/6.19 — spatial trick play notes
     if ctx.policy.profile == super::profile::AuthorProfile::VisionOs && !iframes.is_empty() {
         let stereo_video = videos.iter().any(|v| {

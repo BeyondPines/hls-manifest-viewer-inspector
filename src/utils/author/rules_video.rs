@@ -347,53 +347,237 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         }
     }
 
-    // Phase B: reinforce sample-entry preference / brands from init probes
+    // Phase B: container / profile / level / HDR metadata from init probes
     for entry in ctx.init_probes {
-        if let Some(fourcc) = &entry.probe.video_sample_fourcc {
-            if prefers_parameter_sets_in_sample_entry(fourcc) {
+        let probe = &entry.probe;
+        let fourcc = probe.video_sample_fourcc.as_deref().unwrap_or("");
+        let fourcc_l = fourcc.to_ascii_lowercase();
+        let is_avc = fourcc_l.starts_with("avc");
+        let is_hevc = fourcc_l.starts_with("hvc") || fourcc_l.starts_with("hev");
+        let is_dv = fourcc_l.starts_with("dvh") || fourcc_l.starts_with("dvhe");
+        let is_av1 = fourcc_l.starts_with("av01");
+
+        if prefers_parameter_sets_in_sample_entry(fourcc) {
+            issues.push(author_warn(
+                "1.10",
+                format!(
+                    "init '{}' uses sample entry '{fourcc}' (prefer avc1/hvc1/dvh1)",
+                    entry.uri
+                ),
+            ));
+        }
+
+        // §1.2 / 1.5 / 1.39 — container requirements from init brands + playlist MAP/TS
+        if is_hevc || is_dv {
+            if !probe.looks_like_fmp4_init() {
+                issues.push(author_error(
+                    "1.5",
+                    format!("HEVC/DV init '{}' could not be parsed as fMP4", entry.uri),
+                ));
+            } else if !probe.has_iso6_compatible_brand() {
                 issues.push(author_warn(
-                    "1.10",
+                    "1.5",
                     format!(
-                        "init '{}' uses sample entry '{fourcc}' (prefer avc1/hvc1/dvh1)",
-                        entry.uri
+                        "HEVC/DV init '{}' missing iso6+ / CMAF brand (found {:?})",
+                        entry.uri, probe.major_brand
                     ),
                 ));
             }
-            if fourcc.to_ascii_lowercase().starts_with("avc") {
-                if let (Some(max), Some(level)) =
-                    (ctx.policy.h264_max_level, entry.probe.video_level.as_deref())
+        }
+        if is_av1 {
+            if !probe.looks_like_fmp4_init() {
+                issues.push(author_error(
+                    "1.39",
+                    format!("AV1 init '{}' could not be parsed as fMP4", entry.uri),
+                ));
+            } else if !probe.has_iso6_compatible_brand() {
+                issues.push(author_warn(
+                    "1.39",
+                    format!(
+                        "AV1 init '{}' missing iso6+ / CMAF brand (found {:?})",
+                        entry.uri, probe.major_brand
+                    ),
+                ));
+            }
+        }
+        if is_avc {
+            // H.264 MAY be TS or fMP4. If init exists it is fMP4 — brand SHOULD be iso6+.
+            if probe.looks_like_fmp4_init() && !probe.has_iso6_compatible_brand() {
+                issues.push(author_warn(
+                    "1.2",
+                    format!(
+                        "H.264 fMP4 init '{}' missing iso6+ / CMAF brand (found {:?})",
+                        entry.uri, probe.major_brand
+                    ),
+                ));
+            }
+        }
+
+        // §1.3 / 1.4 / 1.6 profile+level from avcC/hvcC
+        if is_avc {
+            if let Some(profile) = probe.video_profile.as_deref() {
+                let p = profile.to_ascii_lowercase();
+                if p.contains("baseline") || p.contains("main") || p == "66" || p == "77" {
+                    issues.push(author_warn(
+                        "1.4",
+                        format!(
+                            "H.264 profile '{profile}' in init '{}'; High Profile is preferred",
+                            entry.uri
+                        ),
+                    ));
+                }
+            }
+            if let Some(level) = probe.video_level.as_deref() {
+                let max = ctx.policy.h264_max_level.unwrap_or("5.2");
+                if let (Some(have), Some(limit)) =
+                    (parse_codec_level(level), parse_codec_level(max))
                 {
-                    // Soft compare numeric level strings (e.g. "5.1" vs "51")
-                    let parse_lvl = |s: &str| -> Option<f64> {
-                        if let Ok(v) = s.parse::<f64>() {
-                            if v > 10.0 {
-                                Some(v / 10.0)
-                            } else {
-                                Some(v)
-                            }
-                        } else {
-                            None
-                        }
-                    };
-                    if let (Some(have), Some(limit)) = (parse_lvl(level), parse_lvl(max)) {
-                        if have > limit + 0.01 {
-                            issues.push(author_warn(
-                                "1.3",
-                                format!(
-                                    "H.264 level {level} in init '{}' exceeds {} profile max {max}",
-                                    entry.uri,
-                                    ctx.policy.profile.as_str()
-                                ),
-                            ));
-                        }
+                    if have > limit + 0.01 {
+                        issues.push(author_error(
+                            "1.3b",
+                            format!(
+                                "H.264 level {level} in init '{}' exceeds {} max {max}",
+                                entry.uri,
+                                ctx.policy.profile.as_str()
+                            ),
+                        ));
                     }
                 }
             }
         }
-        if entry.probe.major_brand.is_none() && entry.probe.video_sample_fourcc.is_none() {
+
+        if is_hevc {
+            // HEVC general_level_idc is typically level × 30 (e.g. 153 → 5.1).
+            if let Some(raw) = probe.video_level.as_deref().and_then(|s| s.parse::<f64>().ok()) {
+                let hevc_level = if raw > 10.0 { raw / 30.0 } else { raw };
+                if hevc_level > 5.1 + 0.01 && !ctx.policy.is_exempt("1.6b") {
+                    issues.push(author_error(
+                        "1.6b",
+                        format!(
+                            "HEVC level {hevc_level} in init '{}' exceeds Main10 Level 5.1",
+                            entry.uri
+                        ),
+                    ));
+                }
+            }
+        }
+
+        if is_dv {
+            // §1.9 — DV profile/level from codec string is preferred; init fourcc alone is weak.
+            // Soft: if we only have fourcc, skip numeric check.
+        }
+
+        // §1.8 / 1.35 — HDR10 static metadata presence
+        let playlist_is_hdr = entry.playlist_names.iter().any(|name| {
+            ctx.playlists.iter().any(|pl| {
+                pl.name == *name && is_hdr_range(pl.video_range.as_deref())
+            })
+        }) || variants.iter().any(|v| {
+            is_hdr_range(v.video_range.as_deref())
+                && v.codecs.as_deref().is_some_and(|c| {
+                    codec_tokens(c).iter().any(|t| {
+                        matches!(video_codec_family(t), Some("hevc" | "dv" | "av1"))
+                    })
+                })
+        });
+        if playlist_is_hdr && (is_hevc || is_dv) {
+            if !probe.has_mdcv && !probe.has_clli {
+                issues.push(author_warn(
+                    "1.35",
+                    format!(
+                        "HDR content init '{}' missing mdcv/clli static metadata boxes",
+                        entry.uri
+                    ),
+                ));
+            } else if probe.has_mdcv || probe.has_clli {
+                // §1.8 — metadata present in init (hvcC-adjacent) is preferred over sample SEI
+                issues.push(author_info(
+                    "1.8",
+                    format!(
+                        "HDR static metadata present in init '{}' (mdcv={}, clli={})",
+                        entry.uri, probe.has_mdcv, probe.has_clli
+                    ),
+                ));
+            }
+        }
+
+        if probe.major_brand.is_none()
+            && probe.video_sample_fourcc.is_none()
+            && probe.audio_sample_fourcc.is_none()
+        {
             issues.push(author_warn(
                 "1.2",
                 format!("could not parse ftyp/sample entry from init '{}'", entry.uri),
+            ));
+        }
+    }
+
+    // §1.3a — at least one H.264 variant ≤ High@L4.1 when H.264 present
+    if !ctx.policy.is_exempt("1.3a") {
+        let h264_levels: Vec<f64> = ctx
+            .init_probes
+            .iter()
+            .filter(|e| {
+                e.probe
+                    .video_sample_fourcc
+                    .as_deref()
+                    .is_some_and(|c| c.to_ascii_lowercase().starts_with("avc"))
+            })
+            .filter_map(|e| e.probe.video_level.as_deref().and_then(parse_codec_level))
+            .collect();
+        if !h264_levels.is_empty() && !h264_levels.iter().any(|l| *l <= 4.1 + 0.01) {
+            issues.push(author_warn(
+                "1.3a",
+                "no H.264 init ≤ High Profile Level 4.1 for maximum compatibility",
+            ));
+        }
+    }
+
+    // §1.11 — level SHOULD NOT exceed resolution/fps requirement
+    for v in &variants {
+        let Some(res) = v.resolution.as_deref().and_then(parse_resolution) else {
+            continue;
+        };
+        let fps = v.frame_rate.unwrap_or(30.0);
+        let required = h264_level_required_for(res.0, res.1, fps);
+        // Match init by playlist name containing resolution or by codecs avc
+        for entry in ctx.init_probes {
+            let is_avc = entry
+                .probe
+                .video_sample_fourcc
+                .as_deref()
+                .is_some_and(|c| c.to_ascii_lowercase().starts_with("avc"));
+            if !is_avc {
+                continue;
+            }
+            if let Some(level) = entry.probe.video_level.as_deref().and_then(parse_codec_level) {
+                if level > required + 0.15 {
+                    issues.push(author_warn(
+                        "1.11",
+                        format!(
+                            "H.264 level {level} in '{}' exceeds ~{required} needed for {}@{fps}",
+                            entry.uri,
+                            v.resolution.as_deref().unwrap_or("?"),
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Cross-check playlist CODECS families vs container (TS without MAP for HEVC/AV1)
+    for pl in ctx.video_playlists() {
+        let codecs = pl.codecs.as_deref().unwrap_or("");
+        let has_hevc_family = codec_tokens(codecs)
+            .iter()
+            .any(|t| matches!(video_codec_family(t), Some("hevc" | "dv" | "av1")));
+        if has_hevc_family && playlist_looks_like_ts(pl) && !playlist_has_map(pl) {
+            issues.push(author_error(
+                "1.5",
+                format!(
+                    "'{}' declares HEVC/DV/AV1 but looks like MPEG-TS without EXT-X-MAP",
+                    pl.name
+                ),
             ));
         }
     }
@@ -410,6 +594,6 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         }
     }
 
-    // AirPlay +1.41 — CENC pattern checks deferred to protection/init
+    // AirPlay +1.41 — CENC pattern checks live in protection rules
     issues
 }

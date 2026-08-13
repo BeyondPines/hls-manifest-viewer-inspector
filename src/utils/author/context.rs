@@ -28,10 +28,13 @@ impl Default for ValidateAuthorOptions {
 pub struct InitProbeEntry {
     pub uri: String,
     pub byterange: Option<String>,
+    /// Playlist names that reference this init (video/audio/iframe).
+    pub playlist_names: Vec<String>,
+    pub media_types: Vec<String>,
     pub probe: InitSegmentProbe,
 }
 
-/// Measured segment sample for Phase C deep checks.
+/// Measured segment sample for Phase B light probes / Phase C deep checks.
 #[derive(Debug, Clone)]
 pub struct SegmentSample {
     pub playlist_name: String,
@@ -39,14 +42,26 @@ pub struct SegmentSample {
     pub uri: String,
     pub extinf_s: f64,
     pub bytes: usize,
+    pub is_iframe_playlist: bool,
     /// Parsed flags from the segment body (best-effort).
     pub looks_like_ts: bool,
     pub looks_like_fmp4: bool,
+    pub has_moof: bool,
     pub has_idr_nal_hint: bool,
     pub has_tfdt: bool,
     pub has_senc: bool,
     pub has_saiz: bool,
     pub has_saio: bool,
+}
+
+/// WebVTT cue file sample for §5.3.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct WebVttSample {
+    pub playlist_name: String,
+    pub uri: String,
+    pub has_webvtt_header: bool,
+    pub has_x_timestamp_map: bool,
 }
 
 /// Full input for `run_authoring_checks`.
@@ -59,6 +74,7 @@ pub struct AuthoringContext<'a> {
     pub deep_checks: bool,
     pub init_probes: &'a [InitProbeEntry],
     pub segment_samples: &'a [SegmentSample],
+    pub webvtt_samples: &'a [WebVttSample],
     pub probe_notes: Vec<String>,
 }
 
@@ -69,6 +85,7 @@ impl<'a> AuthoringContext<'a> {
         options: &ValidateAuthorOptions,
         init_probes: &'a [InitProbeEntry],
         segment_samples: &'a [SegmentSample],
+        webvtt_samples: &'a [WebVttSample],
     ) -> Self {
         let all_stereo = master
             .map(|m| {
@@ -86,9 +103,15 @@ impl<'a> AuthoringContext<'a> {
             "TLS cipher/certificate validation (Apple Authoring Spec §12.1–12.3) is not available in-browser."
                 .to_string(),
         );
+        notes.push(format!(
+            "Phase B init probes: {} unique init(s), {} light segment sample(s), {} WebVTT sample(s).",
+            init_probes.len(),
+            segment_samples.len(),
+            webvtt_samples.len(),
+        ));
         if !options.deep_checks {
             notes.push(
-                "Deep Author checks (segment sampling) are off — enable to measure bandwidth / IDR / continuity."
+                "Deep Author checks (full segment sampling) are off — enable for measured bandwidth / IDR / continuity."
                     .to_string(),
             );
         }
@@ -100,6 +123,7 @@ impl<'a> AuthoringContext<'a> {
             deep_checks: options.deep_checks,
             init_probes,
             segment_samples,
+            webvtt_samples,
             probe_notes: notes,
         }
     }
@@ -116,5 +140,11 @@ impl<'a> AuthoringContext<'a> {
 
     pub fn audio_playlists(&self) -> impl Iterator<Item = &MediaPlaylist> {
         self.playlists.iter().filter(|p| p.media_type == "AUDIO")
+    }
+
+    pub fn probe_for_playlist(&self, name: &str) -> Option<&InitProbeEntry> {
+        self.init_probes
+            .iter()
+            .find(|e| e.playlist_names.iter().any(|n| n == name))
     }
 }

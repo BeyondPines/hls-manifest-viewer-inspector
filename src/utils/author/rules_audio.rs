@@ -208,13 +208,107 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         }
     }
 
-    // Phase B loudness / ludt
+    // Phase B loudness / container from init probes
     for entry in ctx.init_probes {
-        if entry.probe.audio_sample_fourcc.is_some() && !entry.probe.has_ludt {
-            // §2.19 SHOULD include loudness — Warn when audio init lacks ludt
+        let probe = &entry.probe;
+        let Some(fourcc) = probe.audio_sample_fourcc.as_deref() else {
+            continue;
+        };
+        let fourcc_l = fourcc.to_ascii_lowercase();
+        let is_apac = fourcc_l.starts_with("apac");
+        let is_flac = fourcc_l == "flac" || fourcc_l == "alac";
+        let is_xhe = entry.playlist_names.iter().any(|name| {
+            ctx.playlists.iter().any(|pl| {
+                pl.name == *name
+                    && pl
+                        .codecs
+                        .as_deref()
+                        .is_some_and(|c| c.to_ascii_lowercase().contains("mp4a.40.42"))
+            })
+        });
+
+        // §2.19 — ludt SHOULD for fMP4 audio except APAC (SHALL NOT for APAC)
+        if is_apac {
+            if probe.has_ludt {
+                issues.push(author_error(
+                    "2.19",
+                    format!("APAC init '{}' MUST NOT include a ludt loudness box", entry.uri),
+                ));
+            }
+            // §2.30 — APAC MUST have in-stream loudness/DRC (not fully observable from init)
+            issues.push(author_info(
+                "2.30",
+                format!(
+                    "APAC init '{}': verify in-stream loudness/DRC metadata in samples",
+                    entry.uri
+                ),
+            ));
+        } else if probe.looks_like_fmp4_init() && !probe.has_ludt {
             issues.push(author_warn(
                 "2.19",
                 format!("audio init '{}' missing ludt loudness box", entry.uri),
+            ));
+            // §2.18 / 2.20 — without ludt, dialnorm / AAC loudness SHOULD exist (best-effort note)
+            if fourcc_l == "ac-3" || fourcc_l == "ec-3" {
+                issues.push(author_warn(
+                    "2.20",
+                    format!(
+                        "Dolby init '{}' lacks ludt; dialnorm SHOULD be present in the bitstream",
+                        entry.uri
+                    ),
+                ));
+            } else if fourcc_l == "mp4a" {
+                issues.push(author_warn(
+                    "2.21",
+                    format!(
+                        "AAC init '{}' lacks ludt; dialog loudness SHOULD be signaled in the bitstream",
+                        entry.uri
+                    ),
+                ));
+            }
+        }
+
+        // §2.25 — xHE-AAC / ALAC / FLAC / APAC MUST be fMP4
+        if is_apac || is_flac || is_xhe {
+            if !probe.looks_like_fmp4_init() {
+                issues.push(author_error(
+                    "2.25",
+                    format!(
+                        "codec '{fourcc}' on init '{}' MUST use fMP4 container",
+                        entry.uri
+                    ),
+                ));
+            } else if !probe.has_iso6_compatible_brand() {
+                issues.push(author_warn(
+                    "2.25",
+                    format!(
+                        "fMP4 audio init '{}' missing iso6+ / CMAF brand",
+                        entry.uri
+                    ),
+                ));
+            }
+        }
+
+        // §2.1 — audio SHOULD be elementary or fMP4 (info when we only see odd brands)
+        if probe.looks_like_fmp4_init() {
+            // satisfied
+        }
+    }
+
+    // Playlist-level §2.25 when MAP missing for xHE-AAC/APAC/FLAC
+    for pl in ctx.audio_playlists() {
+        let codecs = pl.codecs.as_deref().unwrap_or("").to_ascii_lowercase();
+        let needs_fmp4 = codecs.contains("mp4a.40.42")
+            || codecs.contains("apac")
+            || codecs.contains("alac")
+            || codecs.contains("flac");
+        if needs_fmp4 && playlist_looks_like_ts(pl) && !playlist_has_map(pl) {
+            issues.push(author_error(
+                "2.25",
+                format!(
+                    "'{}' declares xHE-AAC/APAC/ALAC/FLAC but looks like TS without EXT-X-MAP",
+                    pl.name
+                ),
             ));
         }
     }

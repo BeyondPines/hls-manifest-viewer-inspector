@@ -104,11 +104,38 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         }
     }
 
-    // §5.3 X-TIMESTAMP-MAP — Phase B note when we have WebVTT segment samples
-    for s in ctx.segment_samples {
-        if s.uri.contains(".vtt") || s.playlist_name.contains("subtitle") {
-            // Deep path would check; playlist phase: skip
-            let _ = s;
+    // §5.3 — WebVTT text files MUST include X-TIMESTAMP-MAP
+    if ctx.webvtt_samples.is_empty() {
+        let has_text_subs = master.media_renditions.iter().any(|r| {
+            r.media_type == "SUBTITLES"
+                && r.uri.is_some()
+                && !master.raw_content.contains("stpp")
+        });
+        if has_text_subs {
+            issues.push(author_info(
+                "5.3",
+                "subtitle renditions present but no WebVTT cue files were sampled (fMP4/IMSC or fetch failed)",
+            ));
+        }
+    } else {
+        for sample in ctx.webvtt_samples {
+            if sample.has_webvtt_header && !sample.has_x_timestamp_map {
+                issues.push(author_error(
+                    "5.3",
+                    format!(
+                        "WebVTT '{}' missing X-TIMESTAMP-MAP",
+                        sample.uri
+                    ),
+                ));
+            } else if !sample.has_webvtt_header {
+                issues.push(author_warn(
+                    "5.3",
+                    format!(
+                        "subtitle sample '{}' does not look like a WebVTT text file",
+                        sample.uri
+                    ),
+                ));
+            }
         }
     }
 

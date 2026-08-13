@@ -156,27 +156,52 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
     // §8.19 / 8.21 — DATERANGE for interstitials/program boundaries SHOULD
     // (informational if none — skip)
 
-    // §8.20 — MAP present when fMP4 implied
+    // §8.20 — MAP MUST be present when using fMP4 (strengthened by Phase B init brands)
     for pl in ctx.playlists {
-        let has_map = pl.segments.iter().any(|s| s.map_uri.is_some());
+        let has_map = playlist_has_map(pl);
         let codecs = pl.codecs.as_deref().unwrap_or("");
         let suggests_fmp4 = codecs.contains("avc1")
             || codecs.contains("hvc1")
             || codecs.contains("hev1")
             || codecs.contains("av01")
+            || codecs.contains("dvh")
             || codecs.contains("mp4a");
-        // TS often uses avc1 too — only warn when MAP missing AND no .ts URIs
-        let looks_ts = pl.segments.iter().any(|s| {
-            s.uri.contains(".ts") || s.uri.contains(".m2ts")
-        });
-        if suggests_fmp4 && !looks_ts && !has_map && !pl.segments.is_empty() {
-            issues.push(author_warn(
-                "8.20",
-                format!(
-                    "'{}' appears fMP4 (CODECS) but has no EXT-X-MAP",
-                    pl.name
-                ),
-            ));
+        let looks_ts = playlist_looks_like_ts(pl);
+        let probe = ctx.probe_for_playlist(&pl.name);
+        let init_says_fmp4 = probe.is_some_and(|e| e.probe.looks_like_fmp4_init());
+
+        if (init_says_fmp4 || (suggests_fmp4 && !looks_ts)) && !has_map && !pl.segments.is_empty()
+        {
+            let sev_rule_msg = if init_says_fmp4 {
+                author_error(
+                    "8.20",
+                    format!(
+                        "'{}' uses fMP4 init but has no EXT-X-MAP",
+                        pl.name
+                    ),
+                )
+            } else {
+                author_warn(
+                    "8.20",
+                    format!(
+                        "'{}' appears fMP4 (CODECS) but has no EXT-X-MAP",
+                        pl.name
+                    ),
+                )
+            };
+            issues.push(sev_rule_msg);
+        }
+
+        if let Some(entry) = probe {
+            if entry.probe.looks_like_fmp4_init() && !entry.probe.has_iso6_compatible_brand() {
+                issues.push(author_warn(
+                    "8.20",
+                    format!(
+                        "fMP4 init for '{}' missing iso6+ / CMAF brand (found {:?})",
+                        pl.name, entry.probe.major_brand
+                    ),
+                ));
+            }
         }
     }
 

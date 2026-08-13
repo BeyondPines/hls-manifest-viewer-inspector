@@ -106,18 +106,50 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         }
     }
 
-    // Phase B: vexu presence for spatial
+    // Phase B: §16.2 vexu MUST for spatial video
     let expects_spatial = master.variants.iter().any(|v| {
         v.req_video_layout
             .as_deref()
-            .is_some_and(|l| l.to_ascii_lowercase().contains("stereo"))
+            .is_some_and(|l| {
+                let l = l.to_ascii_lowercase();
+                l.contains("stereo") || l.contains("immersive")
+            })
     });
     if expects_spatial {
-        let any_vexu = ctx.init_probes.iter().any(|e| e.probe.has_vexu);
-        if !ctx.init_probes.is_empty() && !any_vexu {
+        let video_inits: Vec<_> = ctx
+            .init_probes
+            .iter()
+            .filter(|e| {
+                e.media_types.iter().any(|t| t == "VIDEO")
+                    || e.probe.video_sample_fourcc.is_some()
+            })
+            .collect();
+        if video_inits.is_empty() {
             issues.push(author_warn(
                 "16.2",
-                "stereo spatial variants present but no vexu box found in init probes",
+                "spatial variants present but no video init probes were available to check vexu",
+            ));
+        } else if video_inits.iter().any(|e| !e.probe.has_vexu) {
+            for e in video_inits.iter().filter(|e| !e.probe.has_vexu) {
+                issues.push(author_error(
+                    "16.2",
+                    format!(
+                        "spatial video init '{}' MUST include a vexu box",
+                        e.uri
+                    ),
+                ));
+            }
+        }
+
+        // §16.4 — parallax metadata SHOULD when subtitles exist (vexu children not fully parsed)
+        let has_subs = master
+            .media_renditions
+            .iter()
+            .any(|r| r.media_type == "SUBTITLES");
+        if has_subs {
+            issues.push(author_info(
+                "16.4",
+                "stereo/immersive content with subtitles SHOULD include parallax metadata in vexu",
             ));
         }
     }

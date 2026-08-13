@@ -65,40 +65,98 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         }
     }
 
-    // Phase B: CENC pattern / senc|saiz+saio
+    // Phase B: CENC pattern / tenc / AirPlay §1.41
     for entry in ctx.init_probes {
-        // Init may not have senc; check tenc indirectly via encrypted sample entry
-        let enc = entry
-            .probe
-            .video_sample_fourcc
-            .as_deref()
-            .is_some_and(|c| c.eq_ignore_ascii_case("encv"))
-            || entry
-                .probe
+        let probe = &entry.probe;
+        let enc = probe.had_encrypted_sample_entry
+            || probe
+                .video_sample_fourcc
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case("encv"))
+            || probe
                 .audio_sample_fourcc
                 .as_deref()
-                .is_some_and(|c| c.eq_ignore_ascii_case("enca"));
-        if enc {
-            // §13.7 / 13.9 — pattern encryption expected in media; note if deep samples lack saiz/saio
-            if ctx.deep_checks {
-                let related = ctx
-                    .segment_samples
-                    .iter()
-                    .any(|s| s.has_saiz && s.has_saio || s.has_senc);
-                if !related {
-                    issues.push(author_warn(
-                        "13.9",
-                        format!(
-                            "encrypted init '{}' but sampled segments lack senc/saiz+saio",
-                            entry.uri
-                        ),
-                    ));
-                }
+                .is_some_and(|c| c.eq_ignore_ascii_case("enca"))
+            || probe.has_tenc
+            || probe.scheme_type.as_deref().is_some_and(|s| {
+                let s = s.to_ascii_lowercase();
+                s == "cenc" || s == "cbcs" || s == "cens" || s == "cbc1"
+            });
+
+        if !enc {
+            continue;
+        }
+
+        // §13.7 — encrypt:skip pattern of 1:9 (crypt=1, skip=9)
+        if let (Some(crypt), Some(skip)) = (probe.crypt_byte_block, probe.skip_byte_block) {
+            if !(crypt == 1 && skip == 9) {
+                issues.push(author_error(
+                    "13.7",
+                    format!(
+                        "CENC pattern {crypt}:{skip} on init '{}' MUST be encrypt:skip 1:9",
+                        entry.uri
+                    ),
+                ));
+            }
+        } else if probe.has_tenc {
+            // Pattern fields absent (tenc v0) — content-sensitive / full-sample more likely
+            issues.push(author_warn(
+                "13.7",
+                format!(
+                    "encrypted init '{}' has tenc without crypt/skip pattern (expect 1:9)",
+                    entry.uri
+                ),
+            ));
+        }
+
+        // §13.9 — content-sensitive encryption MUST NOT be used (cbcs with pattern is OK;
+        // "cens"/"cbc1" without standard pattern is suspicious — soft warn on unknown schemes)
+        if let Some(scheme) = probe.scheme_type.as_deref() {
+            let s = scheme.to_ascii_lowercase();
+            if s == "cens" {
+                issues.push(author_error(
+                    "13.9",
+                    format!(
+                        "scheme_type '{scheme}' on init '{}' looks like content-sensitive CENC",
+                        entry.uri
+                    ),
+                ));
+            }
+        }
+
+        // AirPlay §1.41 — encrypted fMP4 MUST have senc OR saiz+saio (often in media segments)
+        if ctx.policy.profile == super::profile::AuthorProfile::AirPlay2 {
+            let in_init = probe.has_senc || (probe.has_saiz && probe.has_saio);
+            let in_samples = ctx.segment_samples.iter().any(|s| {
+                s.has_senc || (s.has_saiz && s.has_saio)
+            });
+            if !in_init && !in_samples {
+                issues.push(author_error(
+                    "1.41",
+                    format!(
+                        "AirPlay2: encrypted init '{}' missing senc or saiz+saio (check media segments)",
+                        entry.uri
+                    ),
+                ));
+            }
+        } else if ctx.deep_checks {
+            let related = ctx
+                .segment_samples
+                .iter()
+                .any(|s| s.has_senc || (s.has_saiz && s.has_saio));
+            if !related && !(probe.has_senc || (probe.has_saiz && probe.has_saio)) {
+                issues.push(author_warn(
+                    "13.9",
+                    format!(
+                        "encrypted init '{}' but sampled segments lack senc/saiz+saio",
+                        entry.uri
+                    ),
+                ));
             }
         }
     }
 
-    // AirPlay §1.41 / protection overlay — SAMPLE-AES preferred notes
+    // AirPlay SAMPLE-AES-CTR forbidden (playlist-level)
     if ctx.policy.profile == super::profile::AuthorProfile::AirPlay2 {
         for pl in ctx.playlists {
             if pl.encryption_methods.is_empty() {

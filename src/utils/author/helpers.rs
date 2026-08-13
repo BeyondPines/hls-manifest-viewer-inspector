@@ -125,3 +125,50 @@ pub fn av1_level_ok(token: &str) -> bool {
     };
     level <= 62
 }
+
+/// Parse H.264/HEVC level strings like "4.1", "41", "51", "5.1" into a float.
+pub fn parse_codec_level(s: &str) -> Option<f64> {
+    let cleaned = s.trim().trim_start_matches('L').trim_start_matches('l');
+    if let Ok(v) = cleaned.parse::<f64>() {
+        if v > 10.0 {
+            Some(v / 10.0)
+        } else {
+            Some(v)
+        }
+    } else {
+        None
+    }
+}
+
+/// Rough H.264 High Profile level required by resolution×fps (Apple §1.11 tables, simplified).
+pub fn h264_level_required_for(width: u32, height: u32, fps: f64) -> f64 {
+    let macroblocks = width.div_ceil(16) * height.div_ceil(16);
+    let mbs_per_sec = macroblocks as f64 * fps;
+    // Selected High-profile level ceilings (macroblocks / macroblocks-per-second).
+    // Values are approximate; used only for SHOULD §1.11.
+    if macroblocks <= 396 && mbs_per_sec <= 11_880.0 {
+        3.0
+    } else if macroblocks <= 2_448 && mbs_per_sec <= 108_000.0 {
+        3.1
+    } else if macroblocks <= 8_160 && mbs_per_sec <= 245_760.0 {
+        4.1
+    } else if macroblocks <= 22_080 && mbs_per_sec <= 522_240.0 {
+        4.2
+    } else if macroblocks <= 36_864 && mbs_per_sec <= 589_824.0 {
+        5.0
+    } else if macroblocks <= 36_864 && mbs_per_sec <= 983_040.0 {
+        5.1
+    } else {
+        5.2
+    }
+}
+
+pub fn playlist_looks_like_ts(pl: &crate::utils::validator::types::MediaPlaylist) -> bool {
+    pl.segments
+        .iter()
+        .any(|s| s.uri.contains(".ts") || s.uri.contains(".m2ts") || s.uri.contains(".mts"))
+}
+
+pub fn playlist_has_map(pl: &crate::utils::validator::types::MediaPlaylist) -> bool {
+    pl.segments.iter().any(|s| s.map_uri.is_some())
+}
