@@ -69,7 +69,11 @@ fn extract_query_param(url: &str, param: &str) -> Option<String> {
     })
 }
 
-/// Parse a master playlist and extract variant stream info
+/// Parse a master playlist and extract variant stream info.
+///
+/// Variant and media-rendition URIs are stored **raw** (as written in the playlist).
+/// Callers must substitute EXT-X-DEFINE variables and resolve against the master URL
+/// before fetching (see [`crate::utils::validator::absolute_fetch_uri`]).
 pub fn parse_master_playlist(url: &str, content: &str) -> MasterPlaylist {
     let mut master = MasterPlaylist {
         url: url.to_string(),
@@ -92,7 +96,7 @@ pub fn parse_master_playlist(url: &str, content: &str) -> MasterPlaylist {
             i += 1;
             let uri = if i < lines.len() { lines[i].trim().to_string() } else { String::new() };
             master.variants.push(MasterRendition {
-                uri: resolve_url(url, &uri),
+                uri, // raw — callers must substitute + resolve before fetch
                 bandwidth: attrs.get("BANDWIDTH").and_then(|v| v.parse().ok()),
                 average_bandwidth: attrs.get("AVERAGE-BANDWIDTH").and_then(|v| v.parse().ok()),
                 codecs: attrs.get("CODECS").cloned(),
@@ -108,7 +112,7 @@ pub fn parse_master_playlist(url: &str, content: &str) -> MasterPlaylist {
             let attrs = parse_attributes(attr_str);
             if let Some(uri) = attrs.get("URI") {
                 master.variants.push(MasterRendition {
-                    uri: resolve_url(url, uri),
+                    uri: uri.clone(), // raw — callers must substitute + resolve before fetch
                     bandwidth: attrs.get("BANDWIDTH").and_then(|v| v.parse().ok()),
                     average_bandwidth: attrs.get("AVERAGE-BANDWIDTH").and_then(|v| v.parse().ok()),
                     codecs: attrs.get("CODECS").cloned(),
@@ -127,7 +131,7 @@ pub fn parse_master_playlist(url: &str, content: &str) -> MasterPlaylist {
                 media_type: attrs.get("TYPE").cloned().unwrap_or_default(),
                 group_id: attrs.get("GROUP-ID").cloned().unwrap_or_default(),
                 name: attrs.get("NAME").cloned().unwrap_or_default(),
-                uri: attrs.get("URI").map(|u| resolve_url(url, u)),
+                uri: attrs.get("URI").cloned(), // raw — callers must substitute + resolve before fetch
                 language: attrs.get("LANGUAGE").cloned(),
                 is_default: attrs.get("DEFAULT").is_some_and(|v| v == "YES"),
                 autoselect: attrs.get("AUTOSELECT").is_some_and(|v| v == "YES"),
@@ -451,6 +455,33 @@ mod tests {
     fn resolve_url_http_prefix_is_recognised_as_absolute() {
         let abs = "http://insecure.cdn.com/stream.m3u8";
         assert_eq!(resolve_url("https://other.com/master.m3u8", abs), abs);
+    }
+
+    #[test]
+    fn parse_master_stores_raw_variant_uri() {
+        let master = parse_master_playlist(
+            "https://ex.com/a/master.m3u8",
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nv1/prog.m3u8\n",
+        );
+        assert_eq!(master.variants[0].uri, "v1/prog.m3u8");
+        assert!(
+            master.media_renditions.is_empty(),
+            "no MEDIA tags expected"
+        );
+    }
+
+    #[test]
+    fn parse_master_stores_raw_media_uri() {
+        let master = parse_master_playlist(
+            "https://ex.com/a/master.m3u8",
+            "#EXTM3U\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"en\",URI=\"audio/en.m3u8\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1000,AUDIO=\"a\"\nv1/prog.m3u8\n",
+        );
+        assert_eq!(
+            master.media_renditions[0].uri.as_deref(),
+            Some("audio/en.m3u8")
+        );
     }
 
     // ── parse_iso8601_to_epoch ────────────────────────────────────────────────
