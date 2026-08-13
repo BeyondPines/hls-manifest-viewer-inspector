@@ -82,6 +82,8 @@ pub fn parse_master_playlist(url: &str, content: &str) -> MasterPlaylist {
         variants: Vec::new(),
         media_renditions: Vec::new(),
         definitions: HashMap::new(),
+        independent_segments: false,
+        http_meta: PlaylistHttpMeta::default(),
     };
     let lines: Vec<&str> = content.lines().collect();
     let mut i = 0;
@@ -91,6 +93,8 @@ pub fn parse_master_playlist(url: &str, content: &str) -> MasterPlaylist {
             if let Ok(v) = line.split_once(':').unwrap().1.trim().parse::<u32>() {
                 master.version = v;
             }
+        } else if line == "#EXT-X-INDEPENDENT-SEGMENTS" {
+            master.independent_segments = true;
         } else if let Some(attr_str) = line.strip_prefix("#EXT-X-STREAM-INF:") {
             let attrs = parse_attributes(attr_str);
             i += 1;
@@ -107,6 +111,10 @@ pub fn parse_master_playlist(url: &str, content: &str) -> MasterPlaylist {
                 closed_captions: attrs.get("CLOSED-CAPTIONS").cloned(),
                 video_range: attrs.get("VIDEO-RANGE").cloned(),
                 is_iframe: false,
+                score: attrs.get("SCORE").and_then(|v| v.parse().ok()),
+                hdcp_level: attrs.get("HDCP-LEVEL").cloned(),
+                pathway_id: attrs.get("PATHWAY-ID").cloned(),
+                req_video_layout: attrs.get("REQ-VIDEO-LAYOUT").cloned(),
             });
         } else if let Some(attr_str) = line.strip_prefix("#EXT-X-I-FRAME-STREAM-INF:") {
             let attrs = parse_attributes(attr_str);
@@ -123,6 +131,10 @@ pub fn parse_master_playlist(url: &str, content: &str) -> MasterPlaylist {
                     closed_captions: None,
                     video_range: attrs.get("VIDEO-RANGE").cloned(),
                     is_iframe: true,
+                    score: attrs.get("SCORE").and_then(|v| v.parse().ok()),
+                    hdcp_level: attrs.get("HDCP-LEVEL").cloned(),
+                    pathway_id: attrs.get("PATHWAY-ID").cloned(),
+                    req_video_layout: attrs.get("REQ-VIDEO-LAYOUT").cloned(),
                 });
             }
         } else if let Some(attr_str) = line.strip_prefix("#EXT-X-MEDIA:") {
@@ -136,6 +148,8 @@ pub fn parse_master_playlist(url: &str, content: &str) -> MasterPlaylist {
                 is_default: attrs.get("DEFAULT").is_some_and(|v| v == "YES"),
                 autoselect: attrs.get("AUTOSELECT").is_some_and(|v| v == "YES"),
                 channels: attrs.get("CHANNELS").cloned(),
+                characteristics: attrs.get("CHARACTERISTICS").cloned(),
+                forced: attrs.get("FORCED").is_some_and(|v| v == "YES"),
             });
         } else if let Some(rest) = line.strip_prefix("#EXT-X-DEFINE:") {
             let attrs = parse_attributes(rest);
@@ -193,6 +207,10 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
             pl.playlist_type = line.split_once(':').map(|(_, v)| v.trim().to_string());
         } else if line.starts_with("#EXT-X-ENDLIST") {
             pl.has_endlist = true;
+        } else if line == "#EXT-X-INDEPENDENT-SEGMENTS" {
+            pl.independent_segments = true;
+        } else if line == "#EXT-X-I-FRAMES-ONLY" {
+            pl.iframes_only = true;
         } else if let Some(val) = line.strip_prefix("#EXTINF:") {
             let comma_pos = val.find(',').unwrap_or(val.len());
             current_duration = val[..comma_pos].trim().parse::<f64>().ok();
@@ -216,10 +234,15 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
         } else if let Some(rest) = line.strip_prefix("#EXT-X-MAP:") {
             let attrs = parse_attributes(rest);
             current_map_uri = attrs.get("URI").map(|u| resolve_url(url, u));
+            // Store last MAP byterange on the playlist for init probing
+            pl.map_byterange = attrs.get("BYTERANGE").cloned();
         } else if let Some(rest) = line.strip_prefix("#EXT-X-KEY:") {
             let attrs = parse_attributes(rest);
             if let Some(method) = attrs.get("METHOD") {
                 pl.encryption_methods.insert(method.clone());
+            }
+            if let Some(fmt) = attrs.get("KEYFORMAT") {
+                pl.key_formats.insert(fmt.clone());
             }
         } else if let Some(rest) = line.strip_prefix("#EXT-X-SERVER-CONTROL:") {
             let attrs = parse_attributes(rest);
@@ -228,6 +251,7 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
                 hold_back: attrs.get("HOLD-BACK").and_then(|v| v.parse().ok()),
                 part_hold_back: attrs.get("PART-HOLD-BACK").and_then(|v| v.parse().ok()),
                 can_block_reload: attrs.get("CAN-BLOCK-RELOAD").is_some_and(|v| v == "YES"),
+                can_skip_dateranges: attrs.get("CAN-SKIP-DATERANGES").is_some_and(|v| v == "YES"),
             });
         } else if let Some(rest) = line.strip_prefix("#EXT-X-PART-INF:") {
             let attrs = parse_attributes(rest);

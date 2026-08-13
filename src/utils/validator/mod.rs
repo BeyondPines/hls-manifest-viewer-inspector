@@ -1,12 +1,20 @@
 pub mod types;
 pub mod parser;
 pub mod checks;
+pub mod authoring;
 
 use types::*;
 use parser::*;
+use authoring::{
+    AuthoringContext, InitProbeEntry, SegmentSample, ValidateAuthorOptions,
+    run_authoring_checks,
+};
 use crate::utils::href::replace_hls_variables;
-use crate::utils::network::{fetch_text, FetchError};
-use std::collections::HashMap;
+use crate::utils::mp4_probe::{probe_init_segment, scan_segment_bytes};
+use crate::utils::network::{fetch_array_buffer, fetch_text, FetchError, RequestRange};
+use std::collections::{HashMap, HashSet};
+
+pub use authoring::AuthorProfile;
 
 /// Substitute EXT-X-DEFINE variables in `uri`, then resolve against `base`.
 pub fn absolute_fetch_uri(base: &str, uri: &str, defs: &HashMap<String, String>) -> String {
@@ -19,6 +27,24 @@ pub fn is_master_playlist(content: &str) -> bool {
     content.contains("#EXT-X-STREAM-INF:") || content.contains("#EXT-X-I-FRAME-STREAM-INF:")
 }
 
+/// Options for [`validate_hls_with_options`].
+#[derive(Debug, Clone)]
+pub struct ValidateOptions {
+    pub tolerance_ms: f64,
+    pub author_profile: AuthorProfile,
+    pub deep_author_checks: bool,
+}
+
+impl Default for ValidateOptions {
+    fn default() -> Self {
+        Self {
+            tolerance_ms: 100.0,
+            author_profile: AuthorProfile::None,
+            deep_author_checks: false,
+        }
+    }
+}
+
 /// Get current time in milliseconds (browser performance.now() or Date.now())
 fn now_ms() -> f64 {
     web_sys::window()
@@ -27,18 +53,49 @@ fn now_ms() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Main validation entry point with tolerance option
-pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<ValidationReport, FetchError> {
+fn http_meta_from_fetch(request_url: &str, resp: &crate::utils::network::FetchTextResponse) -> PlaylistHttpMeta {
+    PlaylistHttpMeta {
+        request_url: request_url.to_string(),
+        final_url: resp.final_url.clone(),
+        content_encoding: resp.content_encoding.clone(),
+        last_modified: resp.last_modified.clone(),
+        date: resp.date.clone(),
+    }
+}
+
+fn parse_map_byterange(br: &str) -> Option<RequestRange> {
+    // HLS BYTERANGE is `n` or `n@o`
+    let (length, offset) = if let Some((n, o)) = br.split_once('@') {
+        (n.parse::<u64>().ok()?, o.parse::<u64>().ok()?)
+    } else {
+        (br.parse::<u64>().ok()?, 0)
+    };
+    Some(RequestRange::from_length_with_offset(length, offset))
+}
+
+/// Main validation entry point with tolerance / Author options
+pub async fn validate_hls_with_options(
+    url: &str,
+    options: ValidateOptions,
+) -> Result<ValidationReport, FetchError> {
     let start = now_ms();
     let response = fetch_text(url.to_string()).await?;
     let content = &response.response_text;
     let mut report = ValidationReport::new();
 
-    report.tolerance_ms = tolerance_ms;
+    report.tolerance_ms = options.tolerance_ms;
     report.master_url = url.to_string();
+    report.author_profile = options.author_profile.as_str().to_string();
+    report.deep_author_checks = options.deep_author_checks;
+
+    let author_opts = ValidateAuthorOptions {
+        profile: options.author_profile,
+        deep_checks: options.deep_author_checks,
+    };
 
     if is_master_playlist(content) {
-        let master = parse_master_playlist(url, content);
+        let mut master = parse_master_playlist(url, content);
+        master.http_meta = http_meta_from_fetch(url, &response);
         report.issues.extend(checks::check_codecs_attribute(&master));
         report.issues.extend(checks::check_bandwidth_required(&master));
         report.issues.extend(checks::check_media_group_membership(&master));
@@ -58,6 +115,10 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
             closed_captions: Option<String>,
             video_range: Option<String>,
             is_iframe: bool,
+            score: Option<f64>,
+            hdcp_level: Option<String>,
+            pathway_id: Option<String>,
+            req_video_layout: Option<String>,
         }
         let variant_infos: Vec<VariantInfo> = master.variants.iter().map(|v| VariantInfo {
             uri: v.uri.clone(),
@@ -70,6 +131,10 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
             closed_captions: v.closed_captions.clone(),
             video_range: v.video_range.clone(),
             is_iframe: v.is_iframe,
+            score: v.score,
+            hdcp_level: v.hdcp_level.clone(),
+            pathway_id: v.pathway_id.clone(),
+            req_video_layout: v.req_video_layout.clone(),
         }).collect();
 
         // Build audio group → codec lookup from STREAM-INF CODECS strings
@@ -139,6 +204,11 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
                     pl.video_range = vi.video_range.clone();
                     pl.color_info = derive_color_info(vi.video_range.as_deref(), vi.codecs.as_deref());
                     pl.is_iframe = vi.is_iframe;
+                    pl.score = vi.score;
+                    pl.hdcp_level = vi.hdcp_level.clone();
+                    pl.pathway_id = vi.pathway_id.clone();
+                    pl.req_video_layout = vi.req_video_layout.clone();
+                    pl.http_meta = http_meta_from_fetch(fetch_uri, &resp);
                     parse_media_playlist(fetch_uri, &resp.response_text, &mut pl);
                     apply_master_definitions(&resp.response_text, &master.definitions, &mut pl.definitions);
                     playlists.push(pl);
@@ -184,6 +254,7 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
                     pl.group_id = Some(group_id.clone());
                     // Derive audio codec from the STREAM-INF entry that references this group
                     pl.codecs = audio_group_codec.get(group_id.as_str()).cloned();
+                    pl.http_meta = http_meta_from_fetch(fetch_uri, &resp);
                     parse_media_playlist(fetch_uri, &resp.response_text, &mut pl);
                     apply_master_definitions(&resp.response_text, &master.definitions, &mut pl.definitions);
                     playlists.push(pl);
@@ -235,14 +306,39 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
         let msn_issues = check_media_sequence_monotonicity(&playlists).await;
         report.issues.extend(msn_issues);
 
+        // Author: init probes (Phase B) + optional deep segment samples (Phase C)
+        let (init_probes, segment_samples) =
+            collect_author_media_samples(&playlists, options.deep_author_checks).await;
+        let author_ctx = AuthoringContext::new(
+            Some(&master),
+            &playlists,
+            &author_opts,
+            &init_probes,
+            &segment_samples,
+        );
+        report.author_probe_notes = author_ctx.probe_notes.clone();
+        report.issues.extend(run_authoring_checks(&author_ctx));
+
         // Build renditions for UI
         report.renditions = build_renditions(&playlists);
         report.playlists = playlists;
         report.master = Some(master);
     } else {
         let mut pl = MediaPlaylist::new("media".to_string(), url.to_string());
+        pl.http_meta = http_meta_from_fetch(url, &response);
         parse_media_playlist(url, content, &mut pl);
         run_media_checks(&[pl.clone()], &mut report);
+        let (init_probes, segment_samples) =
+            collect_author_media_samples(std::slice::from_ref(&pl), options.deep_author_checks).await;
+        let author_ctx = AuthoringContext::new(
+            None,
+            std::slice::from_ref(&pl),
+            &author_opts,
+            &init_probes,
+            &segment_samples,
+        );
+        report.author_probe_notes = author_ctx.probe_notes.clone();
+        report.issues.extend(run_authoring_checks(&author_ctx));
         report.renditions = build_renditions(&[pl.clone()]);
         report.playlists = vec![pl];
     }
@@ -251,6 +347,89 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
     report.check_groups = categorize_issues(&report.issues);
     report.elapsed_ms = (now_ms() - start) as u64;
     Ok(report)
+}
+
+/// Fetch unique init segments and (optionally) a few media segments for Author checks.
+async fn collect_author_media_samples(
+    playlists: &[MediaPlaylist],
+    deep: bool,
+) -> (Vec<InitProbeEntry>, Vec<SegmentSample>) {
+    let mut init_jobs: Vec<(String, Option<String>, Option<RequestRange>)> = Vec::new();
+    let mut seen_init: HashSet<String> = HashSet::new();
+    for pl in playlists {
+        let Some(map_uri) = pl.segments.iter().find_map(|s| s.map_uri.clone()) else {
+            continue;
+        };
+        let br = pl.map_byterange.clone();
+        let key = format!("{}|{}", map_uri, br.as_deref().unwrap_or(""));
+        if !seen_init.insert(key) {
+            continue;
+        }
+        let range = br.as_deref().and_then(parse_map_byterange);
+        init_jobs.push((map_uri, br, range));
+    }
+
+    let init_fetches = futures::future::join_all(init_jobs.iter().map(|(uri, _, range)| {
+        let uri = uri.clone();
+        let range = *range;
+        async move { fetch_array_buffer(uri, range).await }
+    }))
+    .await;
+
+    let mut init_probes = Vec::new();
+    for ((uri, br, _), result) in init_jobs.iter().zip(init_fetches) {
+        if let Ok(resp) = result {
+            init_probes.push(InitProbeEntry {
+                uri: uri.clone(),
+                byterange: br.clone(),
+                probe: probe_init_segment(&resp.response_body),
+            });
+        }
+    }
+
+    let mut segment_samples = Vec::new();
+    if deep {
+        const MAX_PER_PLAYLIST: usize = 3;
+        let mut ranged_jobs: Vec<(String, usize, String, f64, Option<RequestRange>)> = Vec::new();
+        for pl in playlists {
+            for (idx, seg) in pl.segments.iter().take(MAX_PER_PLAYLIST).enumerate() {
+                let uri = if seg.uri.contains("://") {
+                    seg.uri.clone()
+                } else {
+                    absolute_fetch_uri(&pl.url, &seg.uri, &pl.definitions)
+                };
+                let range = seg.byterange.as_deref().and_then(parse_map_byterange);
+                ranged_jobs.push((pl.name.clone(), idx, uri, seg.duration, range));
+            }
+        }
+        let fetches = futures::future::join_all(ranged_jobs.iter().map(|(_, _, uri, _, range)| {
+            let uri = uri.clone();
+            let range = *range;
+            async move { fetch_array_buffer(uri, range).await }
+        }))
+        .await;
+        for (job, result) in ranged_jobs.iter().zip(fetches) {
+            if let Ok(resp) = result {
+                let scan = scan_segment_bytes(&resp.response_body);
+                segment_samples.push(SegmentSample {
+                    playlist_name: job.0.clone(),
+                    segment_index: job.1,
+                    uri: job.2.clone(),
+                    extinf_s: job.3,
+                    bytes: resp.response_body.len(),
+                    looks_like_ts: scan.looks_like_ts,
+                    looks_like_fmp4: scan.looks_like_fmp4,
+                    has_idr_nal_hint: scan.has_idr_nal_hint,
+                    has_tfdt: scan.has_tfdt,
+                    has_senc: scan.has_senc,
+                    has_saiz: scan.has_saiz,
+                    has_saio: scan.has_saio,
+                });
+            }
+        }
+    }
+
+    (init_probes, segment_samples)
 }
 
 /// Resolve EXT-X-DEFINE:IMPORT references in a media playlist against the parent (master)
@@ -413,6 +592,21 @@ const CHECK_DEFS: &[CheckDef] = &[
     CheckDef { name: "LL-HLS Compliance", section: "LL-HLS", reference: "rfc8216bis §4.4.3–4.4.5", keywords: &["LL-HLS", "rfc8216bis §4.4.3.8", "rfc8216bis §4.4.4.9", "rfc8216bis §4.4.5"] },
     // Appendix D
     CheckDef { name: "HLS Interstitials", section: "Interstitials", reference: "rfc8216bis Appendix D", keywords: &["Interstitial:"] },
+    // Apple HLS Authoring Specification
+    CheckDef { name: "Video Codecs", section: "Author", reference: "Apple Authoring Spec §1", keywords: &["Apple Authoring Spec §1."] },
+    CheckDef { name: "Audio Codecs", section: "Author", reference: "Apple Authoring Spec §2", keywords: &["Apple Authoring Spec §2."] },
+    CheckDef { name: "Ads", section: "Author", reference: "Apple Authoring Spec §3", keywords: &["Apple Authoring Spec §3."] },
+    CheckDef { name: "Accessibility / Subtitles", section: "Author", reference: "Apple Authoring Spec §4–5", keywords: &["Apple Authoring Spec §4.", "Apple Authoring Spec §5."] },
+    CheckDef { name: "Trick Play", section: "Author", reference: "Apple Authoring Spec §6", keywords: &["Apple Authoring Spec §6."] },
+    CheckDef { name: "Segmentation", section: "Author", reference: "Apple Authoring Spec §7", keywords: &["Apple Authoring Spec §7."] },
+    CheckDef { name: "Media Playlists", section: "Author", reference: "Apple Authoring Spec §8", keywords: &["Apple Authoring Spec §8."] },
+    CheckDef { name: "Multivariant", section: "Author", reference: "Apple Authoring Spec §9", keywords: &["Apple Authoring Spec §9."] },
+    CheckDef { name: "Delivery", section: "Author", reference: "Apple Authoring Spec §10", keywords: &["Apple Authoring Spec §10."] },
+    CheckDef { name: "Privacy", section: "Author", reference: "Apple Authoring Spec §11", keywords: &["Apple Authoring Spec §11."] },
+    CheckDef { name: "Security", section: "Author", reference: "Apple Authoring Spec §12", keywords: &["Apple Authoring Spec §12."] },
+    CheckDef { name: "Protection", section: "Author", reference: "Apple Authoring Spec §13", keywords: &["Apple Authoring Spec §13.", "Apple Authoring Spec §1.41"] },
+    CheckDef { name: "LL-HLS Author", section: "Author", reference: "Apple Authoring Spec §14", keywords: &["Apple Authoring Spec §14."] },
+    CheckDef { name: "SharePlay / Spatial", section: "Author", reference: "Apple Authoring Spec §15–16", keywords: &["Apple Authoring Spec §15.", "Apple Authoring Spec §16."] },
 ];
 
 /// Categorize issues into named check groups (matches Go categorizeIssues)

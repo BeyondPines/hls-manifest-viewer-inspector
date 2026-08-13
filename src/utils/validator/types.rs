@@ -171,6 +171,22 @@ pub struct MediaPlaylist {
     pub color_info: Option<String>,
     pub group_id: Option<String>,
     pub is_iframe: bool,
+    pub independent_segments: bool,
+    pub iframes_only: bool,
+    /// KEYFORMAT values seen on EXT-X-KEY tags
+    pub key_formats: HashSet<String>,
+    /// HDCP-LEVEL from STREAM-INF (copied onto video playlists)
+    pub hdcp_level: Option<String>,
+    /// SCORE from STREAM-INF
+    pub score: Option<f64>,
+    /// REQ-VIDEO-LAYOUT from STREAM-INF
+    pub req_video_layout: Option<String>,
+    /// PATHWAY-ID from STREAM-INF / content steering
+    pub pathway_id: Option<String>,
+    /// HTTP response metadata from the playlist fetch
+    pub http_meta: PlaylistHttpMeta,
+    /// BYTERANGE from the most recent EXT-X-MAP (for init probing)
+    pub map_byterange: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +195,7 @@ pub struct ServerControl {
     pub hold_back: Option<f64>,
     pub part_hold_back: Option<f64>,
     pub can_block_reload: bool,
+    pub can_skip_dateranges: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -223,8 +240,27 @@ impl MediaPlaylist {
             color_info: None,
             group_id: None,
             is_iframe: false,
+            independent_segments: false,
+            iframes_only: false,
+            key_formats: HashSet::new(),
+            hdcp_level: None,
+            score: None,
+            req_video_layout: None,
+            pathway_id: None,
+            http_meta: PlaylistHttpMeta::default(),
+            map_byterange: None,
         }
     }
+}
+
+/// HTTP response metadata captured when fetching a playlist.
+#[derive(Debug, Clone, Default)]
+pub struct PlaylistHttpMeta {
+    pub request_url: String,
+    pub final_url: String,
+    pub content_encoding: Option<String>,
+    pub last_modified: Option<String>,
+    pub date: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +278,10 @@ pub struct MasterRendition {
     pub closed_captions: Option<String>,
     pub video_range: Option<String>,
     pub is_iframe: bool,
+    pub score: Option<f64>,
+    pub hdcp_level: Option<String>,
+    pub pathway_id: Option<String>,
+    pub req_video_layout: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +296,8 @@ pub struct MediaRendition {
     pub is_default: bool,
     pub autoselect: bool,
     pub channels: Option<String>,
+    pub characteristics: Option<String>,
+    pub forced: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +309,9 @@ pub struct MasterPlaylist {
     pub media_renditions: Vec<MediaRendition>,
     /// Variable definitions from EXT-X-DEFINE tags (NAME+VALUE and QUERYPARAM)
     pub definitions: HashMap<String, String>,
+    pub independent_segments: bool,
+    /// HTTP response metadata from the master playlist fetch
+    pub http_meta: PlaylistHttpMeta,
 }
 
 /// Rendition info for UI display (combines master + media playlist data)
@@ -395,6 +440,12 @@ pub struct ValidationReport {
     pub has_scte35_data: bool,
     /// Duration of the best video playlist window in seconds (PDT-based; for SCTE timeline)
     pub playlist_window_s: f64,
+    /// Authoring profile used for Apple Authoring Spec overlays
+    pub author_profile: String,
+    /// Whether deep Author segment sampling was enabled
+    pub deep_author_checks: bool,
+    /// Notes for known in-browser Author probe limitations
+    pub author_probe_notes: Vec<String>,
 }
 
 impl ValidationReport {
@@ -418,6 +469,9 @@ impl ValidationReport {
             has_interstitials_data: false,
             has_scte35_data: false,
             playlist_window_s: 0.0,
+            author_profile: "None".to_string(),
+            deep_author_checks: false,
+            author_probe_notes: Vec::new(),
         }
     }
 

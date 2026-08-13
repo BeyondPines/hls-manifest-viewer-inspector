@@ -5,6 +5,7 @@ use crate::utils::{
 };
 use leptos::prelude::*;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use wasm_bindgen::JsCast;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -141,6 +142,8 @@ fn manifest_viewer_href_with_asset_list(
 pub fn Validate() -> impl IntoView {
     let (url_input, set_url_input) = signal(String::new());
     let (tolerance, set_tolerance) = signal(100.0_f64);
+    let (author_profile, set_author_profile) = signal("None".to_string());
+    let (deep_author, set_deep_author) = signal(false);
     let (report, set_report) = signal(None::<ValidationReport>);
     let (error_msg, set_error_msg) = signal(None::<String>);
     let (loading, set_loading) = signal(false);
@@ -150,11 +153,18 @@ pub fn Validate() -> impl IntoView {
         let url = url_input.get();
         if url.is_empty() { return; }
         let tol = tolerance.get();
+        let profile = author_profile.get();
+        let deep = deep_author.get();
         set_loading.set(true);
         set_error_msg.set(None);
         set_report.set(None);
         leptos::task::spawn_local(async move {
-            match validator::validate_hls_with_options(&url, tol).await {
+            let options = validator::ValidateOptions {
+                tolerance_ms: tol,
+                author_profile: validator::AuthorProfile::parse(&profile),
+                deep_author_checks: deep,
+            };
+            match validator::validate_hls_with_options(&url, options).await {
                 Ok(r) => set_report.set(Some(r)),
                 Err(e) => set_error_msg.set(Some(format!("Validation failed: {}", e))),
             }
@@ -168,7 +178,7 @@ pub fn Validate() -> impl IntoView {
                 "Validate HLS streams instantly"
             </h1>
             <p class="body-content body-text">
-                "Enter a master or media playlist URL to run 20+ compliance checks against RFC 8216 and the HLS bis draft — structural integrity, alignment, LL-HLS, encryption and more. Media-only URLs run a reduced set of checks on that playlist alone."
+                "Enter a master or media playlist URL to run RFC 8216 / HLS bis checks plus Apple HLS Authoring Spec rules (Author section). Choose a platform profile for amendments. Enable Deep Author checks to sample media segments for measured bitrate and bitstream heuristics."
             </p>
             <div style="background: var(--color-white); border: 1px solid var(--color-sky-200); border-radius: 12px; padding: calc(var(--spacing) * 7); box-shadow: 0 2px 12px rgba(0,0,0,.06); margin-top: calc(var(--spacing) * 6);">
                 <form on:submit=on_submit>
@@ -202,6 +212,37 @@ pub fn Validate() -> impl IntoView {
                                 }
                             />
                             <label>"ms"</label>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: calc(var(--spacing) * 2); font-size: .875rem; color: var(--color-sky-700);">
+                            <label for="author-profile">"Author profile"</label>
+                            <select
+                                id="author-profile"
+                                style="background: var(--color-sky-50); border: 1px solid var(--color-sky-200); border-radius: 6px; color: var(--color-sky-950); padding: calc(var(--spacing) * 1.25) calc(var(--spacing) * 2.5); font-size: .875rem; outline: none;"
+                                prop:value=move || author_profile.get()
+                                on:change=move |ev| set_author_profile.set(event_target_value(&ev))
+                            >
+                                <option value="None">"General (None)"</option>
+                                <option value="iOS">"iOS"</option>
+                                <option value="tvOS">"tvOS"</option>
+                                <option value="macOS">"macOS"</option>
+                                <option value="visionOS">"visionOS"</option>
+                                <option value="AirPlay2">"AirPlay2"</option>
+                            </select>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: calc(var(--spacing) * 2); font-size: .875rem; color: var(--color-sky-700);">
+                            <input
+                                type="checkbox"
+                                id="deep-author"
+                                prop:checked=move || deep_author.get()
+                                on:change=move |ev| {
+                                    if let Some(t) = ev.target()
+                                        && let Ok(input) = t.dyn_into::<web_sys::HtmlInputElement>()
+                                    {
+                                        set_deep_author.set(input.checked());
+                                    }
+                                }
+                            />
+                            <label for="deep-author">"Deep Author checks (downloads segments)"</label>
                         </div>
                         // Inspect manifest link (shown after validation)
                         {move || report.get().map(|r| {
@@ -320,6 +361,20 @@ fn ValidationResults(report: ValidationReport) -> impl IntoView {
 
             // Section: Check Results
             <SectionTitle label="🔍 Check Results" />
+            {(!report.author_probe_notes.is_empty()).then(|| {
+                let notes = report.author_probe_notes.clone();
+                let profile = report.author_profile.clone();
+                view! {
+                    <div style="color: var(--color-sky-700); font-size: .82rem; margin-bottom: calc(var(--spacing) * 4); padding: calc(var(--spacing) * 3) calc(var(--spacing) * 4); background: var(--color-sky-50); border-radius: 8px; border: 1px solid var(--color-sky-200);">
+                        <div style="font-weight: 700; margin-bottom: calc(var(--spacing) * 1.5);">
+                            {format!("Author profile: {profile}")}
+                        </div>
+                        <ul style="margin: 0; padding-left: 1.2em;">
+                            {notes.into_iter().map(|n| view! { <li>{n}</li> }).collect_view()}
+                        </ul>
+                    </div>
+                }
+            })}
             <CheckResultsTable
                 groups=check_groups
                 has_interstitials_data=has_interstitials_data
@@ -1403,6 +1458,8 @@ mod tests {
             variants: Vec::new(),
             media_renditions: Vec::new(),
             definitions: master_defs,
+            independent_segments: false,
+            http_meta: PlaylistHttpMeta::default(),
         });
         assert_eq!(
             report_definitions(&with_master).get("TOKEN").map(String::as_str),
