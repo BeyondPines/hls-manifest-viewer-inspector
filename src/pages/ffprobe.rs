@@ -1,5 +1,5 @@
 use crate::utils::{
-    href::playlist_href,
+    href::{playlist_href, replace_hls_variables},
     mp4_atom_properties::{AtomPropertyValue, get_properties},
     network::{FetchError, RequestRange, fetch_array_buffer, fetch_text},
 };
@@ -55,6 +55,8 @@ pub struct ProbeReport {
     pub drm_systems: Vec<DrmInfo>,
     pub init_segment_probed: bool,
     pub probe_notes: Vec<String>,
+    /// EXT-X-DEFINE map from the probed playlist (viewer links + URI substitution).
+    pub definitions: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -440,6 +442,7 @@ struct MasterPlaylist {
     version: u32,
     variants: Vec<VariantStream>,
     media_renditions: Vec<MediaRendition>,
+    definitions: HashMap<String, String>,
 }
 
 /// A single segment entry from a media playlist.
@@ -511,16 +514,70 @@ fn resolve_uri(base: &str, uri: &str) -> String {
     }
 }
 
+/// Substitute EXT-X-DEFINE variables, then resolve against `base`.
+fn resolve_defined_uri(base: &str, uri: &str, definitions: &HashMap<String, String>) -> String {
+    let substituted = replace_hls_variables(uri, definitions);
+    resolve_uri(base, substituted.as_ref())
+}
+
+fn extract_query_param(url: &str, param: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    parsed
+        .query_pairs()
+        .find(|(k, _)| k == param)
+        .map(|(_, v)| v.into_owned())
+}
+
+fn apply_define_tag(base_url: &str, tag: &quick_m3u8::tag::hls::Define<'_>, defs: &mut HashMap<String, String>) {
+    match tag {
+        quick_m3u8::tag::hls::Define::Name(n) => {
+            defs.insert(n.name().to_string(), n.value().to_string());
+        }
+        quick_m3u8::tag::hls::Define::Queryparam(q) => {
+            let param = q.queryparam();
+            if let Some(value) = extract_query_param(base_url, param) {
+                // QUERYPARAM uses the query parameter name as the variable name.
+                defs.insert(param.to_string(), value);
+            }
+        }
+        quick_m3u8::tag::hls::Define::Import(_) => {
+            // IMPORT is only valid in media playlists importing from a master — ignored here.
+        }
+    }
+}
+
+fn audio_needs_init(at: &AudioTrackInfo) -> bool {
+    at.sample_rate.is_none()
+        || at.bit_depth.is_none()
+        || at.codec.is_none()
+        || at.bitrate_bps.is_none()
+}
+
 fn parse_master_playlist(base_url: &str, content: &str) -> MasterPlaylist {
     let mut master = MasterPlaylist {
         version: 3,
         variants: Vec::new(),
         media_renditions: Vec::new(),
+        definitions: HashMap::new(),
     };
-    let opts = make_reader_opts();
     let mut pending_stream_inf: Option<VariantStream> = None;
 
-    let mut reader = Reader::from_str(content, opts);
+    // First pass: collect DEFINE so later URIs can be substituted regardless of tag order.
+    {
+        let mut reader = Reader::from_str(content, make_reader_opts());
+        loop {
+            match reader.read_line() {
+                Ok(Some(HlsLine::KnownTag(KnownTag::Hls(Tag::Define(d))))) => {
+                    apply_define_tag(base_url, &d, &mut master.definitions);
+                }
+                Ok(None) => break,
+                Ok(Some(_)) => {}
+                Err(_) => break,
+            }
+        }
+    }
+
+    let mut reader = Reader::from_str(content, make_reader_opts());
     loop {
         match reader.read_line() {
             Ok(Some(hls_line)) => match hls_line {
@@ -545,8 +602,7 @@ fn parse_master_playlist(base_url: &str, content: &str) -> MasterPlaylist {
                     });
                 }
                 HlsLine::KnownTag(KnownTag::Hls(Tag::IFrameStreamInf(isi))) => {
-                    // I-frame playlists have their URI inline (not on the next line)
-                    let uri = resolve_uri(base_url, isi.uri());
+                    let uri = resolve_defined_uri(base_url, isi.uri(), &master.definitions);
                     master.variants.push(VariantStream {
                         uri,
                         bandwidth: Some(isi.bandwidth()),
@@ -561,26 +617,24 @@ fn parse_master_playlist(base_url: &str, content: &str) -> MasterPlaylist {
                 }
                 HlsLine::Uri(uri) => {
                     if let Some(mut vs) = pending_stream_inf.take() {
-                        vs.uri = resolve_uri(base_url, &uri);
+                        vs.uri = resolve_defined_uri(base_url, &uri, &master.definitions);
                         master.variants.push(vs);
                     }
                 }
                 HlsLine::KnownTag(KnownTag::Hls(Tag::Media(m))) => {
-                    // Extract numeric channel count from the CHANNELS attribute.
-                    // `valid()` borrows the `Channels` value, so we must call
-                    // `count()` (returning a Copy u32) inside the same closure.
                     let channels = m.channels()
                         .and_then(|c| c.valid().map(|v| v.count()));
                     master.media_renditions.push(MediaRendition {
                         media_type: m.media_type().to_string(),
                         name: m.name().to_string(),
                         group_id: m.group_id().to_string(),
-                        uri: m.uri().map(|u| resolve_uri(base_url, u)),
+                        uri: m.uri().map(|u| resolve_defined_uri(base_url, u, &master.definitions)),
                         language: m.language().map(|l| l.to_string()),
                         is_default: m.default(),
                         channels,
                     });
                 }
+                HlsLine::KnownTag(KnownTag::Hls(Tag::Define(_))) => {}
                 _ => {}
             },
             Ok(None) => break,
@@ -590,7 +644,11 @@ fn parse_master_playlist(base_url: &str, content: &str) -> MasterPlaylist {
     master
 }
 
-fn parse_media_playlist(base_url: &str, content: &str) -> MediaPlaylist {
+fn parse_media_playlist(
+    base_url: &str,
+    content: &str,
+    definitions: &HashMap<String, String>,
+) -> MediaPlaylist {
     let mut pl = MediaPlaylist {
         version: 3,
         target_duration: 0.0,
@@ -621,13 +679,15 @@ fn parse_media_playlist(base_url: &str, content: &str) -> MediaPlaylist {
                     pl.has_endlist = true;
                 }
                 HlsLine::KnownTag(KnownTag::Hls(Tag::Map(m))) => {
-                    current_map_uri = Some(resolve_uri(base_url, m.uri()));
+                    current_map_uri = Some(resolve_defined_uri(base_url, m.uri(), definitions));
                     current_map_byterange = m.byterange().map(RequestRange::from);
                 }
                 HlsLine::KnownTag(KnownTag::Hls(Tag::Inf(inf))) => {
                     pending_duration = Some(inf.duration());
                 }
                 HlsLine::Uri(_uri) => {
+                    // Segment URIs are not retained for probing; MAP URI (above) is resolved
+                    // via resolve_defined_uri so init fetches honour EXT-X-DEFINE.
                     if let Some(dur) = pending_duration.take() {
                         pl.segments.push(SegmentInfo {
                             duration: dur,
@@ -1149,6 +1209,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
     if is_master_playlist(content) {
         r.manifest_type = "HLS Multivariant Playlist".into();
         let master = parse_master_playlist(url, content);
+        r.definitions = master.definitions.clone();
         r.hls_version = Some(master.version);
         r.session_tags = parse_session_data(content);
         r.stream_count = master.variants.iter().filter(|v| !v.is_iframe).count() + master.media_renditions.len();
@@ -1281,6 +1342,12 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
         // - When init checks are off, stop after that first success.
         // - When init checks are on, fetch unique playlists + inits in parallel.
         let non_iframe_variants: Vec<_> = master.variants.iter().filter(|v| !v.is_iframe).collect();
+        if non_iframe_variants.is_empty() && master.variants.iter().any(|v| v.is_iframe) {
+            r.probe_notes.push(
+                "Master playlist declares only EXT-X-I-FRAME-STREAM-INF variants — no regular STREAM-INF playlists to probe."
+                    .into(),
+            );
+        }
         let unique_variant_uris = unique_preserving(
             non_iframe_variants.iter().map(|v| v.uri.clone()),
         );
@@ -1312,7 +1379,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
             let Some(Ok(body)) = playlist_bodies.get(uri) else {
                 continue;
             };
-            let pl = parse_media_playlist(uri, body);
+            let pl = parse_media_playlist(uri, body, &r.definitions);
             apply_protocol_from_media(&mut r, body, &pl);
             protocol_set = true;
         }
@@ -1336,7 +1403,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                 let Some(Ok(body)) = playlist_bodies.get(uri) else {
                     continue;
                 };
-                let pl = parse_media_playlist(uri, body);
+                let pl = parse_media_playlist(uri, body, &r.definitions);
                 if let Some((iurl, irange)) = pl.init_segment() {
                     let key = init_cache_key(&iurl, irange);
                     if init_seen.insert(key) {
@@ -1417,12 +1484,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
             let audio_uris: Vec<String> = unique_preserving(
                 r.audio_tracks
                     .iter()
-                    .filter(|at| {
-                        at.sample_rate.is_none()
-                            || at.bit_depth.is_none()
-                            || at.codec.is_none()
-                            || at.bitrate_bps.is_none()
-                    })
+                    .filter(|at| audio_needs_init(at))
                     .filter_map(|at| at.playlist_uri.clone()),
             );
 
@@ -1435,7 +1497,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                 for uri in &audio_uris {
                     match audio_playlists.get(uri) {
                         Some(Ok(body)) => {
-                            let pl = parse_media_playlist(uri, body);
+                            let pl = parse_media_playlist(uri, body, &r.definitions);
                             if let Some((iurl, irange)) = pl.init_segment() {
                                 let key = init_cache_key(&iurl, irange);
                                 if audio_init_seen.insert(key) {
@@ -1458,10 +1520,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                     let Some(apl_url) = at.playlist_uri.clone() else {
                         continue;
                     };
-                    if at.sample_rate.is_some()
-                        && at.bit_depth.is_some()
-                        && at.codec.is_some()
-                    {
+                    if !audio_needs_init(at) {
                         continue;
                     }
                     let Some(pl) = audio_parsed.get(&apl_url) else {
@@ -1495,7 +1554,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
     } else {
         // Single media playlist
         r.manifest_type = "HLS Media Playlist".into();
-        let pl = parse_media_playlist(url, content);
+        let pl = parse_media_playlist(url, content, &r.definitions);
         r.hls_version = Some(pl.version);
         r.target_duration = Some(pl.target_duration);
         r.playlist_type = pl.playlist_type.clone();
@@ -1575,6 +1634,7 @@ pub fn Ffprobe() -> impl IntoView {
     let (report, set_report) = signal(None::<ProbeReport>);
     let (error_msg, set_error_msg) = signal(None::<String>);
     let (loading, set_loading) = signal(false);
+    let probe_gen = RwSignal::new(0u64);
 
     let toggle_check = move |id: String| {
         selected.update(|s| {
@@ -1600,15 +1660,26 @@ pub fn Ffprobe() -> impl IntoView {
         let u = url.get();
         if u.is_empty() { return; }
         let sel = selected.get();
+        let generation = probe_gen.get_untracked() + 1;
+        probe_gen.set(generation);
         set_loading.set(true);
         set_error_msg.set(None);
         set_report.set(None);
         leptos::task::spawn_local(async move {
             match probe_stream(&u, &sel).await {
-                Ok(r)  => set_report.set(Some(r)),
-                Err(e) => set_error_msg.set(Some(format!("Probe failed: {e}"))),
+                Ok(r) => {
+                    if probe_gen.get_untracked() == generation {
+                        set_report.set(Some(r));
+                        set_loading.set(false);
+                    }
+                }
+                Err(e) => {
+                    if probe_gen.get_untracked() == generation {
+                        set_error_msg.set(Some(format!("Probe failed: {e}")));
+                        set_loading.set(false);
+                    }
+                }
             }
-            set_loading.set(false);
         });
     };
 
@@ -1761,8 +1832,14 @@ pub fn Ffprobe() -> impl IntoView {
 fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView {
     let url = report.url.clone();
     let manifest_type = report.manifest_type.clone();
+    let definitions = report.definitions.clone();
     let probed_init = report.init_segment_probed;
     let notes = report.probe_notes.clone();
+    let playlist_kind_label = if manifest_type.contains("Media") {
+        "Media Playlist"
+    } else {
+        "Multivariant Playlist"
+    };
 
     // Pre-compute all selection booleans before view! to avoid move issues
     let s_format_name   = selected.contains("format_name");
@@ -1786,6 +1863,8 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
     let show_hls     = s_hls_version || s_target_dur || s_playlist_type || s_ll_hls || s_segment_count;
     let show_drm     = s_enc_method || s_key_format || s_drm_systems;
     let show_subs    = s_sub_tracks || s_cap_tracks;
+    let show_video_table = VIDEO_COL_DEFS.iter().any(|(id, _)| selected.contains(*id));
+    let show_audio_table = AUDIO_COL_DEFS.iter().any(|(id, _)| selected.contains(*id));
 
     let tags = report.session_tags.clone();
     let ll   = report.ll_hls.clone();
@@ -1798,6 +1877,9 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
     let audio_tracks = report.audio_tracks.clone();
     let video_sel = selected.clone();
     let audio_sel = selected;
+    let defs_for_master = definitions.clone();
+    let defs_for_video = definitions.clone();
+    let defs_for_audio = definitions;
 
     view! {
         <div>
@@ -1810,11 +1892,11 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                 <span style="font-size: 1.4rem; margin-top: 2px;">{"🔍"}</span>
                 <div style="flex: 1; min-width: 0;">
                     <div style="font-size: .9rem; font-weight: 700; color: var(--color-sky-500); margin-bottom: calc(var(--spacing) * 2);">{manifest_type}</div>
-                    // Multivariant playlist link
+                    // Primary playlist link
                     <div style="margin-bottom: 6px;">
                         <span style="font-size: .72rem; font-weight: 600; color: var(--color-sky-700); text-transform: uppercase; \
-                                     letter-spacing: .05em; margin-right: calc(var(--spacing) * 2);">"Multivariant Playlist"</span>
-                        <a href={Url::parse(&url).ok().and_then(|b| playlist_href(b, "", &Default::default())).map(|h| format!("/hls-manifest-viewer/{}", h)).unwrap_or_default()}
+                                     letter-spacing: .05em; margin-right: calc(var(--spacing) * 2);">{playlist_kind_label}</span>
+                        <a href={Url::parse(&url).ok().and_then(|b| playlist_href(b, "", &defs_for_master)).map(|h| format!("/hls-manifest-viewer/{}", h)).unwrap_or_default()}
                            target="_blank"
                            style="font-size: .75rem; color: var(--color-sky-500); word-break: break-all; text-decoration: none; \
                                   border-bottom: 1px dotted var(--color-sky-500);"
@@ -1840,13 +1922,14 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                             .collect();
                         links.sort_by_key(|(k, _, _)| *k);
                         let links: Vec<(String, String)> = links.into_iter().map(|(_, l, u)| (l, u)).collect();
+                        let defs = defs_for_video.clone();
                         (!links.is_empty()).then(|| view! {
                             <div style="margin-bottom: 4px;">
                                 <span style="font-size: .72rem; font-weight: 600; color: var(--color-sky-700); text-transform: uppercase; \
                                              letter-spacing: .05em;">"Variant Playlists"</span>
                                 <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px;">
                                     {links.into_iter().map(|(label, uri)| {
-                                        let href = Url::parse(&uri).ok().and_then(|b| playlist_href(b, "", &Default::default())).map(|h| format!("/hls-manifest-viewer/{}", h)).unwrap_or_default();
+                                        let href = Url::parse(&uri).ok().and_then(|b| playlist_href(b, "", &defs)).map(|h| format!("/hls-manifest-viewer/{}", h)).unwrap_or_default();
                                         view! {
                                             <a href={href} target="_blank"
                                                style="font-size: .72rem; background: rgba(56,189,248,.12); \
@@ -1866,13 +1949,14 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                         let links = audio_tracks.iter()
                             .filter_map(|at| at.playlist_uri.clone().map(|uri| (at.name.clone(), uri)))
                             .collect::<Vec<_>>();
+                        let defs = defs_for_audio.clone();
                         (!links.is_empty()).then(|| view! {
                             <div>
                                 <span style="font-size: .72rem; font-weight: 600; color: var(--color-sky-700); text-transform: uppercase; \
                                              letter-spacing: .05em;">"Audio Playlists"</span>
                                 <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px;">
                                     {links.into_iter().map(|(label, uri)| {
-                                        let href = Url::parse(&uri).ok().and_then(|b| playlist_href(b, "", &Default::default())).map(|h| format!("/hls-manifest-viewer/{}", h)).unwrap_or_default();
+                                        let href = Url::parse(&uri).ok().and_then(|b| playlist_href(b, "", &defs)).map(|h| format!("/hls-manifest-viewer/{}", h)).unwrap_or_default();
                                         view! {
                                             <a href={href} target="_blank"
                                                style="font-size: .72rem; background: rgba(16,185,129,.1); \
@@ -2046,7 +2130,7 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
             })}
 
             // ── Video tracks (table)
-            {(!video_tracks.is_empty()).then(|| view! {
+            {(!video_tracks.is_empty() && show_video_table).then(|| view! {
                 <div>
                     <SectionTitle label="🎬 Video Streams" />
                     <VideoTable tracks=video_tracks selected=video_sel />
@@ -2054,7 +2138,7 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
             })}
 
             // ── Audio tracks (table)
-            {(!audio_tracks.is_empty()).then(|| view! {
+            {(!audio_tracks.is_empty() && show_audio_table).then(|| view! {
                 <div>
                     <SectionTitle label="🔊 Audio Streams" />
                     <AudioTable tracks=audio_tracks selected=audio_sel />
@@ -2356,63 +2440,132 @@ fn AudioTable(tracks: Vec<AudioTrackInfo>, selected: HashSet<String>) -> impl In
         })
         .collect();
 
+    let scroll_ref = NodeRef::<leptos::html::Div>::new();
+    let show_hint = RwSignal::new(false);
+
+    Effect::new(move |_| {
+        use wasm_bindgen::JsCast;
+        if let Some(el) = scroll_ref.get() {
+            // Shared check: has unscrolled overflow remaining?
+            let check = {
+                let el = el.clone();
+                move || {
+                    let remaining = el.scroll_width() - el.scroll_left() - el.client_width();
+                    show_hint.set(remaining > 4);
+                }
+            };
+
+            // Scroll listener — stored so on_cleanup can drop it properly.
+            let check_scroll = check.clone();
+            let scroll_cb = wasm_bindgen::closure::Closure::<dyn Fn()>::new(check_scroll);
+            el.add_event_listener_with_callback("scroll", scroll_cb.as_ref().unchecked_ref()).ok();
+
+            // ResizeObserver fires on mount and on every size change (window resize,
+            // column toggle, etc.) so the hint stays in sync without a separate
+            // window "resize" listener.
+            let check_resize = check.clone();
+            let resize_cb = wasm_bindgen::closure::Closure::<dyn Fn()>::new(check_resize);
+            if let Ok(observer) = web_sys::ResizeObserver::new(resize_cb.as_ref().unchecked_ref()) {
+                observer.observe(&el);
+                // Register cleanup: disconnect the observer and drop closures when
+                // the component is removed, preventing memory leaks.
+                let el_clone = el.clone();
+                // run_wasm_cleanup satisfies on_cleanup's Send+Sync bound safely in WASM.
+                on_cleanup(run_wasm_cleanup(move || {
+                    observer.disconnect();
+                    el_clone.remove_event_listener_with_callback(
+                        "scroll",
+                        scroll_cb.as_ref().unchecked_ref(),
+                    ).ok();
+                    drop(resize_cb);
+                }));
+            } else {
+                // ResizeObserver unavailable — remove the scroll listener we already
+                // registered and run the check once immediately as a fallback.
+                el.remove_event_listener_with_callback(
+                    "scroll",
+                    scroll_cb.as_ref().unchecked_ref(),
+                ).ok();
+                drop(scroll_cb);
+                drop(resize_cb);
+                check();
+            }
+        }
+    });
+
     view! {
-        <div style="overflow-x: auto; margin-bottom: calc(var(--spacing) * 7); \
-                    border: 1px solid var(--color-sky-200); border-radius: 10px;">
-            <table style="width: max-content; min-width: 100%; border-collapse: collapse; font-size: .82rem;">
-                <thead>
-                    <tr>
-                        <th style="text-align: left; padding: calc(var(--spacing) * 2.25) calc(var(--spacing) * 3.5); \
-                                   background: var(--color-sky-100); border-bottom: 2px solid var(--color-sky-200); \
-                                   font-size: .7rem; font-weight: 700; color: var(--color-sky-700); \
-                                   text-transform: uppercase; letter-spacing: .07em; \
-                                   white-space: nowrap;">
-                            "Track"
-                        </th>
-                        {headers.into_iter().map(|h| view! {
+        // Outer wrapper: relative so the scroll-hint overlay is clipped to the table bounds
+        <div style="position: relative; margin-bottom: calc(var(--spacing) * 7);">
+            <div node_ref=scroll_ref style="overflow-x: auto; border: 1px solid var(--color-sky-200); border-radius: 10px;">
+                <table style="width: max-content; min-width: 100%; border-collapse: collapse; font-size: .82rem;">
+                    <thead>
+                        <tr>
                             <th style="text-align: left; padding: calc(var(--spacing) * 2.25) calc(var(--spacing) * 3.5); \
                                        background: var(--color-sky-100); border-bottom: 2px solid var(--color-sky-200); \
                                        font-size: .7rem; font-weight: 700; color: var(--color-sky-700); \
                                        text-transform: uppercase; letter-spacing: .07em; \
                                        white-space: nowrap;">
-                                {h}
+                                "Track"
                             </th>
-                        }).collect::<Vec<_>>()}
-                    </tr>
-                </thead>
-                <tbody>
-                    {table_rows.into_iter().enumerate().map(|(ri, (name, is_default, row))| {
-                        let bg = if ri % 2 == 0 { "var(--color-white)" } else { "var(--color-sky-50)" };
-                        view! {
-                            <tr style=format!("background: {}; transition: background .1s;", bg)>
-                                <td style="padding: calc(var(--spacing) * 2) calc(var(--spacing) * 3.5); border-bottom: 1px solid var(--color-sky-100); \
-                                           white-space: nowrap; vertical-align: middle;">
-                                    <div style="display: flex; align-items: center; gap: 6px;">
-                                        <span style="font-size: .82rem; font-weight: 600; color: var(--color-sky-950);">
-                                            {name}
-                                        </span>
-                                        {is_default.then(|| view! {
-                                            <span style="font-size: .65rem; color: var(--color-green-600); font-weight: 700; \
-                                                         background: rgba(34,197,94,.1); \
-                                                         border: 1px solid rgba(34,197,94,.3); \
-                                                         border-radius: 4px; padding: var(--spacing) calc(var(--spacing) * 1.25);">
-                                                "DEFAULT"
-                                            </span>
-                                        })}
-                                    </div>
-                                </td>
-                                {row.into_iter().map(|val| view! {
+                            {headers.into_iter().map(|h| view! {
+                                <th style="text-align: left; padding: calc(var(--spacing) * 2.25) calc(var(--spacing) * 3.5); \
+                                           background: var(--color-sky-100); border-bottom: 2px solid var(--color-sky-200); \
+                                           font-size: .7rem; font-weight: 700; color: var(--color-sky-700); \
+                                           text-transform: uppercase; letter-spacing: .07em; \
+                                           white-space: nowrap;">
+                                    {h}
+                                </th>
+                            }).collect::<Vec<_>>()}
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {table_rows.into_iter().enumerate().map(|(ri, (name, is_default, row))| {
+                            let bg = if ri % 2 == 0 { "var(--color-white)" } else { "var(--color-sky-50)" };
+                            view! {
+                                <tr style=format!("background: {}; transition: background .1s;", bg)>
                                     <td style="padding: calc(var(--spacing) * 2) calc(var(--spacing) * 3.5); border-bottom: 1px solid var(--color-sky-100); \
-                                               color: var(--color-sky-950); font-family: ui-monospace, monospace; \
                                                white-space: nowrap; vertical-align: middle;">
-                                        {val}
+                                        <div style="display: flex; align-items: center; gap: 6px;">
+                                            <span style="font-size: .82rem; font-weight: 600; color: var(--color-sky-950);">
+                                                {name}
+                                            </span>
+                                            {is_default.then(|| view! {
+                                                <span style="font-size: .65rem; color: var(--color-green-600); font-weight: 700; \
+                                                             background: rgba(34,197,94,.1); \
+                                                             border: 1px solid rgba(34,197,94,.3); \
+                                                             border-radius: 4px; padding: var(--spacing) calc(var(--spacing) * 1.25);">
+                                                    "DEFAULT"
+                                                </span>
+                                            })}
+                                        </div>
                                     </td>
-                                }).collect::<Vec<_>>()}
-                            </tr>
-                        }
-                    }).collect::<Vec<_>>()}
-                </tbody>
-            </table>
+                                    {row.into_iter().map(|val| view! {
+                                        <td style="padding: calc(var(--spacing) * 2) calc(var(--spacing) * 3.5); border-bottom: 1px solid var(--color-sky-100); \
+                                                   color: var(--color-sky-950); font-family: ui-monospace, monospace; \
+                                                   white-space: nowrap; vertical-align: middle;">
+                                            {val}
+                                        </td>
+                                    }).collect::<Vec<_>>()}
+                                </tr>
+                            }
+                        }).collect::<Vec<_>>()}
+                    </tbody>
+                </table>
+            </div>
+            // Scroll hint: right-edge gradient + animated chevron anchored to the header row.
+            <div style=move || format!("position: absolute; right: 1px; top: 1px; height: 38px; width: 52px;                         border-radius: 0 10px 0 0; pointer-events: none;                         background: linear-gradient(to right, transparent, color-mix(in srgb, var(--color-sky-100) 96%, transparent));                         display: flex; align-items: center; justify-content: flex-end;                         padding-right: calc(var(--spacing) * 1.75);                         opacity: {}; transition: opacity .2s;", if show_hint.get() {{ 1 }} else {{ 0 }})>
+                <style>
+                    "@keyframes hls-scroll-bounce {
+                        0%, 100% { transform: translateX(0); opacity: .55; }
+                        50%       { transform: translateX(4px); opacity: 1; }
+                    }"
+                </style>
+                <span style="font-size: 1.25rem; color: var(--color-sky-700); line-height: 1; \
+                             user-select: none; \
+                             animation: hls-scroll-bounce 1.4s ease-in-out infinite;">
+                    {"›"}
+                </span>
+            </div>
         </div>
     }
 }
@@ -2540,7 +2693,7 @@ mod tests {
 
     #[test]
     fn media_playlist_parsed_past_daterange() {
-        let pl = parse_media_playlist("https://example.com/sdr/prog_index.m3u8", APPLE_MEDIA);
+        let pl = parse_media_playlist("https://example.com/sdr/prog_index.m3u8", APPLE_MEDIA, &HashMap::new());
         assert_eq!(pl.target_duration, 6.0, "EXT-X-TARGETDURATION should be 6");
         assert_eq!(pl.playlist_type.as_deref(), Some("VOD"), "playlist type should be VOD");
         assert!(pl.has_endlist, "EXT-X-ENDLIST should be detected");
@@ -2615,12 +2768,33 @@ mod tests {
              #EXT-X-MAP:URI=\"main.mp4\",BYTERANGE=\"719@0\"\n\
              #EXTINF:6.0,\n\
              main.mp4\n",
+            &HashMap::new(),
         );
         let (uri, range) = pl.init_segment().expect("init segment");
         assert_eq!(uri, "https://example.com/v5/main.mp4");
         let range = range.expect("byterange");
         assert_eq!(range.start, 0);
         assert_eq!(range.end, 718);
+    }
+
+    #[test]
+    fn resolve_defined_uri_substitutes_then_joins() {
+        let defs = HashMap::from([("PATH".into(), "v1".into())]);
+        assert_eq!(
+            resolve_defined_uri("https://ex.com/hls/master.m3u8", "{$PATH}/prog.m3u8", &defs),
+            "https://ex.com/hls/v1/prog.m3u8"
+        );
+    }
+
+    #[test]
+    fn define_name_value_resolves_variant_uri() {
+        let content = "#EXTM3U\n\
+            #EXT-X-DEFINE:NAME=\"HOST\",VALUE=\"https://cdn.example\"\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=1000\n\
+            {$HOST}/v.m3u8\n";
+        let master = parse_master_playlist("https://origin.example/master.m3u8", content);
+        assert_eq!(master.definitions.get("HOST").map(String::as_str), Some("https://cdn.example"));
+        assert_eq!(master.variants[0].uri, "https://cdn.example/v.m3u8");
     }
 
     #[test]

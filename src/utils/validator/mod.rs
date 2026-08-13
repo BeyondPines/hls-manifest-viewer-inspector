@@ -6,6 +6,13 @@ use types::*;
 use parser::*;
 use crate::utils::href::replace_hls_variables;
 use crate::utils::network::{fetch_text, FetchError};
+use std::collections::HashMap;
+
+/// Substitute EXT-X-DEFINE variables in `uri`, then resolve against `base`.
+pub fn absolute_fetch_uri(base: &str, uri: &str, defs: &HashMap<String, String>) -> String {
+    let substituted = replace_hls_variables(uri, defs);
+    resolve_url(base, substituted.as_ref())
+}
 
 /// Determine if content is a master (multivariant) playlist
 pub fn is_master_playlist(content: &str) -> bool {
@@ -82,13 +89,25 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
             .map(|r| (r.uri.clone().unwrap(), r.name.clone(), r.group_id.clone(), r.channels.clone()))
             .collect();
 
-        // Fetch variant playlists
-        for vi in &variant_infos {
-            // Substitute EXT-X-DEFINE variables before fetching (UI links already do this).
-            let fetch_uri = replace_hls_variables(&vi.uri, &master.definitions).into_owned();
+        // Fetch variant playlists in parallel (unique absolute URIs only).
+        let mut variant_jobs: Vec<(usize, String)> = Vec::new();
+        for (idx, vi) in variant_infos.iter().enumerate() {
+            let fetch_uri = absolute_fetch_uri(url, &vi.uri, &master.definitions);
             if !seen_urls.insert(fetch_uri.clone()) {
                 continue;
             }
+            variant_jobs.push((idx, fetch_uri));
+        }
+        let variant_fetches = futures::future::join_all(
+            variant_jobs.iter().map(|(_, fetch_uri)| {
+                let fetch_uri = fetch_uri.clone();
+                async move { fetch_text(fetch_uri).await }
+            }),
+        )
+        .await;
+
+        for ((idx, fetch_uri), result) in variant_jobs.iter().zip(variant_fetches) {
+            let vi = &variant_infos[*idx];
             // Include bandwidth in name to disambiguate renditions that share a resolution
             // (e.g. two 1920×1080 tiers at different bitrates).
             let name = if let Some(r) = &vi.resolution {
@@ -106,7 +125,7 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
                     .unwrap_or("unknown")
                     .to_string()
             };
-            match fetch_text(fetch_uri.clone()).await {
+            match result {
                 Ok(resp) => {
                     let mut pl = MediaPlaylist::new(name, fetch_uri.clone());
                     pl.media_type = "VIDEO".to_string();
@@ -120,7 +139,7 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
                     pl.video_range = vi.video_range.clone();
                     pl.color_info = derive_color_info(vi.video_range.as_deref(), vi.codecs.as_deref());
                     pl.is_iframe = vi.is_iframe;
-                    parse_media_playlist(&fetch_uri, &resp.response_text, &mut pl);
+                    parse_media_playlist(fetch_uri, &resp.response_text, &mut pl);
                     apply_master_definitions(&resp.response_text, &master.definitions, &mut pl.definitions);
                     playlists.push(pl);
                 }
@@ -132,12 +151,25 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
             }
         }
 
-        // Fetch audio renditions
-        for (uri, name, group_id, channels) in &audio_uris {
-            let fetch_uri = replace_hls_variables(uri, &master.definitions).into_owned();
+        // Fetch audio renditions in parallel (unique absolute URIs only).
+        let mut audio_jobs: Vec<(usize, String)> = Vec::new();
+        for (idx, (uri, _, _, _)) in audio_uris.iter().enumerate() {
+            let fetch_uri = absolute_fetch_uri(url, uri, &master.definitions);
             if !seen_urls.insert(fetch_uri.clone()) {
                 continue;
             }
+            audio_jobs.push((idx, fetch_uri));
+        }
+        let audio_fetches = futures::future::join_all(
+            audio_jobs.iter().map(|(_, fetch_uri)| {
+                let fetch_uri = fetch_uri.clone();
+                async move { fetch_text(fetch_uri).await }
+            }),
+        )
+        .await;
+
+        for ((idx, fetch_uri), result) in audio_jobs.iter().zip(audio_fetches) {
+            let (_, name, group_id, channels) = &audio_uris[*idx];
             // Build a unique, human-readable name.
             // "ENG (audio1) · 2ch" disambiguates entries that share the same NAME.
             let channel_suffix = channels.as_deref()
@@ -145,14 +177,14 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
                 .unwrap_or_default();
             let audio_name = format!("audio/{} ({}){}", name, group_id, channel_suffix);
 
-            match fetch_text(fetch_uri.clone()).await {
+            match result {
                 Ok(resp) => {
                     let mut pl = MediaPlaylist::new(audio_name, fetch_uri.clone());
                     pl.media_type = "AUDIO".to_string();
                     pl.group_id = Some(group_id.clone());
                     // Derive audio codec from the STREAM-INF entry that references this group
                     pl.codecs = audio_group_codec.get(group_id.as_str()).cloned();
-                    parse_media_playlist(&fetch_uri, &resp.response_text, &mut pl);
+                    parse_media_playlist(fetch_uri, &resp.response_text, &mut pl);
                     apply_master_definitions(&resp.response_text, &master.definitions, &mut pl.definitions);
                     playlists.push(pl);
                 }
@@ -1037,6 +1069,35 @@ mod tests {
     }
 
     // ── apply_master_definitions ──────────────────────────────────────────────
+
+    #[test]
+    fn absolute_fetch_uri_with_absolute_define_value() {
+        let defs = HashMap::from([(
+            "HOST".to_string(),
+            "https://cdn.example/hls/".to_string(),
+        )]);
+        assert_eq!(
+            absolute_fetch_uri(
+                "https://origin.example/master.m3u8",
+                "{$HOST}v.m3u8",
+                &defs
+            ),
+            "https://cdn.example/hls/v.m3u8"
+        );
+    }
+
+    #[test]
+    fn absolute_fetch_uri_joins_relative_after_substitution() {
+        let defs = HashMap::from([("PATH".to_string(), "a1".to_string())]);
+        assert_eq!(
+            absolute_fetch_uri(
+                "https://ex.com/hls/master.m3u8",
+                "{$PATH}/prog.m3u8",
+                &defs
+            ),
+            "https://ex.com/hls/a1/prog.m3u8"
+        );
+    }
 
     #[test]
     fn apply_master_definitions_copies_all_defs_as_fallback() {

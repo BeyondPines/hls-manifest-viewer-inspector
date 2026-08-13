@@ -229,6 +229,8 @@ impl MediaPlaylist {
 
 #[derive(Debug, Clone)]
 pub struct MasterRendition {
+    /// Raw URI as written in the playlist (may contain `{$VAR}`). Callers must
+    /// substitute DEFINE variables and resolve against the master URL before fetch.
     pub uri: String,
     pub bandwidth: Option<u64>,
     pub average_bandwidth: Option<u64>,
@@ -247,6 +249,8 @@ pub struct MediaRendition {
     pub media_type: String,
     pub group_id: String,
     pub name: String,
+    /// Raw URI as written in the playlist (may contain `{$VAR}`). Callers must
+    /// substitute DEFINE variables and resolve against the master URL before fetch.
     pub uri: Option<String>,
     pub language: Option<String>,
     pub is_default: bool,

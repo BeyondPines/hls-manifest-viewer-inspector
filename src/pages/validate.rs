@@ -299,7 +299,11 @@ fn ValidationResults(report: ValidationReport) -> impl IntoView {
             // Section: SCTE-35 Ad Breaks
             {has_scte35_data.then(|| view! {
                 <SectionTitle label="📡 SCTE-35 Ad Breaks" />
-                <Scte35Section ad_breaks=ad_breaks.clone() playlist_window_s=playlist_window_s />
+                <Scte35Section
+                    ad_breaks=ad_breaks.clone()
+                    playlist_window_s=playlist_window_s
+                    definitions=definitions.clone()
+                />
             })}
 
             // Section: Delta Updates
@@ -777,7 +781,11 @@ fn InterstitialsSection(interstitials: Vec<Interstitial>) -> impl IntoView {
 // ── SCTE-35 Ad Breaks Section ───────────────────────────────────────────────
 
 #[component]
-fn Scte35Section(ad_breaks: Vec<AdBreak>, playlist_window_s: f64) -> impl IntoView {
+fn Scte35Section(
+    ad_breaks: Vec<AdBreak>,
+    playlist_window_s: f64,
+    definitions: std::collections::HashMap<String, String>,
+) -> impl IntoView {
     // Commercial breaks only (exclude program-boundary markers from totals)
     let commercial_count = ad_breaks.iter().filter(|b| b.break_type != "program").count();
     let closed_count    = ad_breaks.iter().filter(|b| b.break_type != "program" && b.actual_duration_s.is_some()).count();
@@ -922,10 +930,7 @@ fn Scte35Section(ad_breaks: Vec<AdBreak>, playlist_window_s: f64) -> impl IntoVi
                         } else { 1.0 };
                         let opacity = if is_open { "0.6" } else { "1.0" };
 
-                        let viewer_href = format!(
-                            "/hls-manifest-viewer/?playlist_url={}",
-                            utf8_percent_encode(&b.rendition_url, NON_ALPHANUMERIC)
-                        );
+                        let viewer_href = manifest_viewer_href(&b.rendition_url, &definitions);
                         let tooltip = format!("{} — starts at {} — {} {}",
                             b.id,
                             b.start_date,
@@ -1219,12 +1224,6 @@ fn CheckResultsTable(
                                                     links
                                                 } else {
                                                     Vec::new()
-                                                };
-
-                                                let _sev_class = match iss.severity {
-                                                    Severity::Error => "error",
-                                                    Severity::Warn => "warn",
-                                                    Severity::Info => "info",
                                                 };
 
                                                 view! {
