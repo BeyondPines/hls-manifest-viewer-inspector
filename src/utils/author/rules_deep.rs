@@ -69,6 +69,17 @@ fn extinf_span(pl: &MediaPlaylist, first: usize, last: usize) -> Option<f64> {
     Some(span.iter().map(|s| s.duration).sum())
 }
 
+/// "3 sampled segment(s) (#0, #4, #8)" — findings from a deep sample name the segments
+/// they were read from, so a report can be checked against the media it came from.
+fn describe_segments(indices: &[usize]) -> String {
+    let list = indices
+        .iter()
+        .map(|i| format!("#{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{} sampled segment(s) ({list})", indices.len())
+}
+
 /// Measured bit rate over a set of sampled segments.
 #[derive(Debug, Clone, Copy, Default)]
 struct MeasuredRate {
@@ -398,53 +409,87 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             issues.push(author_info(
                 "7.4",
                 format!(
-                    "'{name}' samples are encrypted — IDR placement (§7.4) and IDR interval (§1.13) cannot be read from segment bytes"
+                    "'{name}' samples are encrypted — IDR placement (§7.4) and key-frame interval (§1.13) cannot be read from segment bytes"
                 ),
             ));
         } else if is_video {
-            // §1.13 — IDRs SHOULD be present every ~2 seconds
-            let idr_total: usize = samples
+            // §1.13 — key frames SHOULD be present every two seconds. A CRA opens a GOP
+            // just as an IDR does, so what is counted is random-access pictures: counting
+            // IDRs alone reads an open-GOP encode as having almost no key frames and
+            // reports an interval the content does not have.
+            let irap_total: usize = samples
                 .iter()
-                .map(|s| s.idr_count.max(usize::from(s.has_idr_nal_hint)))
+                .map(|s| s.irap_count.max(usize::from(s.has_irap_nal_hint)))
                 .sum();
-            if idr_total > 0 {
-                let interval = total_dur / idr_total as f64;
+            if irap_total > 0 {
+                let interval = total_dur / irap_total as f64;
                 if interval > 2.5 {
                     issues.push(author_warn(
                         "1.13",
                         format!(
-                            "'{name}' estimated IDR interval ~{interval:.1}s exceeds ~2s recommendation (deep sample)"
+                            "'{name}' averages one key frame (IRAP) every ~{interval:.1}s over {} sampled segment(s) totalling {total_dur:.1}s, above the ~2s recommendation",
+                            samples.len()
                         ),
                     ));
                 }
             }
 
-            // §7.4 — video segments MUST start with an IDR
-            let mut no_idr: Vec<usize> = Vec::new();
+            // §7.4 — video segments MUST start with an IDR. A segment holding no IRAP at
+            // all cannot be entered on a switch, which is the conclusive violation. A
+            // segment that opens on a CRA or BLA is still randomly accessible, so it is
+            // reported on its own rather than as a failure of the same weight.
+            let mut no_irap: Vec<usize> = Vec::new();
+            let mut irap_not_at_start: Vec<usize> = Vec::new();
+            let mut open_gop: Vec<usize> = Vec::new();
+            let mut open_gop_holds_no_idr = false;
+            let mut read_beyond_video_track = false;
             for s in samples.iter().filter(|s| s.looks_like_fmp4 || s.looks_like_ts) {
-                if !s.has_idr_nal_hint {
-                    no_idr.push(s.segment_index);
+                if !s.has_irap_nal_hint {
+                    no_irap.push(s.segment_index);
+                } else if !s.irap_at_start {
+                    irap_not_at_start.push(s.segment_index);
                 } else if !s.idr_at_start {
-                    issues.push(author_error(
-                        "7.4",
-                        format!(
-                            "video segment '{}[#{}]' has IDR but not near segment start",
-                            s.playlist_name, s.segment_index
-                        ),
-                    ));
+                    open_gop.push(s.segment_index);
+                    open_gop_holds_no_idr |= !s.has_idr_nal_hint;
+                    read_beyond_video_track |= !s.nal_scan_scoped_to_video;
                 }
             }
-            if !no_idr.is_empty() {
-                let list = no_idr
-                    .iter()
-                    .map(|i| format!("#{i}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+            if !no_irap.is_empty() {
+                issues.push(author_error(
+                    "7.4",
+                    format!(
+                        "'{name}' — no IRAP (IDR, CRA or BLA) NAL found in {}: video segments MUST start with an IDR",
+                        describe_segments(&no_irap)
+                    ),
+                ));
+            }
+            if !irap_not_at_start.is_empty() {
                 issues.push(author_warn(
                     "7.4",
                     format!(
-                        "'{name}' — no IDR NAL detected at the start of {} sampled segment(s) ({list}, best-effort)",
-                        no_idr.len()
+                        "'{name}' — the first IRAP sits well past the start of {}; video segments MUST start with an IDR (position read from sample offsets, best-effort)",
+                        describe_segments(&irap_not_at_start)
+                    ),
+                ));
+            }
+            if !open_gop.is_empty() {
+                let idrs = if open_gop_holds_no_idr {
+                    " and carry no IDR at all"
+                } else {
+                    ""
+                };
+                // Without the video track's sample ranges the scan reads the whole payload,
+                // where another track's bytes can pass for NAL syntax.
+                let scope = if read_beyond_video_track {
+                    " (read from the whole segment payload, so the opening picture could not be tied to the video track)"
+                } else {
+                    ""
+                };
+                issues.push(author_warn(
+                    "7.4",
+                    format!(
+                        "'{name}' — {} open on a CRA or BLA rather than an IDR{idrs}; random access works, but §7.4 asks for an IDR{scope}",
+                        describe_segments(&open_gop)
                     ),
                 ));
             }

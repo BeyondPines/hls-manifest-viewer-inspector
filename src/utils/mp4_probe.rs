@@ -849,7 +849,7 @@ fn scan_nal_hints(data: &[u8], scan: &mut SegmentScan, codec: VideoCodecHint) {
 
     // Offsets of the NAL header byte, so the Annex-B and length-prefixed passes
     // agree on a position for the same NAL and can be deduped.
-    let mut idr_offsets: Vec<usize> = Vec::new();
+    let mut nals = NalOffsets::default();
 
     // Annex-B start codes (MPEG-TS, and some fMP4 payloads).
     let mut i = 0usize;
@@ -862,7 +862,7 @@ fn scan_nal_hints(data: &[u8], scan: &mut SegmentScan, codec: VideoCodecHint) {
             i += 1;
             continue;
         };
-        classify_nal(buf, nal_off, codec, &mut idr_offsets, scan);
+        classify_nal(buf, nal_off, codec, &mut nals, scan);
         i += sc_len;
     }
 
@@ -876,16 +876,51 @@ fn scan_nal_hints(data: &[u8], scan: &mut SegmentScan, codec: VideoCodecHint) {
         if nalu_len == 0 || nalu_len > buf.len() - (off + 4) {
             break;
         }
-        classify_nal(buf, off + 4, codec, &mut idr_offsets, scan);
+        classify_nal(buf, off + 4, codec, &mut nals, scan);
         off += 4 + nalu_len;
     }
 
-    idr_offsets.sort_unstable();
-    idr_offsets.dedup();
-    if let Some(&first) = idr_offsets.first() {
-        scan.idr_count += idr_offsets.len();
-        if !scan.idr_at_start {
-            scan.idr_at_start = first < 8 * 1024;
+    nals.commit(scan);
+}
+
+/// Offsets of the random-access NAL headers one payload holds. An IDR is also an IRAP,
+/// so the two sets overlap; they are kept apart because §7.4 is written about IDRs while
+/// §1.13 counts key frames, which a CRA also provides.
+#[derive(Debug, Default)]
+struct NalOffsets {
+    irap: Vec<usize>,
+    idr: Vec<usize>,
+}
+
+/// A random-access NAL this close to the payload start opens the segment.
+const SEGMENT_START_WINDOW: usize = 8 * 1024;
+
+impl NalOffsets {
+    fn commit(mut self, scan: &mut SegmentScan) {
+        for (offsets, count, at_start, hint) in [
+            (
+                &mut self.irap,
+                &mut scan.irap_count,
+                &mut scan.irap_at_start,
+                &mut scan.has_irap_nal_hint,
+            ),
+            (
+                &mut self.idr,
+                &mut scan.idr_count,
+                &mut scan.idr_at_start,
+                &mut scan.has_idr_nal_hint,
+            ),
+        ] {
+            offsets.sort_unstable();
+            offsets.dedup();
+            let Some(&first) = offsets.first() else {
+                continue;
+            };
+            *count += offsets.len();
+            *hint = true;
+            if !*at_start {
+                *at_start = first < SEGMENT_START_WINDOW;
+            }
         }
     }
 }
@@ -899,12 +934,13 @@ fn scan_media_markers(data: &[u8], scan: &mut SegmentScan) {
     }
 }
 
-/// Inspect the NAL header at `nal_off`, recording IDR offsets and CEA-608/708 SEI hints.
+/// Inspect the NAL header at `nal_off`, recording random-access offsets and CEA-608/708
+/// SEI hints.
 fn classify_nal(
     buf: &[u8],
     nal_off: usize,
     codec: VideoCodecHint,
-    idr_offsets: &mut Vec<usize>,
+    nals: &mut NalOffsets,
     scan: &mut SegmentScan,
 ) {
     let Some(&b0) = buf.get(nal_off) else {
@@ -912,9 +948,10 @@ fn classify_nal(
     };
     if codec.checks_avc() {
         match b0 & 0x1f {
+            // H.264 has no CRA, so its only random-access picture is the IDR.
             5 => {
-                idr_offsets.push(nal_off);
-                scan.has_idr_nal_hint = true;
+                nals.irap.push(nal_off);
+                nals.idr.push(nal_off);
             }
             6 if has_ga94_payload(buf, nal_off) => scan.has_cc_sei_hint = true,
             _ => {}
@@ -922,9 +959,14 @@ fn classify_nal(
     }
     if codec.checks_hevc() {
         match (b0 >> 1) & 0x3f {
-            19 | 20 => {
-                idr_offsets.push(nal_off);
-                scan.has_idr_nal_hint = true;
+            // HEVC IRAP types (ISO/IEC 23008-2 Table 7-1): BLA 16–18, IDR 19–20, CRA 21.
+            // A CRA opens a segment just as well as an IDR does, so all of them count as
+            // random access; only 19 and 20 are IDRs, which is what §7.4 asks for.
+            t @ 16..=21 => {
+                nals.irap.push(nal_off);
+                if matches!(t, 19 | 20) {
+                    nals.idr.push(nal_off);
+                }
             }
             39 if has_ga94_payload(buf, nal_off) => scan.has_cc_sei_hint = true,
             _ => {}
@@ -942,10 +984,17 @@ pub struct SegmentScan {
     pub looks_like_ts: bool,
     pub looks_like_fmp4: bool,
     pub has_moof: bool,
+    /// An IRAP that is also an IDR was seen (HEVC NAL 19–20, H.264 NAL 5).
     pub has_idr_nal_hint: bool,
     /// IDR found near the start of the segment payload.
     pub idr_at_start: bool,
     pub idr_count: usize,
+    /// Any IRAP was seen, including the CRA and BLA pictures that open an HEVC segment
+    /// without being an IDR.
+    pub has_irap_nal_hint: bool,
+    /// IRAP found near the start of the segment payload.
+    pub irap_at_start: bool,
+    pub irap_count: usize,
     pub has_tfdt: bool,
     /// Decode time of the video fragment, when the init named a video track.
     pub video_tfdt: Option<u64>,
@@ -1139,7 +1188,7 @@ mod tests {
     }
 
     impl Fragment {
-        /// A fragment whose single sample reads as an HEVC IRAP NAL.
+        /// A fragment whose single sample reads as an HEVC IDR_W_RADL NAL (type 19).
         fn new(track_id: u32, tfdt: u64) -> Self {
             Self {
                 track_id,
@@ -1148,6 +1197,12 @@ mod tests {
                 size_in_tfhd_default: false,
                 base_is_moof: true,
             }
+        }
+
+        /// The same fragment opened by `nal_header` instead of an IDR.
+        fn opened_by(mut self, nal_header: u8) -> Self {
+            self.payload = length_prefixed_nal(nal_header, 40);
+            self
         }
     }
 
@@ -1268,6 +1323,36 @@ mod tests {
             scan_segment_bytes(&segment, SegmentScanHints::for_codec(VideoCodecHint::Hevc));
         assert!(!blind.nal_scan_scoped_to_video);
         assert_eq!(blind.idr_count, 2);
+    }
+
+    /// An open-GOP encoder starts a segment on a CRA, which gives random access without
+    /// being an IDR. Counting only IDRs reads such a segment as having no key frames.
+    #[test]
+    fn cra_and_bla_opened_runs_are_irap_without_being_idr() {
+        let probe = probe_init_segment(&init_with_metadata_track_first());
+        // HEVC NAL type 21 (CRA_NUT) and type 16 (BLA_W_LP) in the NAL header's high bits.
+        for nal_header in [0x2a, 0x20] {
+            let segment = media_segment(&[
+                Fragment::new(1, 900_000),
+                Fragment::new(2, 6_000).opened_by(nal_header),
+            ]);
+            let scan = scan_segment_bytes(&segment, probe.scan_hints(VideoCodecHint::Hevc));
+            assert!(scan.nal_scan_scoped_to_video);
+            assert_eq!(scan.irap_count, 1, "NAL header {nal_header:#x}");
+            assert!(scan.irap_at_start && scan.has_irap_nal_hint);
+            assert_eq!(scan.idr_count, 0);
+            assert!(!scan.has_idr_nal_hint && !scan.idr_at_start);
+        }
+    }
+
+    /// An IDR is an IRAP as well, so a segment that opens on one satisfies both counts.
+    #[test]
+    fn idr_opened_run_counts_as_irap_too() {
+        let probe = probe_init_segment(&init_with_metadata_track_first());
+        let segment = media_segment(&metadata_and_video_fragments());
+        let scan = scan_segment_bytes(&segment, probe.scan_hints(VideoCodecHint::Hevc));
+        assert_eq!((scan.idr_count, scan.irap_count), (1, 1));
+        assert!(scan.idr_at_start && scan.irap_at_start);
     }
 
     #[test]

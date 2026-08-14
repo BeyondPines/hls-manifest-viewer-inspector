@@ -340,22 +340,16 @@ https://example.com/v.m3u8
                 extinf_s: 2.0,
                 // 800kbps * 2s = 1_600_000 bits = 200_000 bytes would match; use 400_000 bytes → 1.6 Mbps
                 bytes: 400_000,
-                is_iframe_playlist: false,
                 looks_like_fmp4: true,
                 has_moof: true,
                 has_idr_nal_hint: true,
                 idr_at_start: true,
-                idr_count: 1,
+                has_irap_nal_hint: true,
+                irap_at_start: true,
+                irap_count: 1,
                 has_tfdt: true,
                 video_tfdt: Some(0),
-                audio_tfdt: None,
-                looks_like_ts: false,
-                has_senc: false,
-                has_saiz: false,
-                has_saio: false,
-                ts_continuity_ok: None,
-                has_cc_sei_hint: false,
-                has_asp_hint: false,
+                ..Default::default()
             },
             SegmentSample {
                 playlist_name: pl.name.clone(),
@@ -363,22 +357,16 @@ https://example.com/v.m3u8
                 uri: "https://example.com/1.m4s".into(),
                 extinf_s: 2.0,
                 bytes: 400_000,
-                is_iframe_playlist: false,
                 looks_like_fmp4: true,
                 has_moof: true,
                 has_idr_nal_hint: true,
                 idr_at_start: true,
-                idr_count: 1,
+                has_irap_nal_hint: true,
+                irap_at_start: true,
+                irap_count: 1,
                 has_tfdt: true,
                 video_tfdt: Some(60_000),
-                audio_tfdt: None,
-                looks_like_ts: false,
-                has_senc: false,
-                has_saiz: false,
-                has_saio: false,
-                ts_continuity_ok: None,
-                has_cc_sei_hint: false,
-                has_asp_hint: false,
+                ..Default::default()
             },
         ];
         let opts = ValidateAuthorOptions {
@@ -772,19 +760,20 @@ https://example.com/v.m3u8
     }
 
     #[test]
-    fn author_7_4_reports_missing_idr_on_clear_video() {
+    fn author_7_4_reports_missing_random_access_on_clear_video() {
         use crate::utils::mp4_probe::SegmentScan;
         let issues = idr_issues(SegmentScan {
             looks_like_fmp4: true,
             has_moof: true,
             ..Default::default()
         });
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
         assert!(
-            issues
-                .iter()
-                .any(|i| i.severity == Severity::Warn && i.message.contains("no IDR NAL detected")),
-            "expected a §7.4 warning, got: {:?}",
-            issues.iter().map(|i| &i.message).collect::<Vec<_>>()
+            issues[0].message.contains("no IRAP")
+                && issues[0].message.contains("2 sampled segment(s) (#0, #1)"),
+            "the error should say what was missing and where, got: {}",
+            issues[0].message
         );
     }
 
@@ -871,6 +860,9 @@ https://example.com/v.m3u8
                         has_idr_nal_hint: true,
                         idr_at_start: true,
                         idr_count: 1,
+                        has_irap_nal_hint: true,
+                        irap_at_start: true,
+                        irap_count: 1,
                         nal_scan_scoped_to_video: true,
                         video_tfdt: Some(tfdt_of(i)),
                         ..Default::default()
@@ -1094,6 +1086,109 @@ https://example.com/v.m3u8
             found.message.contains("level 5.2") && found.message.contains("max 5.1"),
             "expected the measured and allowed levels, got: {}",
             found.message
+        );
+    }
+
+    /// Deep-check findings for one HEVC video playlist whose sampled segments scanned as
+    /// `scans`. Every sample is two seconds long, so a per-segment key frame is the ~2s
+    /// interval §1.13 asks for.
+    fn deep_video_issues(
+        scans: Vec<crate::utils::mp4_probe::SegmentScan>,
+        section: &str,
+    ) -> Vec<Issue> {
+        use crate::utils::mp4_probe::InitSegmentProbe;
+        let mut video = demuxed_video_playlist(scans.len());
+        video.audio_group = None;
+        video.frame_rate = Some(30.0);
+        let segs: Vec<SegmentSample> = scans
+            .into_iter()
+            .enumerate()
+            .map(|(i, scan)| sample(&video.name, i, 2.0, 200_000, scan))
+            .collect();
+        let inits = vec![InitProbeEntry {
+            uri: "https://example.com/v-init.mp4".into(),
+            byterange: None,
+            playlist_names: vec![video.name.clone()],
+            media_types: vec!["VIDEO".into()],
+            probe: InitSegmentProbe {
+                major_brand: Some("iso6".into()),
+                video_sample_fourcc: Some("hvc1".into()),
+                timescale: Some(600),
+                ..Default::default()
+            },
+        }];
+        let playlists = vec![video];
+        let opts = deep_opts();
+        let vtts = Vec::new();
+        let ctx = AuthoringContext::new(None, &playlists, &opts, &inits, &segs, &vtts);
+        run_authoring_checks(&ctx)
+            .into_iter()
+            .filter(|i| i.message.contains(section))
+            .collect()
+    }
+
+    /// A sampled fMP4 segment opened by a random-access picture: an IDR when `idr` is set,
+    /// otherwise a CRA, which is an IRAP without being an IDR.
+    fn opening_scan(idr: bool) -> crate::utils::mp4_probe::SegmentScan {
+        crate::utils::mp4_probe::SegmentScan {
+            looks_like_fmp4: true,
+            has_moof: true,
+            has_tfdt: true,
+            nal_scan_scoped_to_video: true,
+            has_irap_nal_hint: true,
+            irap_at_start: true,
+            irap_count: 1,
+            has_idr_nal_hint: idr,
+            idr_at_start: idr,
+            idr_count: usize::from(idr),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn author_7_4_warns_about_cra_opened_segments_instead_of_failing() {
+        let issues = deep_video_issues(vec![opening_scan(false); 4], "§7.4");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Warn);
+        assert!(
+            issues[0].message.contains("CRA or BLA"),
+            "the finding should name what the segments open on, got: {}",
+            issues[0].message
+        );
+    }
+
+    #[test]
+    fn author_7_4_accepts_idr_opened_segments() {
+        assert!(deep_video_issues(vec![opening_scan(true); 4], "§7.4").is_empty());
+    }
+
+    /// An open-GOP encode carries a key frame per segment, so its §1.13 interval is the
+    /// segment duration. Counting IDRs alone divided the sampled span by the one closed
+    /// GOP that happened to be sampled, and reported an interval the content never had.
+    #[test]
+    fn author_1_13_counts_open_gop_key_frames() {
+        let mut scans = vec![opening_scan(false); 5];
+        scans[0] = opening_scan(true);
+        assert!(
+            deep_video_issues(scans, "§1.13").is_empty(),
+            "a key frame every 2s must not be reported"
+        );
+    }
+
+    #[test]
+    fn author_1_13_still_reports_a_sparse_key_frame_interval() {
+        let mut scans = vec![opening_scan(false); 5];
+        for scan in scans.iter_mut().skip(1) {
+            scan.has_irap_nal_hint = false;
+            scan.irap_at_start = false;
+            scan.irap_count = 0;
+        }
+        let issues = deep_video_issues(scans, "§1.13");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(
+            issues[0].message.contains("~10.0s"),
+            "one key frame across 10s of samples is a ~10s interval, got: {}",
+            issues[0].message
         );
     }
 

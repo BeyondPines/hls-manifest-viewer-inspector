@@ -35,7 +35,7 @@ pub struct InitProbeEntry {
 }
 
 /// Measured segment sample for Phase B light probes / Phase C deep checks.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SegmentSample {
     pub playlist_name: String,
     pub segment_index: usize,
@@ -49,7 +49,14 @@ pub struct SegmentSample {
     pub has_moof: bool,
     pub has_idr_nal_hint: bool,
     pub idr_at_start: bool,
-    pub idr_count: usize,
+    /// Random-access pictures, including the CRA/BLA an open-GOP encoder opens a
+    /// segment with. §1.13 counts these; §7.4 is written about IDRs alone.
+    pub has_irap_nal_hint: bool,
+    pub irap_at_start: bool,
+    pub irap_count: usize,
+    /// True when the NAL scan was narrowed to the video track's sample ranges. When
+    /// false, another track's bytes could have been read as NAL syntax.
+    pub nal_scan_scoped_to_video: bool,
     pub has_tfdt: bool,
     /// Decode times of the video and audio fragments, when the matching init named
     /// those tracks. A rule comparing a playlist's EXTINF against a media timeline
@@ -87,7 +94,10 @@ impl SegmentSample {
             has_moof: scan.has_moof,
             has_idr_nal_hint: scan.has_idr_nal_hint,
             idr_at_start: scan.idr_at_start,
-            idr_count: scan.idr_count,
+            has_irap_nal_hint: scan.has_irap_nal_hint,
+            irap_at_start: scan.irap_at_start,
+            irap_count: scan.irap_count,
+            nal_scan_scoped_to_video: scan.nal_scan_scoped_to_video,
             has_tfdt: scan.has_tfdt,
             video_tfdt: scan.video_tfdt,
             audio_tfdt: scan.audio_tfdt,
