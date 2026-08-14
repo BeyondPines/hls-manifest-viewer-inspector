@@ -167,9 +167,10 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         }
     }
 
-    // §16.7 — immersive video MUST name both CH-STEREO and PROJ-AIV in REQ-VIDEO-LAYOUT.
-    // A layout that carries one of the pair is immersive content declaring itself
-    // incompletely, which is the mistake this can see from the multivariant playlist alone.
+    // §16.7 — immersive video MUST name both CH-STEREO and PROJ-AIV. The projection
+    // specifier is what identifies the content as immersive, so PROJ-AIV without
+    // CH-STEREO is the violation this can see. CH-STEREO on its own is ordinary stereo
+    // video, which §16.7 says nothing about.
     for v in &master.variants {
         let Some(layout) = v.req_video_layout.as_deref() else {
             continue;
@@ -180,15 +181,13 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             .filter(|t| !t.is_empty())
             .collect();
         let has = |want: &str| specifiers.iter().any(|s| s == want);
-        let missing = match (has("CH-STEREO"), has("PROJ-AIV")) {
-            (true, false) => "PROJ-AIV",
-            (false, true) => "CH-STEREO",
-            _ => continue,
-        };
+        if !has("PROJ-AIV") || has("CH-STEREO") {
+            continue;
+        }
         issues.push(author_error(
             "16.7",
             format!(
-                "'{}' declares REQ-VIDEO-LAYOUT '{layout}' but immersive video MUST use both CH-STEREO and PROJ-AIV; '{missing}' is missing",
+                "'{}' declares REQ-VIDEO-LAYOUT '{layout}', so its video is immersive, but immersive video MUST use both CH-STEREO and PROJ-AIV; 'CH-STEREO' is missing",
                 v.uri
             ),
         ));
@@ -571,17 +570,29 @@ https://example.com/stereo.m3u8
     }
 
     #[test]
-    fn author_16_7_requires_ch_stereo_and_proj_aiv_together() {
-        for (layout, missing) in [("PROJ-AIV", "CH-STEREO"), ("CH-STEREO", "PROJ-AIV")] {
-            let master = master_with_layout(layout);
-            let issues = issues_for(&master, &[], &[], "§16.7");
-            assert_eq!(issues.len(), 1, "{layout}: {issues:?}");
-            assert_eq!(
-                issues[0].severity,
-                crate::utils::validator::types::Severity::Error
-            );
-            assert!(issues[0].message.contains(missing), "{}", issues[0].message);
-        }
+    fn author_16_7_requires_ch_stereo_alongside_proj_aiv() {
+        let master = master_with_layout("CH-MONO,PROJ-AIV");
+        let issues = issues_for(&master, &[], &[], "§16.7");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(
+            issues[0].severity,
+            crate::utils::validator::types::Severity::Error
+        );
+        assert!(
+            issues[0].message.contains("CH-STEREO"),
+            "{}",
+            issues[0].message
+        );
+    }
+
+    #[test]
+    fn author_16_7_leaves_plain_stereo_video_alone() {
+        // Stereo video without an immersive projection is not what §16.7 is written about.
+        let master = master_with_layout("CH-STEREO");
+        assert!(
+            issues_for(&master, &[], &[], "§16.7").is_empty(),
+            "CH-STEREO on its own does not make content immersive"
+        );
     }
 
     #[test]
