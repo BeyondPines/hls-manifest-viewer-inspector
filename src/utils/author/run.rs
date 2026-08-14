@@ -2,7 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::utils::mp4_probe::{probe_init_segment, scan_segment_bytes, VideoCodecHint};
+use crate::utils::mp4_probe::{
+    probe_init_segment, scan_segment_bytes, InitSegmentProbe, SegmentScanHints, VideoCodecHint,
+};
 use crate::utils::network::{
     fetch_array_buffer, fetch_text, FetchArrayBufferResonse, FetchError, RequestRange,
 };
@@ -215,7 +217,7 @@ struct SegmentJob {
     duration: f64,
     range: Option<RequestRange>,
     is_iframe_playlist: bool,
-    codec: VideoCodecHint,
+    hints: SegmentScanHints,
 }
 
 /// The playlist's first EXT-X-MAP as a fetchable URI plus the BYTERANGE from that
@@ -228,6 +230,17 @@ fn init_map_fetch_target(pl: &MediaPlaylist) -> Option<(String, Option<String>)>
     ))
 }
 
+/// The init segment probed for this playlist, if one was fetched.
+fn probe_for_playlist<'a>(
+    pl: &MediaPlaylist,
+    init_probes: &'a [InitProbeEntry],
+) -> Option<&'a InitSegmentProbe> {
+    init_probes
+        .iter()
+        .find(|e| e.playlist_names.iter().any(|n| n == &pl.name))
+        .map(|e| &e.probe)
+}
+
 /// Video codec for a playlist, from its CODECS attribute or the probed init fourCC.
 fn codec_hint_for_playlist(pl: &MediaPlaylist, init_probes: &[InitProbeEntry]) -> VideoCodecHint {
     if let Some(codecs) = pl.codecs.as_deref() {
@@ -238,12 +251,20 @@ fn codec_hint_for_playlist(pl: &MediaPlaylist, init_probes: &[InitProbeEntry]) -
             }
         }
     }
-    init_probes
-        .iter()
-        .find(|e| e.playlist_names.iter().any(|n| n == &pl.name))
-        .and_then(|e| e.probe.video_sample_fourcc.as_deref())
+    probe_for_playlist(pl, init_probes)
+        .and_then(|p| p.video_sample_fourcc.as_deref())
         .map(VideoCodecHint::from_codec_str)
         .unwrap_or_default()
+}
+
+/// Codec plus the track IDs a segment scan needs to tell this playlist's media
+/// fragments from the timed-metadata ones alongside them.
+fn scan_hints_for_playlist(pl: &MediaPlaylist, init_probes: &[InitProbeEntry]) -> SegmentScanHints {
+    let codec = codec_hint_for_playlist(pl, init_probes);
+    match probe_for_playlist(pl, init_probes) {
+        Some(probe) => probe.scan_hints(codec),
+        None => SegmentScanHints::for_codec(codec),
+    }
 }
 
 /// Fetch every job in parallel and turn each body into a [`SegmentSample`], noting
@@ -266,7 +287,7 @@ async fn fetch_segment_samples(
                 if range_ignored {
                     notes.record_ignored(&job.uri);
                 }
-                let scan = scan_segment_bytes(bytes, job.codec);
+                let scan = scan_segment_bytes(bytes, job.hints);
                 samples.push(SegmentSample::from_scan(
                     job.playlist_name.clone(),
                     job.segment_index,
@@ -429,7 +450,7 @@ async fn collect_media_samples(
                 duration: seg.duration,
                 range: seg.byterange.as_deref().and_then(parse_byterange),
                 is_iframe_playlist: true,
-                codec: codec_hint_for_playlist(pl, &init_probes),
+                hints: scan_hints_for_playlist(pl, &init_probes),
             });
         }
         fetch_segment_samples(&ranged_jobs, &mut segment_samples, &mut notes).await;
@@ -445,7 +466,7 @@ async fn collect_media_samples(
             } else {
                 MAX_DEEP_SEGMENT_SAMPLES_PER_PLAYLIST
             };
-            let codec = codec_hint_for_playlist(pl, &init_probes);
+            let hints = scan_hints_for_playlist(pl, &init_probes);
             for idx in stride_indices(pl.segments.len(), limit) {
                 let seg = &pl.segments[idx];
                 // Skip duplicates already sampled as iframe light probes.
@@ -459,7 +480,7 @@ async fn collect_media_samples(
                     duration: seg.duration,
                     range: seg.byterange.as_deref().and_then(parse_byterange),
                     is_iframe_playlist: pl.is_iframe,
-                    codec,
+                    hints,
                 });
             }
         }

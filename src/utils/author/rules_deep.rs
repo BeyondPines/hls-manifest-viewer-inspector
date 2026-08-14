@@ -4,7 +4,70 @@ use std::collections::HashMap;
 
 use super::context::{AuthoringContext, SegmentSample};
 use super::helpers::*;
+use crate::utils::mp4_probe::InitSegmentProbe;
 use crate::utils::validator::types::{Issue, MediaPlaylist, Severity};
+
+/// The track whose media timeline a playlist's segments carry. A segment can hold
+/// several tracks, and a timed-metadata one usually runs on its own timescale, so a
+/// decode time is only comparable to EXTINF once the right track is picked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimelineTrack {
+    Video,
+    Audio,
+}
+
+impl TimelineTrack {
+    fn for_playlist(is_video: bool, is_iframe: bool, is_audio: bool) -> Option<Self> {
+        if is_video || is_iframe {
+            Some(Self::Video)
+        } else if is_audio {
+            Some(Self::Audio)
+        } else {
+            None
+        }
+    }
+
+    fn tfdt(self, sample: &SegmentSample) -> Option<u64> {
+        match self {
+            Self::Video => sample.video_tfdt,
+            Self::Audio => sample.audio_tfdt,
+        }
+    }
+
+    fn timescale(self, probe: &InitSegmentProbe) -> Option<u32> {
+        match self {
+            Self::Video => probe.video_timescale(),
+            Self::Audio => probe.audio_timescale(),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Video => "video",
+            Self::Audio => "audio",
+        }
+    }
+}
+
+/// Playlist duration from the start of segment `first` to the start of segment `last`.
+///
+/// The sum comes from the playlist rather than from the sampled segments: deep samples
+/// stride across an asset, so adding their EXTINF values measures a handful of segments
+/// while a decode-time delta measures every segment between them.
+///
+/// `None` when the indices do not describe an uninterrupted span — EXT-X-DISCONTINUITY
+/// restarts the media timeline, which leaves the two sides of it incomparable.
+fn extinf_span(pl: &MediaPlaylist, first: usize, last: usize) -> Option<f64> {
+    if last <= first || last > pl.segments.len() {
+        return None;
+    }
+    let span = &pl.segments[first..last];
+    let resets = span.iter().skip(1).chain(pl.segments.get(last));
+    if resets.into_iter().any(|s| s.discontinuity) {
+        return None;
+    }
+    Some(span.iter().map(|s| s.duration).sum())
+}
 
 /// Measured bit rate over a set of sampled segments.
 #[derive(Debug, Clone, Copy, Default)]
@@ -400,35 +463,37 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             }
         }
 
-        // §7.3 / 7.1 — fMP4 tfdt continuity across contiguous samples
-        let tfdt_pairs: Vec<_> = samples
-            .iter()
-            .filter_map(|s| s.tfdt_base_media_decode_time.map(|t| (s, t)))
-            .collect();
-        for w in tfdt_pairs.windows(2) {
-            let (a, ta) = w[0];
-            let (b, tb) = w[1];
-            if b.segment_index != a.segment_index + 1 {
-                continue;
-            }
-            if tb < ta {
-                issues.push(author_error(
-                    "7.3",
-                    format!(
-                        "'{name}' tfdt decreased from {ta} to {tb} between segments {} and {}",
-                        a.segment_index, b.segment_index
-                    ),
-                ));
-                continue;
-            }
-            // Compare EXTINF ratio to tfdt delta ratio when 3+ points unavailable —
-            // with timescale from matching init, convert to seconds.
-            if let Some(scale) = ctx
+        // §7.3 / 7.1 / 8.1 — the media timeline against the playlist's own durations
+        let timeline = TimelineTrack::for_playlist(is_video, is_iframe, is_audio);
+        if let (Some(timeline), Some(pl)) = (timeline, pl) {
+            let scale = ctx
                 .probe_for_playlist(name)
-                .and_then(|e| e.probe.timescale.or(e.probe.movie_timescale))
-            {
+                .and_then(|e| timeline.timescale(&e.probe));
+            let points: Vec<_> = samples
+                .iter()
+                .filter_map(|s| timeline.tfdt(s).map(|t| (*s, t)))
+                .collect();
+
+            for w in points.windows(2) {
+                let (a, ta) = w[0];
+                let (b, tb) = w[1];
+                let Some(extinf) = extinf_span(pl, a.segment_index, b.segment_index) else {
+                    continue;
+                };
+                if tb < ta {
+                    issues.push(author_error(
+                        "7.3",
+                        format!(
+                            "'{name}' tfdt decreased from {ta} to {tb} between segments {} and {}",
+                            a.segment_index, b.segment_index
+                        ),
+                    ));
+                    continue;
+                }
+                let Some(scale) = scale else {
+                    continue;
+                };
                 let media_dur = (tb - ta) as f64 / scale as f64;
-                let extinf = a.extinf_s;
                 if extinf > 0.0 && (media_dur - extinf).abs() > 0.5 {
                     issues.push(author_warn(
                         "7.3",
@@ -439,39 +504,40 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
                     ));
                 }
             }
-        }
 
-        // §8.1 — sum EXTINF vs media timeline within ~1 frame
-        if let Some(scale) = ctx
-            .probe_for_playlist(name)
-            .and_then(|e| e.probe.timescale.or(e.probe.movie_timescale))
-        {
-            if let (Some(first), Some(last)) = (tfdt_pairs.first(), tfdt_pairs.last()) {
-                if last.0.segment_index > first.0.segment_index {
-                    let media_dur = (last.1 - first.1) as f64 / scale as f64;
-                    // Sum EXTINF of segments from first inclusive through last exclusive
-                    // (tfdt spans the media of intervening segments ending at last's start)
-                    let extinf_sum: f64 = samples
-                        .iter()
-                        .filter(|s| {
-                            s.segment_index >= first.0.segment_index
-                                && s.segment_index < last.0.segment_index
-                        })
-                        .map(|s| s.extinf_s)
-                        .sum();
-                    let frame = pl
-                        .and_then(|p| p.frame_rate)
-                        .map(|fps| 1.0 / fps)
-                        .unwrap_or(1.0 / 30.0);
-                    if extinf_sum > 0.0 && (extinf_sum - media_dur).abs() > frame + 0.001 {
-                        issues.push(author_error(
-                            "8.1",
-                            format!(
-                                "'{name}' EXTINF sum {extinf_sum:.3}s vs tfdt span {media_dur:.3}s exceeds one frame (~{frame:.3}s)",
-                            ),
-                        ));
+            // §8.1 — EXTINF durations MUST match the media timeline to within a frame
+            match (scale, points.first(), points.last()) {
+                (Some(scale), Some(&(first, first_tfdt)), Some(&(last, last_tfdt)))
+                    if last_tfdt >= first_tfdt =>
+                {
+                    if let Some(extinf_sum) =
+                        extinf_span(pl, first.segment_index, last.segment_index)
+                    {
+                        let media_dur = (last_tfdt - first_tfdt) as f64 / scale as f64;
+                        let frame = pl.frame_rate.map(|fps| 1.0 / fps).unwrap_or(1.0 / 30.0);
+                        if extinf_sum > 0.0 && (extinf_sum - media_dur).abs() > frame + 0.001 {
+                            issues.push(author_error(
+                                "8.1",
+                                format!(
+                                    "'{name}' EXTINF total {extinf_sum:.3}s from segment #{} up to #{} vs {} tfdt span {media_dur:.3}s — more than one frame (~{frame:.3}s) apart",
+                                    first.segment_index,
+                                    last.segment_index,
+                                    timeline.as_str(),
+                                ),
+                            ));
+                        }
                     }
                 }
+                // Decode times were read but the track they belong to has no timescale,
+                // so the media timeline cannot be turned into seconds to compare.
+                (None, Some(_), _) => issues.push(author_info(
+                    "8.1",
+                    format!(
+                        "'{name}' EXTINF durations were not checked against the media timeline — no {} track timescale in the init segment",
+                        timeline.as_str(),
+                    ),
+                )),
+                _ => {}
             }
         }
 

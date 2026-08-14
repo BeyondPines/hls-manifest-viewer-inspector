@@ -51,7 +51,12 @@ pub struct SegmentSample {
     pub idr_at_start: bool,
     pub idr_count: usize,
     pub has_tfdt: bool,
-    pub tfdt_base_media_decode_time: Option<u64>,
+    /// Decode times of the video and audio fragments, when the matching init named
+    /// those tracks. A rule comparing a playlist's EXTINF against a media timeline
+    /// has to use the track that playlist carries — a segment's first `traf` is
+    /// often timed metadata running on a timescale of its own.
+    pub video_tfdt: Option<u64>,
+    pub audio_tfdt: Option<u64>,
     pub has_senc: bool,
     pub has_saiz: bool,
     pub has_saio: bool,
@@ -84,7 +89,8 @@ impl SegmentSample {
             idr_at_start: scan.idr_at_start,
             idr_count: scan.idr_count,
             has_tfdt: scan.has_tfdt,
-            tfdt_base_media_decode_time: scan.tfdt_base_media_decode_time,
+            video_tfdt: scan.video_tfdt,
+            audio_tfdt: scan.audio_tfdt,
             has_senc: scan.has_senc,
             has_saiz: scan.has_saiz,
             has_saio: scan.has_saio,

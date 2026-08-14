@@ -347,7 +347,8 @@ https://example.com/v.m3u8
                 idr_at_start: true,
                 idr_count: 1,
                 has_tfdt: true,
-                tfdt_base_media_decode_time: Some(0),
+                video_tfdt: Some(0),
+                audio_tfdt: None,
                 looks_like_ts: false,
                 has_senc: false,
                 has_saiz: false,
@@ -369,7 +370,8 @@ https://example.com/v.m3u8
                 idr_at_start: true,
                 idr_count: 1,
                 has_tfdt: true,
-                tfdt_base_media_decode_time: Some(60_000),
+                video_tfdt: Some(60_000),
+                audio_tfdt: None,
                 looks_like_ts: false,
                 has_senc: false,
                 has_saiz: false,
@@ -803,6 +805,223 @@ https://example.com/v.m3u8
         assert!(
             issues.iter().any(|i| i.message.contains("encrypted")),
             "expected an informational note about encryption, got: {:?}",
+            issues.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A VOD video ladder for the media-timeline rules.
+    struct Timeline {
+        /// Segments in the playlist, each two seconds long.
+        segments: usize,
+        /// Segment indices the deep pass sampled.
+        sampled: Vec<usize>,
+        /// `mdhd` timescale of the init's video track.
+        video_timescale: Option<u32>,
+        /// Segment carrying EXT-X-DISCONTINUITY, if any.
+        discontinuity_at: Option<usize>,
+    }
+
+    impl Timeline {
+        /// 14 two-second segments read at four points, on a 600 Hz video track.
+        fn strided() -> Self {
+            Self {
+                segments: 14,
+                sampled: vec![0, 4, 9, 13],
+                video_timescale: Some(600),
+                discontinuity_at: None,
+            }
+        }
+    }
+
+    /// Run the deep rules over `timeline`, with each sample's video decode time coming
+    /// from `tfdt_of`. The init puts a 90 kHz timed-metadata track ahead of the video
+    /// track, which is the layout that made the media timeline unreadable.
+    fn timeline_issues(timeline: Timeline, tfdt_of: impl Fn(usize) -> u64) -> Vec<Issue> {
+        use crate::utils::mp4_probe::{InitSegmentProbe, SegmentScan, TrackProbe};
+        let Timeline {
+            segments: segment_count,
+            sampled,
+            video_timescale,
+            discontinuity_at,
+        } = timeline;
+        let master = master_from(
+            r#"#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,AVERAGE-BANDWIDTH=800000,RESOLUTION=1280x720,CODECS="hvc1.1.6.L93.B0",FRAME-RATE=30
+https://example.com/v.m3u8
+"#,
+        );
+        let mut video = demuxed_video_playlist(segment_count);
+        video.audio_group = None;
+        video.frame_rate = Some(30.0);
+        if let Some(at) = discontinuity_at {
+            video.segments[at].discontinuity = true;
+        }
+        let segs: Vec<SegmentSample> = sampled
+            .iter()
+            .map(|&i| {
+                sample(
+                    &video.name,
+                    i,
+                    2.0,
+                    200_000,
+                    SegmentScan {
+                        looks_like_fmp4: true,
+                        has_moof: true,
+                        has_tfdt: true,
+                        has_idr_nal_hint: true,
+                        idr_at_start: true,
+                        idr_count: 1,
+                        nal_scan_scoped_to_video: true,
+                        video_tfdt: Some(tfdt_of(i)),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let inits = vec![InitProbeEntry {
+            uri: "https://example.com/v-init.mp4".into(),
+            byterange: None,
+            playlist_names: vec![video.name.clone()],
+            media_types: vec!["VIDEO".into()],
+            probe: InitSegmentProbe {
+                major_brand: Some("iso6".into()),
+                compatible_brands: vec!["cmfc".into()],
+                video_sample_fourcc: Some("hvc1".into()),
+                timescale: video_timescale,
+                tracks: vec![
+                    TrackProbe {
+                        track_id: Some(1),
+                        handler: Some("meta".into()),
+                        timescale: Some(90_000),
+                        sample_fourcc: None,
+                    },
+                    TrackProbe {
+                        track_id: Some(2),
+                        handler: Some("vide".into()),
+                        timescale: video_timescale,
+                        sample_fourcc: Some("hvc1".into()),
+                    },
+                ],
+                ..Default::default()
+            },
+        }];
+        let playlists = vec![video];
+        let opts = deep_opts();
+        let vtts = Vec::new();
+        let ctx = AuthoringContext::new(Some(&master), &playlists, &opts, &inits, &segs, &vtts);
+        run_authoring_checks(&ctx)
+            .into_iter()
+            .filter(|i| i.message.contains("§8.1") || i.message.contains("§7.3"))
+            .collect()
+    }
+
+    /// 14 two-second segments read from four of them. Adding the sampled EXTINF
+    /// values gives 6s against a 26s decode-time span, which used to be reported as
+    /// a §8.1 violation of a perfectly conforming playlist.
+    #[test]
+    fn author_8_1_accepts_a_sparse_sample_of_an_exact_timeline() {
+        let issues = timeline_issues(Timeline::strided(), |i| i as u64 * 1_200);
+        assert!(
+            issues.is_empty(),
+            "an exact timeline must not be flagged, got: {:?}",
+            issues.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn author_8_1_flags_a_media_timeline_longer_than_the_extinf_durations() {
+        let issues = timeline_issues(Timeline::strided(), |i| {
+            i as u64 * 1_200 + if i == 13 { 600 } else { 0 }
+        });
+        let found = issues
+            .iter()
+            .find(|i| i.message.contains("§8.1"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a §8.1 error, got: {:?}",
+                    issues.iter().map(|i| &i.message).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(found.severity, Severity::Error);
+        assert!(
+            found.message.contains("26.000s") && found.message.contains("27.000s"),
+            "expected both durations in the message, got: {}",
+            found.message
+        );
+        assert!(
+            found.message.contains("#0") && found.message.contains("#13"),
+            "expected the segment range in the message, got: {}",
+            found.message
+        );
+    }
+
+    /// The metadata track's 90 kHz timescale is not the video track's, so an init
+    /// that never names a video timescale leaves §8.1 unmeasurable rather than wrong.
+    #[test]
+    fn author_8_1_is_informational_without_a_video_track_timescale() {
+        let issues = timeline_issues(
+            Timeline {
+                video_timescale: None,
+                ..Timeline::strided()
+            },
+            |i| i as u64 * 1_200,
+        );
+        assert!(
+            issues.iter().all(|i| i.severity == Severity::Info),
+            "a missing timescale must not fail the stream, got: {:?}",
+            issues
+                .iter()
+                .map(|i| (i.severity, &i.message))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.message.contains("§8.1") && i.message.contains("video track timescale")),
+            "expected a §8.1 note about the missing timescale, got: {:?}",
+            issues.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// §7.3 compares a pair of samples against every segment between them, so a gap
+    /// in the middle of a strided sample is still attributed to the pair that spans it.
+    #[test]
+    fn author_7_3_flags_drift_between_non_adjacent_samples() {
+        let issues = timeline_issues(Timeline::strided(), |i| {
+            i as u64 * 1_200 + if i >= 9 { 1_200 } else { 0 }
+        });
+        let found = issues
+            .iter()
+            .find(|i| i.message.contains("§7.3"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a §7.3 warning, got: {:?}",
+                    issues.iter().map(|i| &i.message).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(found.severity, Severity::Warn);
+        assert!(
+            found.message.contains("4→9"),
+            "expected the drifting pair in the message, got: {}",
+            found.message
+        );
+    }
+
+    /// A discontinuity restarts the media timeline, so decode times either side of
+    /// one cannot be held against the EXTINF durations that span it.
+    #[test]
+    fn timeline_checks_stop_at_a_discontinuity() {
+        let issues = timeline_issues(
+            Timeline {
+                discontinuity_at: Some(9),
+                ..Timeline::strided()
+            },
+            // The tag at #9 restarts decode time from zero.
+            |i| if i < 9 { i } else { i - 9 } as u64 * 1_200,
+        );
+        assert!(
+            issues.is_empty(),
+            "a restarted timeline is not drift, got: {:?}",
             issues.iter().map(|i| &i.message).collect::<Vec<_>>()
         );
     }
