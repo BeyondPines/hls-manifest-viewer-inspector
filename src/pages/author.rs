@@ -207,6 +207,7 @@ fn AuthorCheckTable(groups: Vec<CheckGroup>) -> impl IntoView {
                     let (pill_color, pill_bg, pill_border, pill_label) = match g.status.as_str() {
                         "FAIL" => ("#ef4444", "rgba(239,68,68,.15)", "rgba(239,68,68,.3)", "✗ FAIL"),
                         "WARN" => ("#f59e0b", "rgba(245,158,11,.15)", "rgba(245,158,11,.3)", "⚠ WARN"),
+                        "INFO" => ("#38bdf8", "rgba(56,189,248,.15)", "rgba(56,189,248,.3)", "ℹ INFO"),
                         _ => ("#22c55e", "rgba(34,197,94,.15)", "rgba(34,197,94,.3)", "✓ PASS"),
                     };
                     let (expanded, set_expanded) = signal(false);

@@ -185,8 +185,20 @@ pub struct MediaPlaylist {
     pub pathway_id: Option<String>,
     /// HTTP response metadata from the playlist fetch
     pub http_meta: PlaylistHttpMeta,
-    /// BYTERANGE from the most recent EXT-X-MAP (for init probing)
-    pub map_byterange: Option<String>,
+    /// Distinct EXT-X-MAP tags in playlist order (for init probing).
+    pub init_maps: Vec<InitMap>,
+}
+
+/// One EXT-X-MAP tag: the URI and BYTERANGE that were written together.
+///
+/// The URI is stored **raw** (as written in the playlist) because it may contain
+/// `{$VAR}` references; callers must substitute EXT-X-DEFINE variables and resolve
+/// against the playlist URL before fetching (see
+/// [`crate::utils::validator::absolute_fetch_uri`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitMap {
+    pub uri: String,
+    pub byterange: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -248,7 +260,7 @@ impl MediaPlaylist {
             req_video_layout: None,
             pathway_id: None,
             http_meta: PlaylistHttpMeta::default(),
-            map_byterange: None,
+            init_maps: Vec::new(),
         }
     }
 }

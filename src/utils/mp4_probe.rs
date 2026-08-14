@@ -22,12 +22,20 @@ pub struct InitSegmentProbe {
     pub has_saiz: bool,
     pub has_saio: bool,
     pub has_vexu: bool,
+    /// `lhvC` layered-HEVC configuration, which is how MV-HEVC is signaled (§1.36).
+    pub has_lhvc: bool,
     pub has_tenc: bool,
+    /// True when a `tenc` was parsed inside a video track (`vide` handler).
+    pub has_video_tenc: bool,
     /// CENC scheme_type from `schm` (e.g. "cenc", "cbcs").
     pub scheme_type: Option<String>,
-    /// From `tenc` version ≥1 pattern encryption fields.
+    /// From `tenc` version ≥1 pattern encryption fields (last track seen).
     pub crypt_byte_block: Option<u8>,
     pub skip_byte_block: Option<u8>,
+    /// Same fields, but only from the video track — the 1:9 `cbcs` pattern
+    /// requirement applies to video, while audio is commonly encrypted without one.
+    pub video_crypt_byte_block: Option<u8>,
+    pub video_skip_byte_block: Option<u8>,
     /// HDR10 static metadata boxes / SEI containers often signaled near hvcC.
     pub has_mdcv: bool,
     pub has_clli: bool,
@@ -86,6 +94,7 @@ pub fn probe_init_segment(data: &[u8]) -> InitSegmentProbe {
             "saiz" => info.has_saiz = true,
             "saio" => info.has_saio = true,
             "vexu" => info.has_vexu = true,
+            "lhvC" => info.has_lhvc = true,
             "tenc" => info.has_tenc = true,
             "mdcv" => info.has_mdcv = true,
             "clli" => info.has_clli = true,
@@ -155,8 +164,8 @@ pub fn probe_init_segment(data: &[u8]) -> InitSegmentProbe {
                 info.movie_timescale = get("timescale").and_then(|s| s.parse().ok());
             }
             "AVCConfigurationBox" if info.video_profile.is_none() => {
-                info.video_profile = get("profile");
-                info.video_level = get("level");
+                info.video_profile = get("avc_profile_indication");
+                info.video_level = get("avc_level_indication");
             }
             "HEVCConfigurationBox" if info.video_profile.is_none() => {
                 info.video_profile = get("general_profile_idc").or_else(|| get("profile"));
@@ -170,6 +179,11 @@ pub fn probe_init_segment(data: &[u8]) -> InitSegmentProbe {
                 }
                 if let Some(s) = get("default_skip_byte_block") {
                     info.skip_byte_block = s.split_whitespace().next().and_then(|x| x.parse().ok());
+                }
+                if in_video {
+                    info.has_video_tenc = true;
+                    info.video_crypt_byte_block = info.crypt_byte_block;
+                    info.video_skip_byte_block = info.skip_byte_block;
                 }
             }
             "SchemeTypeBox" if info.scheme_type.is_none() => {
@@ -245,8 +259,45 @@ impl InitSegmentProbe {
     }
 }
 
+/// Which video codec's NAL syntax should be trusted while scanning a segment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VideoCodecHint {
+    /// Codec unknown — both H.264 and HEVC NAL types are checked, which can
+    /// over-count (an H.264 SPS header reads as an HEVC IDR NAL type).
+    #[default]
+    Unknown,
+    Avc,
+    Hevc,
+}
+
+impl VideoCodecHint {
+    /// Derive from a CODECS token or an fMP4 sample-entry fourCC.
+    pub fn from_codec_str(s: &str) -> Self {
+        let s = s.trim().to_ascii_lowercase();
+        if s.starts_with("avc1") || s.starts_with("avc3") {
+            Self::Avc
+        } else if s.starts_with("hvc1")
+            || s.starts_with("hev1")
+            || s.starts_with("dvh1")
+            || s.starts_with("dvhe")
+        {
+            Self::Hevc
+        } else {
+            Self::Unknown
+        }
+    }
+
+    fn checks_avc(self) -> bool {
+        matches!(self, Self::Avc | Self::Unknown)
+    }
+
+    fn checks_hevc(self) -> bool {
+        matches!(self, Self::Hevc | Self::Unknown)
+    }
+}
+
 /// Best-effort scan of a media segment for Author Phase B/C flags.
-pub fn scan_segment_bytes(data: &[u8]) -> SegmentScan {
+pub fn scan_segment_bytes(data: &[u8], codec: VideoCodecHint) -> SegmentScan {
     use std::collections::HashMap;
 
     let mut scan = SegmentScan::default();
@@ -278,21 +329,28 @@ pub fn scan_segment_bytes(data: &[u8]) -> SegmentScan {
             offset += 188;
         }
         scan.ts_continuity_ok = Some(cc_ok);
-        scan_nal_hints(data, &mut scan);
+        scan_nal_hints(data, &mut scan, codec);
         return scan;
     }
 
     // ISOBMFF: size-based box walk with recursion into containers that hold tfdt/mdat.
-    walk_boxes(data, 0, data.len(), &mut scan, 0);
+    walk_boxes(data, 0, data.len(), &mut scan, 0, codec);
 
     if scan.looks_like_fmp4 && !scan.has_idr_nal_hint {
-        scan_nal_hints(data, &mut scan);
+        scan_nal_hints(data, &mut scan, codec);
     }
 
     scan
 }
 
-fn walk_boxes(data: &[u8], start: usize, end: usize, scan: &mut SegmentScan, depth: usize) {
+fn walk_boxes(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    scan: &mut SegmentScan,
+    depth: usize,
+    codec: VideoCodecHint,
+) {
     if depth > 12 {
         return;
     }
@@ -332,14 +390,14 @@ fn walk_boxes(data: &[u8], start: usize, end: usize, scan: &mut SegmentScan, dep
             b"moof" => {
                 scan.looks_like_fmp4 = true;
                 scan.has_moof = true;
-                walk_boxes(data, body_start, body_end, scan, depth + 1);
+                walk_boxes(data, body_start, body_end, scan, depth + 1, codec);
             }
             b"traf" | b"trak" | b"mdia" | b"minf" | b"stbl" => {
-                walk_boxes(data, body_start, body_end, scan, depth + 1);
+                walk_boxes(data, body_start, body_end, scan, depth + 1, codec);
             }
             b"mdat" => {
                 scan.looks_like_fmp4 = true;
-                scan_nal_hints(&data[body_start..body_end], scan);
+                scan_nal_hints(&data[body_start..body_end], scan, codec);
             }
             b"senc" => scan.has_senc = true,
             b"saiz" => scan.has_saiz = true,
@@ -377,95 +435,96 @@ fn walk_boxes(data: &[u8], start: usize, end: usize, scan: &mut SegmentScan, dep
     }
 }
 
-fn scan_nal_hints(data: &[u8], scan: &mut SegmentScan) {
-    let early_limit = data.len().min(256 * 1024);
-    let early = &data[..early_limit];
+/// Soft cap on bytes scanned per payload; only pathological segments are truncated,
+/// in which case the IDR count under-reports (§1.13 estimates read as conservative).
+const MAX_NAL_SCAN_BYTES: usize = 8 * 1024 * 1024;
 
-    let mut idr_positions: Vec<usize> = Vec::new();
+fn scan_nal_hints(data: &[u8], scan: &mut SegmentScan, codec: VideoCodecHint) {
+    let buf = &data[..data.len().min(MAX_NAL_SCAN_BYTES)];
+
+    // Offsets of the NAL header byte, so the Annex-B and length-prefixed passes
+    // agree on a position for the same NAL and can be deduped.
+    let mut idr_offsets: Vec<usize> = Vec::new();
+
+    // Annex-B start codes (MPEG-TS, and some fMP4 payloads).
     let mut i = 0usize;
-    while i + 4 < early.len() {
-        let (sc_len, nal_off) = if early[i] == 0 && early[i + 1] == 0 && early[i + 2] == 1 {
+    while i + 4 < buf.len() {
+        let (sc_len, nal_off) = if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
             (3usize, i + 3)
-        } else if i + 4 < early.len()
-            && early[i] == 0
-            && early[i + 1] == 0
-            && early[i + 2] == 0
-            && early[i + 3] == 1
-        {
+        } else if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1 {
             (4usize, i + 4)
         } else {
             i += 1;
             continue;
         };
-        if nal_off >= early.len() {
-            break;
-        }
-        let b0 = early[nal_off];
-        let h264_type = b0 & 0x1f;
-        if h264_type == 5 {
-            idr_positions.push(i);
-            scan.has_idr_nal_hint = true;
-        }
-        if h264_type == 6 {
-            let sei_end = (nal_off + 64).min(early.len());
-            let sei = &early[nal_off..sei_end];
-            if sei.windows(4).any(|w| w == b"GA94") {
-                scan.has_cc_sei_hint = true;
-            }
-        }
-        let hevc_type = (b0 >> 1) & 0x3f;
-        if hevc_type == 19 || hevc_type == 20 {
-            idr_positions.push(i);
-            scan.has_idr_nal_hint = true;
-        }
+        classify_nal(buf, nal_off, codec, &mut idr_offsets, scan);
         i += sc_len;
     }
 
-    // Length-prefixed NALs (common in fMP4 mdat)
-    if !scan.has_idr_nal_hint {
-        let mut off = 0usize;
-        while off + 4 < early.len() {
-            let nalu_len =
-                u32::from_be_bytes([early[off], early[off + 1], early[off + 2], early[off + 3]])
-                    as usize;
-            if nalu_len == 0 || nalu_len > early.len().saturating_sub(off + 4) || nalu_len > 8_000_000
-            {
-                off += 1;
-                continue;
-            }
-            let nal_off = off + 4;
-            let b0 = early[nal_off];
-            let h264_type = b0 & 0x1f;
-            if h264_type == 5 {
-                idr_positions.push(off);
-                scan.has_idr_nal_hint = true;
-            }
-            if h264_type == 6 {
-                let sei_end = (nal_off + 64).min(early.len());
-                let sei = &early[nal_off..sei_end];
-                if sei.windows(4).any(|w| w == b"GA94") {
-                    scan.has_cc_sei_hint = true;
-                }
-            }
-            let hevc_type = (b0 >> 1) & 0x3f;
-            if hevc_type == 19 || hevc_type == 20 {
-                idr_positions.push(off);
-                scan.has_idr_nal_hint = true;
-            }
-            off += 4 + nalu_len;
+    // Length-prefixed NALs (common in fMP4 mdat). The walk must stay aligned from
+    // offset 0: a bad length means the payload is not length-prefixed, so we stop
+    // instead of resynchronising, which would invent NAL headers in Annex-B/TS data.
+    let mut off = 0usize;
+    while off + 4 < buf.len() {
+        let nalu_len =
+            u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
+        if nalu_len == 0 || nalu_len > buf.len() - (off + 4) {
+            break;
         }
+        classify_nal(buf, off + 4, codec, &mut idr_offsets, scan);
+        off += 4 + nalu_len;
     }
 
-    if !idr_positions.is_empty() {
-        scan.idr_count = scan.idr_count.max(idr_positions.len());
+    idr_offsets.sort_unstable();
+    idr_offsets.dedup();
+    if let Some(&first) = idr_offsets.first() {
+        scan.idr_count += idr_offsets.len();
         if !scan.idr_at_start {
-            scan.idr_at_start = idr_positions.first().is_some_and(|&p| p < 8 * 1024);
+            scan.idr_at_start = first < 8 * 1024;
         }
     }
 
-    if early.windows(4).any(|w| w == b"asp ") {
+    if buf.windows(4).any(|w| w == b"asp ") {
         scan.has_asp_hint = true;
     }
+}
+
+/// Inspect the NAL header at `nal_off`, recording IDR offsets and CEA-608/708 SEI hints.
+fn classify_nal(
+    buf: &[u8],
+    nal_off: usize,
+    codec: VideoCodecHint,
+    idr_offsets: &mut Vec<usize>,
+    scan: &mut SegmentScan,
+) {
+    let Some(&b0) = buf.get(nal_off) else {
+        return;
+    };
+    if codec.checks_avc() {
+        match b0 & 0x1f {
+            5 => {
+                idr_offsets.push(nal_off);
+                scan.has_idr_nal_hint = true;
+            }
+            6 if has_ga94_payload(buf, nal_off) => scan.has_cc_sei_hint = true,
+            _ => {}
+        }
+    }
+    if codec.checks_hevc() {
+        match (b0 >> 1) & 0x3f {
+            19 | 20 => {
+                idr_offsets.push(nal_off);
+                scan.has_idr_nal_hint = true;
+            }
+            39 if has_ga94_payload(buf, nal_off) => scan.has_cc_sei_hint = true,
+            _ => {}
+        }
+    }
+}
+
+fn has_ga94_payload(buf: &[u8], nal_off: usize) -> bool {
+    let end = (nal_off + 64).min(buf.len());
+    buf[nal_off..end].windows(4).any(|w| w == b"GA94")
 }
 
 #[derive(Debug, Clone, Default)]
@@ -505,7 +564,69 @@ mod tests {
     fn scan_ts_sync() {
         let mut data = vec![0u8; 188];
         data[0] = 0x47;
-        let s = scan_segment_bytes(&data);
+        let s = scan_segment_bytes(&data, VideoCodecHint::Unknown);
         assert!(s.looks_like_ts);
+    }
+
+    /// Length-prefixed NAL of `nal_header` padded to `payload_len` bytes.
+    fn length_prefixed_nal(nal_header: u8, payload_len: usize) -> Vec<u8> {
+        let mut out = (payload_len as u32).to_be_bytes().to_vec();
+        out.push(nal_header);
+        out.resize(4 + payload_len, 0);
+        out
+    }
+
+    fn mdat(payload: &[u8]) -> Vec<u8> {
+        let mut out = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(b"mdat");
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn idr_count_accumulates_across_mdat_boxes() {
+        let mut data = mdat(&length_prefixed_nal(0x65, 32));
+        data.extend(mdat(&length_prefixed_nal(0x65, 32)));
+        let s = scan_segment_bytes(&data, VideoCodecHint::Avc);
+        assert!(s.has_idr_nal_hint);
+        assert_eq!(s.idr_count, 2);
+    }
+
+    #[test]
+    fn avc_sps_is_not_counted_as_idr() {
+        // 0x27 is an H.264 SPS, but reads as HEVC NAL type 19 (IDR_W_RADL).
+        let data = mdat(&length_prefixed_nal(0x27, 32));
+        let avc = scan_segment_bytes(&data, VideoCodecHint::Avc);
+        assert!(!avc.has_idr_nal_hint);
+        assert_eq!(avc.idr_count, 0);
+
+        let unknown = scan_segment_bytes(&data, VideoCodecHint::Unknown);
+        assert!(unknown.has_idr_nal_hint);
+    }
+
+    #[test]
+    fn annex_b_and_length_prefixed_idr_deduped() {
+        // A 4-byte start code also parses as a length prefix of 1, so both passes
+        // see the same NAL header and must count it once.
+        let mut payload = vec![0u8, 0, 0, 1, 0x65];
+        payload.resize(64, 0);
+        let s = scan_segment_bytes(&mdat(&payload), VideoCodecHint::Avc);
+        assert_eq!(s.idr_count, 1);
+    }
+
+    #[test]
+    fn codec_hint_from_codec_str() {
+        assert_eq!(
+            VideoCodecHint::from_codec_str("avc1.640028"),
+            VideoCodecHint::Avc
+        );
+        assert_eq!(
+            VideoCodecHint::from_codec_str("hvc1.2.4.L153.B0"),
+            VideoCodecHint::Hevc
+        );
+        assert_eq!(
+            VideoCodecHint::from_codec_str("mp4a.40.2"),
+            VideoCodecHint::Unknown
+        );
     }
 }

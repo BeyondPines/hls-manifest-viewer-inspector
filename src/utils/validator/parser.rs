@@ -234,8 +234,17 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
         } else if let Some(rest) = line.strip_prefix("#EXT-X-MAP:") {
             let attrs = parse_attributes(rest);
             current_map_uri = attrs.get("URI").map(|u| resolve_url(url, u));
-            // Store last MAP byterange on the playlist for init probing
-            pl.map_byterange = attrs.get("BYTERANGE").cloned();
+            if let Some(uri) = attrs.get("URI") {
+                // Keep URI and BYTERANGE together and unresolved, so init probing can
+                // substitute EXT-X-DEFINE variables and fetch the right bytes.
+                let map = InitMap {
+                    uri: uri.clone(),
+                    byterange: attrs.get("BYTERANGE").cloned(),
+                };
+                if !pl.init_maps.contains(&map) {
+                    pl.init_maps.push(map);
+                }
+            }
         } else if let Some(rest) = line.strip_prefix("#EXT-X-KEY:") {
             let attrs = parse_attributes(rest);
             if let Some(method) = attrs.get("METHOD") {
@@ -505,6 +514,58 @@ mod tests {
         assert_eq!(
             master.media_renditions[0].uri.as_deref(),
             Some("audio/en.m3u8")
+        );
+    }
+
+    // ── parse_media_playlist EXT-X-MAP ────────────────────────────────────────
+
+    #[test]
+    fn parse_media_keeps_each_map_uri_with_its_own_byterange() {
+        let mut pl = MediaPlaylist::new("v1".to_string(), String::new());
+        parse_media_playlist(
+            "https://ex.com/hls/prog.m3u8",
+            "#EXTM3U\n\
+             #EXT-X-MAP:URI=\"{$base}/init_a.mp4\",BYTERANGE=\"800@0\"\n\
+             #EXTINF:4.0,\nseg1.m4s\n\
+             #EXT-X-DISCONTINUITY\n\
+             #EXT-X-MAP:URI=\"init_b.mp4\",BYTERANGE=\"1200@5000\"\n\
+             #EXTINF:4.0,\nseg2.m4s\n",
+            &mut pl,
+        );
+        assert_eq!(
+            pl.init_maps,
+            vec![
+                InitMap {
+                    // Kept raw so the {$base} variable can still be substituted.
+                    uri: "{$base}/init_a.mp4".to_string(),
+                    byterange: Some("800@0".to_string()),
+                },
+                InitMap {
+                    uri: "init_b.mp4".to_string(),
+                    byterange: Some("1200@5000".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_media_records_a_repeated_map_once() {
+        let mut pl = MediaPlaylist::new("v1".to_string(), String::new());
+        parse_media_playlist(
+            "https://ex.com/hls/prog.m3u8",
+            "#EXTM3U\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXTINF:4.0,\nseg1.m4s\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXTINF:4.0,\nseg2.m4s\n",
+            &mut pl,
+        );
+        assert_eq!(
+            pl.init_maps,
+            vec![InitMap {
+                uri: "init.mp4".to_string(),
+                byterange: None
+            }]
         );
     }
 

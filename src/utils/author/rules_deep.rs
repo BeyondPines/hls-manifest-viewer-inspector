@@ -2,9 +2,172 @@
 
 use std::collections::HashMap;
 
-use super::context::AuthoringContext;
+use super::context::{AuthoringContext, SegmentSample};
 use super::helpers::*;
-use crate::utils::validator::types::{Issue, Severity};
+use crate::utils::validator::types::{Issue, MediaPlaylist, Severity};
+
+/// Measured bit rate over a set of sampled segments.
+#[derive(Debug, Clone, Copy, Default)]
+struct MeasuredRate {
+    avg: f64,
+    peak: f64,
+    duration: f64,
+}
+
+fn measure(samples: &[&SegmentSample]) -> MeasuredRate {
+    let bytes: usize = samples.iter().map(|s| s.bytes).sum();
+    let duration: f64 = samples.iter().map(|s| s.extinf_s).sum();
+    if duration <= 0.0 {
+        return MeasuredRate::default();
+    }
+    MeasuredRate {
+        avg: (bytes as f64 * 8.0) / duration,
+        peak: samples
+            .iter()
+            .filter(|s| s.extinf_s > 0.0)
+            .map(|s| (s.bytes as f64 * 8.0) / s.extinf_s)
+            .fold(0.0_f64, f64::max),
+        duration,
+    }
+}
+
+/// Which part of a playlist a deep sample covers.
+struct SampleWindow {
+    sampled: usize,
+    total: usize,
+    first: usize,
+    last: usize,
+}
+
+/// Deviation wide enough to blame on the declaration rather than on sampling variance.
+const GROSS_RATE_DEVIATION: f64 = 0.50;
+
+impl SampleWindow {
+    fn new(samples: &[&SegmentSample], total: usize) -> Self {
+        Self {
+            sampled: samples.len(),
+            total,
+            first: samples.first().map(|s| s.segment_index).unwrap_or(0),
+            last: samples.last().map(|s| s.segment_index).unwrap_or(0),
+        }
+    }
+
+    /// Most of the playlist was actually measured.
+    fn covers_playlist(&self) -> bool {
+        self.total == 0 || self.sampled * 2 >= self.total
+    }
+
+    /// Samples stride across the asset instead of clustering at its start.
+    fn spans_playlist(&self) -> bool {
+        self.total == 0 || (self.last + 1 - self.first) * 2 >= self.total
+    }
+
+    fn describe(&self) -> String {
+        if self.total == 0 || self.sampled >= self.total {
+            format!(" (sampled {} segment(s))", self.sampled)
+        } else {
+            format!(
+                " (sampled {} of {} segments, #{}–#{})",
+                self.sampled, self.total, self.first, self.last
+            )
+        }
+    }
+}
+
+/// A declared rate can only be called wrong when the sample stands in for the asset: a short
+/// prefix, or a measurement missing the audio it is played with, is reported as a warning.
+fn rate_severity(window: &SampleWindow, audio_accounted: bool, deviation: f64) -> Severity {
+    if !audio_accounted {
+        Severity::Warn
+    } else if window.covers_playlist()
+        || (window.spans_playlist() && deviation > GROSS_RATE_DEVIATION)
+    {
+        Severity::Error
+    } else {
+        Severity::Warn
+    }
+}
+
+/// The audio a variant is played with, which STREAM-INF BANDWIDTH has to cover.
+enum AudioContribution {
+    /// The variant's own segments already carry audio, or it declares no audio group.
+    Muxed,
+    /// Measured average rate of the audio rendition this variant would be played with.
+    Measured { playlist: String, avg: f64 },
+    /// Audio could not be added, for the given reason — the measurement is video-only.
+    Unmeasured(&'static str),
+}
+
+impl AudioContribution {
+    /// Audio bit rate to add to the video measurement. Audio is near-constant-rate, so its
+    /// average also stands in for its share of the combination's peak.
+    fn addend(&self) -> f64 {
+        match self {
+            Self::Measured { avg, .. } => *avg,
+            _ => 0.0,
+        }
+    }
+
+    fn is_accounted(&self) -> bool {
+        !matches!(self, Self::Unmeasured(_))
+    }
+
+    fn note(&self) -> String {
+        match self {
+            Self::Muxed => String::new(),
+            Self::Measured { playlist, avg } => {
+                format!(", including audio '{playlist}' at ~{avg:.0} bps")
+            }
+            Self::Unmeasured(reason) => format!(", video only — {reason}"),
+        }
+    }
+}
+
+/// BANDWIDTH describes the playable combination, so a demuxed variant's measured video rate
+/// has to gain the rate of the audio rendition it is played with.
+fn audio_contribution(ctx: &AuthoringContext<'_>, pl: &MediaPlaylist) -> AudioContribution {
+    // No AUDIO group means the variant is self-contained (muxed TS, or a video-only ladder).
+    let Some(group) = pl.audio_group.as_deref() else {
+        return AudioContribution::Muxed;
+    };
+    // Only an init showing a video track and no audio track proves the variant's own segments
+    // are video-only: a variant carrying muxed audio can declare an AUDIO group as well, and
+    // adding a rendition's audio on top of that would overstate its rate.
+    match ctx.probe_for_playlist(&pl.name).map(|e| &e.probe) {
+        Some(probe)
+            if probe.video_sample_fourcc.is_some() && probe.audio_sample_fourcc.is_none() => {}
+        Some(_) => return AudioContribution::Muxed,
+        None => {
+            return AudioContribution::Unmeasured(
+                "the variant's segments could not be confirmed as video-only",
+            )
+        }
+    }
+    let in_group: Vec<&MediaPlaylist> = ctx
+        .audio_playlists()
+        .filter(|a| a.group_id.as_deref() == Some(group))
+        .collect();
+    let candidates = if in_group.is_empty() {
+        ctx.audio_playlists().collect()
+    } else {
+        in_group
+    };
+    for audio in candidates {
+        let samples: Vec<&SegmentSample> = ctx
+            .segment_samples
+            .iter()
+            .filter(|s| s.playlist_name == audio.name)
+            .collect();
+        let rate = measure(&samples);
+        if rate.duration > 0.0 {
+            return AudioContribution::Measured {
+                playlist: audio.name.clone(),
+                avg: rate.avg,
+            };
+        }
+    }
+    AudioContribution::Unmeasured("no audio segments were sampled for the variant's AUDIO group")
+}
 
 pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
     let mut issues = Vec::new();
@@ -37,41 +200,44 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         let is_video = pl.is_some_and(|p| p.media_type == "VIDEO" && !p.is_iframe);
         let is_audio = pl.is_some_and(|p| p.media_type == "AUDIO");
 
-        let total_bytes: usize = samples.iter().map(|s| s.bytes).sum();
-        let total_dur: f64 = samples.iter().map(|s| s.extinf_s).sum();
-        if total_dur <= 0.0 {
+        let rate = measure(&samples);
+        if rate.duration <= 0.0 {
             continue;
         }
-        let measured_avg = (total_bytes as f64 * 8.0) / total_dur;
-        let peak = samples
-            .iter()
-            .filter(|s| s.extinf_s > 0.0)
-            .map(|s| (s.bytes as f64 * 8.0) / s.extinf_s)
-            .fold(0.0_f64, f64::max);
+        let total_dur = rate.duration;
 
         if let Some(pl) = pl {
+            let audio = if is_video {
+                audio_contribution(ctx, pl)
+            } else {
+                AudioContribution::Muxed
+            };
+            let window = SampleWindow::new(&samples, pl.segments.len());
+            let sample_note = format!("{}{}", window.describe(), audio.note());
+            let measured_avg = rate.avg + audio.addend();
+            let peak = rate.peak + audio.addend();
+            let mut bandwidth_flagged = false;
+
             // §1.26 / 1.28 — average vs AVERAGE-BANDWIDTH
             if let Some(avg) = pl.average_bandwidth {
-                let avg_f = avg as f64;
+                let declared = avg as f64;
+                let deviation = (measured_avg - declared).abs() / declared;
                 if is_vod {
-                    let delta = (measured_avg - avg_f).abs() / avg_f;
-                    if delta > 0.10 {
+                    if deviation > 0.10 {
                         issues.push(author_issue(
-                            Severity::Error,
+                            rate_severity(&window, audio.is_accounted(), deviation),
                             "1.26",
                             format!(
-                                "'{name}' measured avg {:.0} bps is outside ±10% of AVERAGE-BANDWIDTH {avg} (deep sample)",
-                                measured_avg
+                                "'{name}' measured avg {measured_avg:.0} bps is outside ±10% of AVERAGE-BANDWIDTH {avg}{sample_note}"
                             ),
                         ));
                     }
-                } else if measured_avg > avg_f * 1.10 {
+                } else if measured_avg > declared * 1.10 {
                     // Live: sampled window is short vs ~1h — Warn instead of Error
                     issues.push(author_warn(
                         "1.28",
                         format!(
-                            "'{name}' sampled avg {:.0} bps exceeds 110% of AVERAGE-BANDWIDTH {avg} (short live sample)",
-                            measured_avg
+                            "'{name}' sampled avg {measured_avg:.0} bps exceeds 110% of AVERAGE-BANDWIDTH {avg}{sample_note}"
                         ),
                     ));
                 }
@@ -79,33 +245,36 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
 
             // §1.27 / 1.29 — peak vs BANDWIDTH
             if let Some(bw) = pl.bandwidth {
-                let bw_f = bw as f64;
+                let declared = bw as f64;
+                let deviation = (peak - declared).abs() / declared;
                 if is_vod {
-                    let delta = (peak - bw_f).abs() / bw_f;
                     // Peak must be within 10% of BANDWIDTH for VOD — typically peak ≤ declared
-                    if peak > bw_f * 1.10 {
-                        issues.push(author_error(
+                    if peak > declared * 1.10 {
+                        bandwidth_flagged = true;
+                        issues.push(author_issue(
+                            rate_severity(&window, audio.is_accounted(), deviation),
                             "1.27",
                             format!(
-                                "'{name}' measured peak {:.0} bps exceeds BANDWIDTH {bw} by >10% (deep sample)",
-                                peak
+                                "'{name}' measured peak {peak:.0} bps exceeds BANDWIDTH {bw} by >10%{sample_note}"
                             ),
                         ));
-                    } else if delta > 0.10 && peak < bw_f * 0.90 {
-                        issues.push(author_warn(
+                    } else if peak < declared * 0.90 {
+                        // The asset's real peak may sit outside the sampled window, so an
+                        // apparently over-declared BANDWIDTH is only informational.
+                        issues.push(author_info(
                             "1.27",
                             format!(
-                                "'{name}' measured peak {:.0} bps is >10% below BANDWIDTH {bw} (deep sample)",
-                                peak
+                                "'{name}' measured peak {peak:.0} bps is >10% below BANDWIDTH {bw} — the peak may be elsewhere in the asset{sample_note}"
                             ),
                         ));
                     }
-                } else if peak > bw_f * 1.25 {
-                    issues.push(author_error(
+                } else if peak > declared * 1.25 {
+                    bandwidth_flagged = true;
+                    issues.push(author_issue(
+                        rate_severity(&window, audio.is_accounted(), deviation),
                         "1.29",
                         format!(
-                            "'{name}' measured peak {:.0} bps exceeds 125% of BANDWIDTH {bw} (live sample)",
-                            peak
+                            "'{name}' measured peak {peak:.0} bps exceeds 125% of BANDWIDTH {bw}{sample_note}"
                         ),
                     ));
                 }
@@ -116,20 +285,18 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
                 issues.push(author_warn(
                     "1.30",
                     format!(
-                        "'{name}' peak {:.0} bps is more than 200% of measured avg {:.0} bps",
-                        peak, measured_avg
+                        "'{name}' peak {peak:.0} bps is more than 200% of measured avg {measured_avg:.0} bps{sample_note}"
                     ),
                 ));
             }
 
-            // §9.13 — BANDWIDTH should cover peak of playable combination (soft: this rendition alone)
+            // §9.13 — BANDWIDTH must cover the peak of the playable combination
             if let Some(bw) = pl.bandwidth {
-                if peak > bw as f64 * 1.01 {
+                if !bandwidth_flagged && peak > bw as f64 * 1.01 {
                     issues.push(author_warn(
                         "9.13",
                         format!(
-                            "'{name}' measured peak {:.0} bps exceeds declared BANDWIDTH {bw}",
-                            peak
+                            "'{name}' measured peak {peak:.0} bps exceeds declared BANDWIDTH {bw}{sample_note}"
                         ),
                     ));
                 }
@@ -142,8 +309,7 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
                         issues.push(author_warn(
                             "6.9",
                             format!(
-                                "I-frame '{name}' measured peak {:.0} bps exceeds BANDWIDTH {bw}",
-                                peak
+                                "I-frame '{name}' measured peak {peak:.0} bps exceeds BANDWIDTH {bw}{sample_note}"
                             ),
                         ));
                     }
@@ -151,10 +317,34 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             }
         }
 
-        // §1.13 — IDRs SHOULD be present every ~2 seconds
-        if is_video {
-            let idr_total: usize = samples.iter().map(|s| s.idr_count.max(usize::from(s.has_idr_nal_hint))).sum();
-            if idr_total > 0 && total_dur > 0.0 {
+        // NAL scanning cannot see inside encrypted samples, so IDR heuristics there would
+        // only invent findings.
+        let encrypted = samples.iter().any(|s| s.has_senc)
+            || pl.is_some_and(|p| {
+                p.encryption_methods
+                    .iter()
+                    .any(|m| !m.eq_ignore_ascii_case("NONE"))
+            })
+            || ctx.probe_for_playlist(name).is_some_and(|e| {
+                e.probe.had_encrypted_sample_entry
+                    || e.probe.has_tenc
+                    || e.probe.scheme_type.is_some()
+            });
+
+        if is_video && encrypted {
+            issues.push(author_info(
+                "7.4",
+                format!(
+                    "'{name}' samples are encrypted — IDR placement (§7.4) and IDR interval (§1.13) cannot be read from segment bytes"
+                ),
+            ));
+        } else if is_video {
+            // §1.13 — IDRs SHOULD be present every ~2 seconds
+            let idr_total: usize = samples
+                .iter()
+                .map(|s| s.idr_count.max(usize::from(s.has_idr_nal_hint)))
+                .sum();
+            if idr_total > 0 {
                 let interval = total_dur / idr_total as f64;
                 if interval > 2.5 {
                     issues.push(author_warn(
@@ -164,23 +354,14 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
                         ),
                     ));
                 }
-            } else if samples.iter().any(|s| s.looks_like_fmp4 || s.looks_like_ts)
-                && samples.iter().all(|s| !s.has_idr_nal_hint)
-            {
-                issues.push(author_warn(
-                    "1.13",
-                    format!("'{name}' deep samples had no detectable IDR NALs"),
-                ));
             }
-        }
 
-        // §7.4 — video segments MUST start with an IDR
-        if is_video {
-            for s in &samples {
-                if (s.looks_like_fmp4 || s.looks_like_ts)
-                    && s.has_idr_nal_hint
-                    && !s.idr_at_start
-                {
+            // §7.4 — video segments MUST start with an IDR
+            let mut no_idr: Vec<usize> = Vec::new();
+            for s in samples.iter().filter(|s| s.looks_like_fmp4 || s.looks_like_ts) {
+                if !s.has_idr_nal_hint {
+                    no_idr.push(s.segment_index);
+                } else if !s.idr_at_start {
                     issues.push(author_error(
                         "7.4",
                         format!(
@@ -188,15 +369,21 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
                             s.playlist_name, s.segment_index
                         ),
                     ));
-                } else if (s.looks_like_fmp4 || s.looks_like_ts) && !s.has_idr_nal_hint {
-                    issues.push(author_warn(
-                        "7.4",
-                        format!(
-                            "video segment '{}[#{}]' — no IDR NAL detected at start (best-effort)",
-                            s.playlist_name, s.segment_index
-                        ),
-                    ));
                 }
+            }
+            if !no_idr.is_empty() {
+                let list = no_idr
+                    .iter()
+                    .map(|i| format!("#{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                issues.push(author_warn(
+                    "7.4",
+                    format!(
+                        "'{name}' — no IDR NAL detected at the start of {} sampled segment(s) ({list}, best-effort)",
+                        no_idr.len()
+                    ),
+                ));
             }
         }
 

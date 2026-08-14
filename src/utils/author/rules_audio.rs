@@ -2,7 +2,20 @@
 
 use super::context::AuthoringContext;
 use super::helpers::*;
+use super::severity::must;
 use crate::utils::validator::types::Issue;
+
+/// NAME wording broadcasters use for described video, so a DVS rendition that omits
+/// §2.12's CHARACTERISTICS is still recognised. Deliberately narrow: every rule keyed
+/// off this is a MUST.
+fn name_suggests_dvs(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("audio description")
+        || n.contains("described")
+        || n.contains("descriptive")
+        || n.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| word == "dvs")
+}
 
 pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
     let mut issues = Vec::new();
@@ -110,35 +123,42 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         }
     }
 
-    // §2.12–2.14, 2.27–2.28 — DVS / speech CHARACTERISTICS
+    // §2.12 / §2.13 / §2.27 / §2.28 — DVS and speech-intelligibility CHARACTERISTICS
     for r in &audio_renditions {
         let chars = r.characteristics.as_deref().unwrap_or("");
-        let is_dvs = chars.contains("public.accessibility.describes-video")
-            || chars.contains("describes-video");
-        let is_speech = chars.contains("public.accessibility.transcribes-spoken-dialog")
-            || chars.contains("easy-to-read");
-        if is_dvs || is_speech {
-            if !r.autoselect {
-                issues.push(author_warn(
-                    "2.13",
-                    format!(
-                        "accessibility audio '{}' SHOULD have AUTOSELECT=YES",
-                        r.name
-                    ),
-                ));
-            }
-            if r.language.is_none() {
-                issues.push(author_error(
-                    "2.14",
-                    format!("accessibility audio '{}' MUST have LANGUAGE", r.name),
-                ));
-            }
-            if r.name.is_empty() {
-                issues.push(author_error(
-                    "2.12",
-                    "accessibility audio missing NAME",
-                ));
-            }
+        let has_dvs_characteristic = chars.contains("public.accessibility.describes-video");
+        // A rendition can only be recognised as descriptive audio from its
+        // CHARACTERISTICS or, failing that, from how it is named.
+        let is_dvs =
+            has_dvs_characteristic || chars.contains("describes-video") || name_suggests_dvs(&r.name);
+        let enhances_speech = chars.contains("enhances-speech-intelligibility");
+
+        // §2.12 — the descriptive-audio characteristic itself, spelled in full.
+        if is_dvs && !has_dvs_characteristic {
+            issues.push(author_issue(
+                must(),
+                "2.12",
+                format!(
+                    "descriptive audio '{}' MUST declare CHARACTERISTICS=\"public.accessibility.describes-video\"",
+                    r.name
+                ),
+            ));
+        }
+        // §2.13 — DVS is selected by the accessibility preference, not by the picker.
+        if is_dvs && !r.autoselect {
+            issues.push(author_issue(
+                must(),
+                "2.13",
+                format!("descriptive audio '{}' MUST have AUTOSELECT=YES", r.name),
+            ));
+        }
+        // §2.27 — accessibility audio MUST be language-tagged.
+        if (is_dvs || enhances_speech) && r.language.is_none() {
+            issues.push(author_issue(
+                must(),
+                "2.27",
+                format!("accessibility audio '{}' MUST have LANGUAGE", r.name),
+            ));
         }
     }
 
@@ -314,4 +334,94 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
     }
 
     issues
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::context::{
+        InitProbeEntry, SegmentSample, ValidateAuthorOptions, WebVttSample,
+    };
+    use super::*;
+    use crate::utils::validator::parser::parse_master_playlist;
+    use crate::utils::validator::types::{MediaPlaylist, Severity};
+
+    /// Run the audio rules over a hand-written multivariant playlist with the given
+    /// EXT-X-MEDIA lines and no media playlists fetched.
+    fn master_issues(media: &str) -> Vec<Issue> {
+        let content = format!(
+            "#EXTM3U\n{media}#EXT-X-STREAM-INF:BANDWIDTH=2000000,AVERAGE-BANDWIDTH=1800000,RESOLUTION=1280x720,CODECS=\"avc1.4d401f,mp4a.40.2\",FRAME-RATE=30,AUDIO=\"aud\"\nhttps://example.com/v.m3u8\n"
+        );
+        let master = parse_master_playlist("https://example.com/master.m3u8", &content);
+        let opts = ValidateAuthorOptions::default();
+        let playlists: Vec<MediaPlaylist> = Vec::new();
+        let inits: Vec<InitProbeEntry> = Vec::new();
+        let segs: Vec<SegmentSample> = Vec::new();
+        let vtts: Vec<WebVttSample> = Vec::new();
+        let ctx = AuthoringContext::new(Some(&master), &playlists, &opts, &inits, &segs, &vtts);
+        check(&ctx)
+    }
+
+    fn find<'a>(issues: &'a [Issue], section: &str) -> Option<&'a Issue> {
+        issues.iter().find(|i| i.message.contains(section))
+    }
+
+    const DVS: &str = "public.accessibility.describes-video";
+
+    #[test]
+    fn author_2_13_makes_dvs_autoselect_an_error() {
+        let issues = master_issues(&format!(
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English AD\",LANGUAGE=\"en\",CHARACTERISTICS=\"{DVS}\",URI=\"dvs.m3u8\"\n"
+        ));
+        let issue = find(&issues, "§2.13").expect("expected §2.13 AUTOSELECT issue");
+        assert_eq!(issue.severity, Severity::Error);
+        assert!(issue.message.contains("AUTOSELECT=YES"));
+    }
+
+    #[test]
+    fn author_2_27_carries_the_dvs_language_requirement() {
+        let issues = master_issues(&format!(
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English AD\",AUTOSELECT=YES,CHARACTERISTICS=\"{DVS}\",URI=\"dvs.m3u8\"\n"
+        ));
+        let issue = find(&issues, "§2.27").expect("expected §2.27 LANGUAGE issue");
+        assert_eq!(issue.severity, Severity::Error);
+        assert!(find(&issues, "§2.14").is_none(), "§2.14 was the old mislabel");
+    }
+
+    #[test]
+    fn author_2_12_flags_descriptive_audio_without_the_characteristic() {
+        let issues = master_issues(
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English (Audio Description)\",LANGUAGE=\"en\",AUTOSELECT=YES,URI=\"dvs.m3u8\"\n",
+        );
+        let issue = find(&issues, "§2.12").expect("expected §2.12 CHARACTERISTICS issue");
+        assert_eq!(issue.severity, Severity::Error);
+        assert!(issue.message.contains("public.accessibility.describes-video"));
+    }
+
+    #[test]
+    fn author_2_12_and_2_13_accept_a_compliant_dvs_rendition() {
+        let issues = master_issues(&format!(
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English AD\",LANGUAGE=\"en\",AUTOSELECT=YES,CHARACTERISTICS=\"{DVS}\",URI=\"dvs.m3u8\"\n"
+        ));
+        assert!(find(&issues, "§2.12").is_none(), "{issues:?}");
+        assert!(find(&issues, "§2.13").is_none(), "{issues:?}");
+        assert!(find(&issues, "§2.27").is_none(), "{issues:?}");
+    }
+
+    #[test]
+    fn author_2_13_does_not_apply_to_speech_intelligibility_audio() {
+        let issues = master_issues(
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English Dialogue\",LANGUAGE=\"en\",CHARACTERISTICS=\"public.accessibility.enhances-speech-intelligibility\",URI=\"speech.m3u8\"\n",
+        );
+        assert!(find(&issues, "§2.13").is_none(), "{issues:?}");
+        assert!(find(&issues, "§2.12").is_none(), "{issues:?}");
+    }
+
+    #[test]
+    fn author_2_12_ignores_ordinary_audio_renditions() {
+        let issues = master_issues(
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",LANGUAGE=\"en\",AUTOSELECT=YES,DEFAULT=YES,URI=\"en.m3u8\"\n",
+        );
+        assert!(find(&issues, "§2.12").is_none(), "{issues:?}");
+        assert!(find(&issues, "§2.27").is_none(), "{issues:?}");
+    }
 }

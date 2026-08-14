@@ -55,6 +55,8 @@ pub struct FetchArrayBufferResonse {
     pub response_body: Vec<u8>,
     pub content_type: Option<String>,
     pub url: String,
+    /// HTTP status code. A ranged request only got its range when this is 206.
+    pub status: u16,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -103,6 +105,7 @@ pub async fn fetch_array_buffer(
     let response = response_from(&request_url, byterange).await?;
     let content_type = content_type_from(&response);
     let url = response.url();
+    let status = response.status();
     let response_buf = JsFuture::from(response.array_buffer().map_err(fetch_failed)?)
         .await
         .map_err(fetch_failed)?;
@@ -116,6 +119,7 @@ pub async fn fetch_array_buffer(
         response_body: body,
         content_type,
         url,
+        status,
     })
 }
 

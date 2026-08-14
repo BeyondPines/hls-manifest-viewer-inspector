@@ -112,7 +112,7 @@ impl AuthorPolicy {
     /// General `*` rules that visionOS exempts when all variants are stereo spatial.
     pub fn vision_exempt_rules() -> HashSet<&'static str> {
         [
-            "1.3a", "1.6a", "1.9b", "1.12", "1.24", "2.3", "2.6", "6.14", "6.16",
+            "1.3a", "1.6a", "1.9b", "1.12", "1.24", "2.3", "2.6", "6.14", "6.15", "6.16",
         ]
         .into_iter()
         .collect()

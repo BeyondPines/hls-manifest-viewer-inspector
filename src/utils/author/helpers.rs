@@ -126,11 +126,37 @@ pub fn av1_level_ok(token: &str) -> bool {
     level <= 62
 }
 
+/// Map an H.264 `profile_idc` (avcC `avc_profile_indication`) to its profile name.
+pub fn h264_profile_name(profile_idc: &str) -> Option<&'static str> {
+    match profile_idc.trim().parse::<u16>().ok()? {
+        66 => Some("baseline"),
+        77 => Some("main"),
+        88 => Some("extended"),
+        100 => Some("high"),
+        110 => Some("high10"),
+        122 => Some("high422"),
+        244 => Some("high444"),
+        _ => None,
+    }
+}
+
+/// Human-readable HEVC profile from an `hvcC` / CODECS `general_profile_idc`.
+pub fn hevc_profile_name(profile_idc: u32) -> String {
+    match profile_idc {
+        1 => "1 (Main)".to_string(),
+        2 => "2 (Main 10)".to_string(),
+        3 => "3 (Main Still Picture)".to_string(),
+        4 => "4 (Format Range Extensions)".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Parse H.264/HEVC level strings like "4.1", "41", "51", "5.1" into a float.
+/// Two-digit level indications are scaled down, so "10" reads as level 1.0.
 pub fn parse_codec_level(s: &str) -> Option<f64> {
     let cleaned = s.trim().trim_start_matches('L').trim_start_matches('l');
     if let Ok(v) = cleaned.parse::<f64>() {
-        if v > 10.0 {
+        if v >= 10.0 {
             Some(v / 10.0)
         } else {
             Some(v)
@@ -138,6 +164,98 @@ pub fn parse_codec_level(s: &str) -> Option<f64> {
     } else {
         None
     }
+}
+
+/// HEVC `general_level_idc` → level number: the indication is level × 30, so 153 → 5.1.
+/// Values of 10 or less are assumed to already be levels.
+pub fn hevc_level_from_idc(raw: f64) -> f64 {
+    if raw > 10.0 {
+        raw / 30.0
+    } else {
+        raw
+    }
+}
+
+/// H.264 profile_idc and level read from an `avc1`/`avc3` CODECS token.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AvcCodec {
+    pub profile_idc: u16,
+    pub level: f64,
+}
+
+/// Parse an `avc1`/`avc3` CODECS token. The RFC 6381 form is `avc1.PPCCLL`, three
+/// hex bytes holding profile_idc, the constraint flags and level_idc (`41` → 4.1).
+/// The legacy dotted decimal form `avc1.<profile_idc>.<level_idc>` is also accepted.
+pub fn parse_avc_codec(token: &str) -> Option<AvcCodec> {
+    let t = token.to_ascii_lowercase();
+    let (fourcc, rest) = t.split_once('.')?;
+    if !matches!(fourcc, "avc1" | "avc3") {
+        return None;
+    }
+    if rest.len() == 6 && rest.chars().all(|c| c.is_ascii_hexdigit()) {
+        let profile_idc = u16::from_str_radix(&rest[0..2], 16).ok()?;
+        let level_idc = u16::from_str_radix(&rest[4..6], 16).ok()?;
+        return Some(AvcCodec {
+            profile_idc,
+            level: f64::from(level_idc) / 10.0,
+        });
+    }
+    let mut parts = rest.split('.');
+    let profile_idc = parts.next()?.trim().parse::<u16>().ok()?;
+    let level = parse_codec_level(parts.next()?)?;
+    Some(AvcCodec { profile_idc, level })
+}
+
+/// HEVC `general_profile_idc` (1 = Main, 2 = Main 10) and level read from an
+/// `hvc1`/`hev1` CODECS token. Either field may be absent from a short token.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HevcCodec {
+    pub profile_idc: Option<u32>,
+    pub level: Option<f64>,
+}
+
+/// Parse an `hvc1`/`hev1` CODECS token such as `hvc1.2.4.L153.B0`. The first
+/// element is the profile (optionally prefixed by a profile space letter) and the
+/// tier/level element is a `L`/`H` prefix followed by `general_level_idc`.
+pub fn parse_hevc_codec(token: &str) -> Option<HevcCodec> {
+    let t = token.to_ascii_lowercase();
+    let (fourcc, rest) = t.split_once('.')?;
+    if !matches!(fourcc, "hvc1" | "hev1") {
+        return None;
+    }
+    fn strip_alpha(s: &str) -> &str {
+        s.trim_start_matches(|c: char| c.is_ascii_alphabetic())
+    }
+    let parts: Vec<&str> = rest.split('.').collect();
+    let profile_idc = parts.first().and_then(|p| strip_alpha(p).parse::<u32>().ok());
+    let level = parts
+        .iter()
+        .find(|p| {
+            let mut chars = p.chars();
+            matches!(chars.next(), Some('l') | Some('h')) && chars.all(|c| c.is_ascii_digit())
+        })
+        .and_then(|p| strip_alpha(p).parse::<f64>().ok())
+        .map(hevc_level_from_idc);
+    Some(HevcCodec { profile_idc, level })
+}
+
+/// Dolby Vision profile and level read from a `dvh1.PP.LL` / `dvhe.PP.LL` CODECS token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DvCodec {
+    pub profile: u32,
+    pub level: u32,
+}
+
+pub fn parse_dv_codec(token: &str) -> Option<DvCodec> {
+    let t = token.to_ascii_lowercase();
+    let (fourcc, rest) = t.split_once('.')?;
+    if !matches!(fourcc, "dvh1" | "dvhe") {
+        return None;
+    }
+    let mut parts = rest.split('.');
+    let profile = parts.next()?.trim().parse::<u32>().ok()?;
+    let level = parts.next()?.trim().parse::<u32>().ok()?;
+    Some(DvCodec { profile, level })
 }
 
 /// Rough H.264 High Profile level required by resolution×fps (Apple §1.11 tables, simplified).
@@ -171,4 +289,60 @@ pub fn playlist_looks_like_ts(pl: &crate::utils::validator::types::MediaPlaylist
 
 pub fn playlist_has_map(pl: &crate::utils::validator::types::MediaPlaylist) -> bool {
     pl.segments.iter().any(|s| s.map_uri.is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_avc_hex_and_dotted_forms() {
+        let hex = parse_avc_codec("avc1.640029").expect("hex form");
+        assert_eq!(hex.profile_idc, 100);
+        assert!((hex.level - 4.1).abs() < f64::EPSILON);
+
+        let upper = parse_avc_codec("AVC3.4D401F").expect("uppercase hex form");
+        assert_eq!(upper.profile_idc, 77);
+        assert!((upper.level - 3.1).abs() < f64::EPSILON);
+
+        let dotted = parse_avc_codec("avc1.66.30").expect("dotted form");
+        assert_eq!(dotted.profile_idc, 66);
+        assert!((dotted.level - 3.0).abs() < f64::EPSILON);
+
+        assert!(parse_avc_codec("hvc1.2.4.L153.B0").is_none());
+        assert!(parse_avc_codec("avc1").is_none());
+    }
+
+    #[test]
+    fn parses_hevc_profile_and_tier_level() {
+        let main10 = parse_hevc_codec("hvc1.2.4.L153.B0").expect("hevc token");
+        assert_eq!(main10.profile_idc, Some(2));
+        assert!((main10.level.unwrap() - 5.1).abs() < 0.01);
+
+        let high_tier = parse_hevc_codec("hev1.1.6.H120").expect("high tier token");
+        assert_eq!(high_tier.profile_idc, Some(1));
+        assert!((high_tier.level.unwrap() - 4.0).abs() < 0.01);
+
+        assert!(parse_hevc_codec("dvh1.05.06").is_none());
+    }
+
+    #[test]
+    fn parses_dolby_vision_profile_and_level() {
+        assert_eq!(
+            parse_dv_codec("dvh1.05.06"),
+            Some(DvCodec {
+                profile: 5,
+                level: 6
+            })
+        );
+        assert_eq!(
+            parse_dv_codec("dvhe.08.09"),
+            Some(DvCodec {
+                profile: 8,
+                level: 9
+            })
+        );
+        assert!(parse_dv_codec("dvh1").is_none());
+        assert!(parse_dv_codec("hvc1.2.4.L153.B0").is_none());
+    }
 }
