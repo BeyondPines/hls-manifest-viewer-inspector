@@ -326,17 +326,6 @@ impl InitSegmentProbe {
         out
     }
 
-    /// HLS requires fMP4 init brands compatible with `iso6` or higher / CMAF.
-    pub fn has_iso6_compatible_brand(&self) -> bool {
-        self.all_brands().iter().any(|b| {
-            let b = b.to_ascii_lowercase();
-            matches!(
-                b.as_str(),
-                "iso6" | "iso7" | "iso8" | "iso9" | "cmfc" | "cmfs" | "cfsd" | "msdh" | "msix"
-            )
-        })
-    }
-
     pub fn looks_like_fmp4_init(&self) -> bool {
         self.major_brand.is_some()
             || self.video_sample_fourcc.is_some()
@@ -480,7 +469,6 @@ pub fn scan_segment_bytes(data: &[u8], hints: SegmentScanHints) -> SegmentScan {
         }
         scan.ts_continuity_ok = Some(cc_ok);
         scan_nal_hints(data, &mut scan, codec);
-        scan_media_markers(data, &mut scan);
         return scan;
     }
 
@@ -501,10 +489,6 @@ pub fn scan_segment_bytes(data: &[u8], hints: SegmentScanHints) -> SegmentScan {
         .video_tfdt
         .or(scan.audio_tfdt)
         .or_else(|| trafs.iter().find_map(|t| t.tfdt));
-
-    for &(start, end) in &mdats {
-        scan_media_markers(&data[start..end], &mut scan);
-    }
 
     let video_runs: Vec<(usize, usize)> = match hints.video_track_id {
         Some(id) => trafs
@@ -925,15 +909,6 @@ impl NalOffsets {
     }
 }
 
-/// Payload markers that are not NAL syntax, so they stay readable when the NAL scan
-/// is narrowed to one track's samples.
-fn scan_media_markers(data: &[u8], scan: &mut SegmentScan) {
-    let buf = &data[..data.len().min(MAX_NAL_SCAN_BYTES)];
-    if buf.windows(4).any(|w| w == b"asp ") {
-        scan.has_asp_hint = true;
-    }
-}
-
 /// Inspect the NAL header at `nal_off`, recording random-access offsets and CEA-608/708
 /// SEI hints.
 fn classify_nal(
@@ -1013,8 +988,6 @@ pub struct SegmentScan {
     pub ts_continuity_ok: Option<bool>,
     /// Best-effort CEA-608/708 SEI / GA94 hint.
     pub has_cc_sei_hint: bool,
-    /// Best-effort APAC ASP marker hint.
-    pub has_asp_hint: bool,
 }
 
 

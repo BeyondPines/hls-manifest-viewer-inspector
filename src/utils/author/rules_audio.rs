@@ -202,13 +202,27 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         }
     }
 
-    // §2.31 — APAC immersive → stereo AAC SHOULD exist
+    // §2.31 — APAC *immersive* audio is what asks for a stereo AAC companion. Plain
+    // stereo APAC ("2/BED-2") is a two-channel rendition like any other, so the rule
+    // needs an immersive antecedent before it has anything to say.
     if audio_tokens.iter().any(|t| is_apac(t)) {
+        let immersive: Vec<&str> = audio_renditions
+            .iter()
+            .filter(|r| {
+                r.channels
+                    .as_deref()
+                    .is_some_and(apac_channels_are_immersive)
+            })
+            .map(|r| r.name.as_str())
+            .collect();
         let has_stereo_aac = audio_tokens.iter().any(|t| is_aac_lc_family(t));
-        if !has_stereo_aac {
+        if !immersive.is_empty() && !has_stereo_aac {
             issues.push(author_warn(
                 "2.31",
-                "APAC immersive present; stereo AAC SHOULD also exist",
+                format!(
+                    "immersive APAC audio ({}) without a stereo AAC rendition, which SHOULD also be provided",
+                    immersive.join(", ")
+                ),
             ));
         }
     }
@@ -274,24 +288,14 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         }
 
         // §2.25 — xHE-AAC / ALAC / FLAC / APAC MUST be fMP4
-        if is_apac || is_flac || is_xhe {
-            if !probe.looks_like_fmp4_init() {
-                issues.push(author_error(
-                    "2.25",
-                    format!(
-                        "codec '{fourcc}' on init '{}' MUST use fMP4 container",
-                        entry.uri
-                    ),
-                ));
-            } else if !probe.has_iso6_compatible_brand() {
-                issues.push(author_warn(
-                    "2.25",
-                    format!(
-                        "fMP4 audio init '{}' missing iso6+ / CMAF brand",
-                        entry.uri
-                    ),
-                ));
-            }
+        if (is_apac || is_flac || is_xhe) && !probe.looks_like_fmp4_init() {
+            issues.push(author_error(
+                "2.25",
+                format!(
+                    "codec '{fourcc}' on init '{}' MUST use fMP4 container",
+                    entry.uri
+                ),
+            ));
         }
 
         // §2.1 — audio SHOULD be elementary or fMP4 (info when we only see odd brands)
@@ -319,6 +323,38 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
     }
 
     issues
+}
+
+/// Whether an APAC rendition's CHANNELS attribute describes immersive audio.
+///
+/// The attribute's first parameter counts channels and its second names the spatial
+/// components: a channel bed (`BED-n`), isolated audio objects (`ISO-n`) or Ambisonics
+/// (`1OA`, `2OA`, `3OA`). Immersive audio is a combination of two or more of those, or a
+/// bed wider than stereo; a plain `2/BED-2` rendition is stereo APAC.
+fn apac_channels_are_immersive(channels: &str) -> bool {
+    let mut parts = channels.split('/');
+    let count: u32 = parts
+        .next()
+        .and_then(|c| c.trim().parse().ok())
+        .unwrap_or(0);
+    if count > 2 {
+        return true;
+    }
+    let Some(spatial) = parts.next() else {
+        return false;
+    };
+    spatial
+        .split('+')
+        .map(|id| id.trim().to_ascii_uppercase())
+        .any(|id| {
+            if let Some(bed) = id.strip_prefix("BED-") {
+                return bed.parse::<u32>().is_ok_and(|n| n > 2);
+            }
+            let ambisonics = id
+                .strip_suffix("OA")
+                .is_some_and(|order| !order.is_empty() && order.chars().all(|c| c.is_ascii_digit()));
+            id.starts_with("ISO-") || ambisonics
+        })
 }
 
 #[cfg(test)]
@@ -351,6 +387,43 @@ mod tests {
     }
 
     const DVS: &str = "public.accessibility.describes-video";
+
+    #[test]
+    fn apac_channels_tell_immersive_from_stereo() {
+        assert!(!apac_channels_are_immersive("2/BED-2"));
+        assert!(!apac_channels_are_immersive("2"));
+        assert!(apac_channels_are_immersive("12/BED-4+ISO-8"));
+        assert!(apac_channels_are_immersive("2/BED-2+ISO-4"));
+        assert!(apac_channels_are_immersive("2/3OA"));
+        assert!(apac_channels_are_immersive("6/BED-6"));
+    }
+
+    /// An APAC-only ladder whose audio rendition declares `channels`.
+    fn apac_issues(channels: &str) -> Vec<Issue> {
+        let content = format!(
+            "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Immersive\",LANGUAGE=\"en\",AUTOSELECT=YES,CHANNELS=\"{channels}\",URI=\"a.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,AVERAGE-BANDWIDTH=1800000,RESOLUTION=1280x720,CODECS=\"hvc1.2.4.L123.B0,apac\",FRAME-RATE=30,AUDIO=\"aud\"\nhttps://example.com/v.m3u8\n"
+        );
+        let master = parse_master_playlist("https://example.com/master.m3u8", &content);
+        let opts = ValidateAuthorOptions::default();
+        let playlists: Vec<MediaPlaylist> = Vec::new();
+        let inits: Vec<InitProbeEntry> = Vec::new();
+        let segs: Vec<SegmentSample> = Vec::new();
+        let vtts: Vec<WebVttSample> = Vec::new();
+        let ctx = AuthoringContext::new(Some(&master), &playlists, &opts, &inits, &segs, &vtts);
+        check(&ctx)
+    }
+
+    #[test]
+    fn author_2_31_needs_an_immersive_apac_antecedent() {
+        assert!(
+            find(&apac_issues("2/BED-2"), "§2.31").is_none(),
+            "stereo APAC is not the immersive audio §2.31 is about"
+        );
+        let immersive = apac_issues("12/BED-4+ISO-8");
+        let issue = find(&immersive, "§2.31").expect("immersive APAC without stereo AAC");
+        assert_eq!(issue.severity, Severity::Warn);
+        assert!(issue.message.contains("Immersive"), "{}", issue.message);
+    }
 
     #[test]
     fn author_2_13_makes_dvs_autoselect_an_error() {

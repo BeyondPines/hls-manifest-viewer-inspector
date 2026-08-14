@@ -69,7 +69,6 @@ pub struct SegmentSample {
     pub has_saio: bool,
     pub ts_continuity_ok: Option<bool>,
     pub has_cc_sei_hint: bool,
-    pub has_asp_hint: bool,
 }
 
 impl SegmentSample {
@@ -106,7 +105,6 @@ impl SegmentSample {
             has_saio: scan.has_saio,
             ts_continuity_ok: scan.ts_continuity_ok,
             has_cc_sei_hint: scan.has_cc_sei_hint,
-            has_asp_hint: scan.has_asp_hint,
         }
     }
 }
@@ -119,6 +117,38 @@ pub struct WebVttSample {
     pub uri: String,
     pub has_webvtt_header: bool,
     pub has_x_timestamp_map: bool,
+}
+
+/// Brands to report per init, before the note is summarised.
+const MAX_BRAND_NOTE_INITS: usize = 4;
+
+/// The `ftyp` brands each probed init declares. The Authoring Spec's container rules
+/// (§1.2, §1.5, §1.39, §2.25, §8.20) ask for fMP4 and name no brand, so brands are
+/// reported as an observation rather than judged against a list.
+fn init_brand_note(init_probes: &[InitProbeEntry]) -> Option<String> {
+    let listed: Vec<String> = init_probes
+        .iter()
+        .take(MAX_BRAND_NOTE_INITS)
+        .map(|e| {
+            let brands = e.probe.all_brands();
+            let brands = if brands.is_empty() {
+                "no ftyp".to_string()
+            } else {
+                brands.join(", ")
+            };
+            format!("{} [{brands}]", e.uri)
+        })
+        .collect();
+    if listed.is_empty() {
+        return None;
+    }
+    let more = init_probes.len().saturating_sub(listed.len());
+    let more = if more > 0 {
+        format!(" (and {more} more init(s))")
+    } else {
+        String::new()
+    };
+    Some(format!("Init segment brands: {}{more}.", listed.join("; ")))
 }
 
 /// Full input for `run_authoring_checks`.
@@ -166,6 +196,7 @@ impl<'a> AuthoringContext<'a> {
             segment_samples.len(),
             webvtt_samples.len(),
         ));
+        notes.extend(init_brand_note(init_probes));
         if !options.deep_checks {
             notes.push(
                 "Deep Author checks are off — enable to measure bandwidth, IDR interval, tfdt/TS continuity, and CC SEI."

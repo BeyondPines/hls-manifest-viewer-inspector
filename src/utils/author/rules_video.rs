@@ -422,50 +422,20 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             ));
         }
 
-        // §1.2 / 1.5 / 1.39 — container requirements from init brands + playlist MAP/TS
-        if is_hevc || is_dv {
-            if !probe.looks_like_fmp4_init() {
-                issues.push(author_error(
-                    "1.5",
-                    format!("HEVC/DV init '{}' could not be parsed as fMP4", entry.uri),
-                ));
-            } else if !probe.has_iso6_compatible_brand() {
-                issues.push(author_warn(
-                    "1.5",
-                    format!(
-                        "HEVC/DV init '{}' missing iso6+ / CMAF brand (found {:?})",
-                        entry.uri, probe.major_brand
-                    ),
-                ));
-            }
+        // §1.5 / §1.39 — the container itself, which these rules require to be fMP4. The
+        // spec names no brand, so an init that parses as fMP4 satisfies them however its
+        // packager spelled `ftyp`; the brands it declares are reported as probe notes.
+        if (is_hevc || is_dv) && !probe.looks_like_fmp4_init() {
+            issues.push(author_error(
+                "1.5",
+                format!("HEVC/DV init '{}' could not be parsed as fMP4", entry.uri),
+            ));
         }
-        if is_av1 {
-            if !probe.looks_like_fmp4_init() {
-                issues.push(author_error(
-                    "1.39",
-                    format!("AV1 init '{}' could not be parsed as fMP4", entry.uri),
-                ));
-            } else if !probe.has_iso6_compatible_brand() {
-                issues.push(author_warn(
-                    "1.39",
-                    format!(
-                        "AV1 init '{}' missing iso6+ / CMAF brand (found {:?})",
-                        entry.uri, probe.major_brand
-                    ),
-                ));
-            }
-        }
-        if is_avc {
-            // H.264 MAY be TS or fMP4. If init exists it is fMP4 — brand SHOULD be iso6+.
-            if probe.looks_like_fmp4_init() && !probe.has_iso6_compatible_brand() {
-                issues.push(author_warn(
-                    "1.2",
-                    format!(
-                        "H.264 fMP4 init '{}' missing iso6+ / CMAF brand (found {:?})",
-                        entry.uri, probe.major_brand
-                    ),
-                ));
-            }
+        if is_av1 && !probe.looks_like_fmp4_init() {
+            issues.push(author_error(
+                "1.39",
+                format!("AV1 init '{}' could not be parsed as fMP4", entry.uri),
+            ));
         }
 
         // §1.3 / 1.4 / 1.6 profile+level from avcC/hvcC

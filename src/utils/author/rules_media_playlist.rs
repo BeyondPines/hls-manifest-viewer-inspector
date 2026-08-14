@@ -230,18 +230,6 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             };
             issues.push(sev_rule_msg);
         }
-
-        if let Some(entry) = probe {
-            if entry.probe.looks_like_fmp4_init() && !entry.probe.has_iso6_compatible_brand() {
-                issues.push(author_warn(
-                    "8.20",
-                    format!(
-                        "fMP4 init for '{}' missing iso6+ / CMAF brand (found {:?})",
-                        pl.name, entry.probe.major_brand
-                    ),
-                ));
-            }
-        }
     }
 
     // §8.22–8.25 — INDEPENDENT-SEGMENTS for xHE-AAC/APAC

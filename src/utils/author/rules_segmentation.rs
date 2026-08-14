@@ -11,8 +11,35 @@ fn is_av_media(pl: &MediaPlaylist) -> bool {
     !pl.is_iframe && (pl.media_type == "VIDEO" || pl.media_type == "AUDIO")
 }
 
+/// Playlists named in an aggregated §7.5 / §7.6 finding before it is summarised.
+const MAX_NAMED_PLAYLISTS: usize = 3;
+
+/// One finding for the whole stream. A ladder segments every rendition the same way, so
+/// reporting §7.5 or §7.6 per playlist repeats one authoring decision once per variant.
+fn aggregated(section: &str, subject: &str, offenders: &[String], measured: usize) -> Option<Issue> {
+    let named = offenders.iter().take(MAX_NAMED_PLAYLISTS);
+    let more = match offenders.len().saturating_sub(MAX_NAMED_PLAYLISTS) {
+        0 => String::new(),
+        n => format!(", and {n} more"),
+    };
+    if offenders.is_empty() {
+        return None;
+    }
+    Some(author_warn(
+        section,
+        format!(
+            "{} of {measured} audio/video playlist(s) {subject}: {}{more}",
+            offenders.len(),
+            named.cloned().collect::<Vec<_>>().join("; "),
+        ),
+    ))
+}
+
 pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
     let mut issues = Vec::new();
+    let mut av_measured = 0usize;
+    let mut long_target_duration: Vec<String> = Vec::new();
+    let mut long_average_extinf: Vec<String> = Vec::new();
 
     for pl in ctx.playlists.iter().filter(|p| !p.is_iframe) {
         if pl.target_duration <= 0.0 || pl.segments.is_empty() {
@@ -21,25 +48,15 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
 
         // §7.5–7.6 — TD SHOULD be ~6s; EXTINF nominal ~6s
         if is_av_media(pl) {
+            av_measured += 1;
             if (pl.target_duration - 6.0).abs() > 2.0 {
-                issues.push(author_warn(
-                    "7.5",
-                    format!(
-                        "'{}' TARGETDURATION {:.0}s is far from recommended ~6s",
-                        pl.name, pl.target_duration
-                    ),
-                ));
+                long_target_duration
+                    .push(format!("'{}' at {:.0}s", pl.name, pl.target_duration));
             }
             let avg: f64 = pl.segments.iter().map(|s| s.duration).sum::<f64>()
                 / pl.segments.len() as f64;
             if (avg - 6.0).abs() > 2.0 {
-                issues.push(author_warn(
-                    "7.6",
-                    format!(
-                        "'{}' average EXTINF {avg:.2}s is far from recommended ~6s",
-                        pl.name
-                    ),
-                ));
+                long_average_extinf.push(format!("'{}' at {avg:.2}s", pl.name));
             }
         }
 
@@ -57,6 +74,19 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             }
         }
     }
+
+    issues.extend(aggregated(
+        "7.5",
+        "declare a TARGETDURATION far from the recommended ~6s",
+        &long_target_duration,
+        av_measured,
+    ));
+    issues.extend(aggregated(
+        "7.6",
+        "average an EXTINF far from the recommended ~6s",
+        &long_average_extinf,
+        av_measured,
+    ));
 
     // §7.1 (each segment starts with an IDR) is checked from sampled segment bytes by the
     // deep rules as §7.4, which knows which playlists carry unencrypted video.
@@ -144,6 +174,26 @@ mod tests {
             issues.is_empty(),
             "trick-play playlists are not judged against the ~6s recommendation, got: {:?}",
             issues.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn author_7_5_reports_a_whole_ladder_once() {
+        let ladder: Vec<MediaPlaylist> = ["360", "720", "1080", "2160"]
+            .iter()
+            .map(|res| playlist(&format!("video/{res}"), "VIDEO", 2.0, 2.0, 4))
+            .collect();
+        let issues = issues_for(&ladder);
+        let td: Vec<&Issue> = issues
+            .iter()
+            .filter(|i| i.message.contains("§7.5"))
+            .collect();
+        assert_eq!(td.len(), 1, "one finding for the ladder: {issues:?}");
+        assert!(
+            td[0].message.contains("4 of 4 audio/video playlist(s)")
+                && td[0].message.contains("and 1 more"),
+            "the finding should account for every playlist it covers, got: {}",
+            td[0].message
         );
     }
 

@@ -601,15 +601,16 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
                 ));
             }
             if codecs.contains("apac") {
-                let any_asp = samples.iter().any(|s| s.has_asp_hint);
-                if !any_asp {
-                    issues.push(author_warn(
-                        "7.9",
-                        format!(
-                            "'{name}' APAC samples — no ASP marker hint detected (best-effort)"
-                        ),
-                    ));
-                }
+                // An Audio Synchronization Packet is a bitstream structure inside the APAC
+                // payload, not a box or a fourCC. Searching the bytes for the ASCII "asp "
+                // found unrelated data and missed real ASPs, so the rule reports what it is
+                // rather than guessing.
+                issues.push(author_info(
+                    "7.9",
+                    format!(
+                        "'{name}' carries APAC — each segment MUST start with an Audio Synchronization Packet, which cannot be verified in-browser"
+                    ),
+                ));
             }
         }
 
