@@ -87,7 +87,9 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         }
     }
 
-    // §4.7 (and §8.10) — LANGUAGE on subtitle / closed-caption renditions
+    // §4.7 — LANGUAGE on subtitle / closed-caption renditions. §8.10 states the same
+    // requirement for every non-VIDEO rendition but defers to this section for these two
+    // types, so the missing attribute is reported once.
     for r in master
         .media_renditions
         .iter()
@@ -97,10 +99,7 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             issues.push(author_issue(
                 must(),
                 "4.7",
-                format!(
-                    "{} '{}' MUST have LANGUAGE (see also §8.10)",
-                    r.media_type, r.name
-                ),
+                format!("{} '{}' MUST have LANGUAGE", r.media_type, r.name),
             ));
         }
     }

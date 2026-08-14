@@ -212,8 +212,13 @@ pub fn probe_init_segment(data: &[u8]) -> InitSegmentProbe {
     }
 
     // Byte scan fallback for boxes our property walker may skip.
-    for w in data.windows(8) {
-        let typ = &w[4..8];
+    for pos in 4..data.len().saturating_sub(3) {
+        let typ = &data[pos..pos + 4];
+        if !matches!(typ, b"mdcv" | b"clli" | b"ludt" | b"vexu" | b"tenc")
+            || !is_plausible_box_at(data, pos)
+        {
+            continue;
+        }
         match typ {
             b"mdcv" => info.has_mdcv = true,
             b"clli" => info.has_clli = true,
@@ -225,6 +230,32 @@ pub fn probe_init_segment(data: &[u8]) -> InitSegmentProbe {
     }
 
     info
+}
+
+/// Whether the fourCC at `pos` is preceded by a box size that fits the buffer.
+/// Without that check any ASCII run in a payload — a `vexu` inside a URL, or in
+/// compressed sample data — would register as a box and set a probe flag.
+fn is_plausible_box_at(data: &[u8], pos: usize) -> bool {
+    if pos < 4 || pos + 4 > data.len() {
+        return false;
+    }
+    let start = pos - 4;
+    let size = u32::from_be_bytes([data[start], data[start + 1], data[start + 2], data[start + 3]]);
+    match size {
+        // Size 0 means the box runs to the end of the file.
+        0 => true,
+        // Size 1 moves the real size into a 64-bit largesize after the type.
+        1 => {
+            let Some(raw) = data.get(pos + 4..pos + 12) else {
+                return false;
+            };
+            let mut large = [0u8; 8];
+            large.copy_from_slice(raw);
+            let large = u64::from_be_bytes(large);
+            large >= 16 && start as u64 + large <= data.len() as u64
+        }
+        _ => size >= 8 && start as u64 + size as u64 <= data.len() as u64,
+    }
 }
 
 impl InitSegmentProbe {
@@ -558,6 +589,32 @@ mod tests {
     fn empty_probe() {
         let p = probe_init_segment(&[]);
         assert!(p.major_brand.is_none());
+    }
+
+    #[test]
+    fn ascii_fourcc_without_a_box_size_is_not_a_box() {
+        // The four bytes ahead of "vexu" read as a ~1.7 GB size, so nothing here
+        // looks like a box even though the fourCC is present verbatim.
+        let p = probe_init_segment(b"free-text-with-vexu-inside-and-tenc-too");
+        assert!(!p.has_vexu);
+        assert!(!p.has_tenc);
+    }
+
+    #[test]
+    fn fallback_scan_accepts_a_sized_box() {
+        let mut data = vec![0u8; 16];
+        data.extend_from_slice(&8u32.to_be_bytes());
+        data.extend_from_slice(b"vexu");
+        assert!(probe_init_segment(&data).has_vexu);
+    }
+
+    #[test]
+    fn box_size_must_fit_the_buffer() {
+        let mut data = 64u32.to_be_bytes().to_vec();
+        data.extend_from_slice(b"vexu");
+        // A 64-byte box in a 12-byte buffer is a truncated read at best.
+        data.extend_from_slice(&[0u8; 4]);
+        assert!(!is_plausible_box_at(&data, 4));
     }
 
     #[test]

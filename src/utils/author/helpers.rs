@@ -1,6 +1,6 @@
 //! Shared Author helpers: issue builders and codec classification.
 
-use crate::utils::validator::types::{Issue, Severity};
+use crate::utils::validator::types::{Issue, MediaRendition, Severity};
 
 pub fn author_issue(severity: Severity, section: &str, message: impl Into<String>) -> Issue {
     Issue::new(
@@ -20,6 +20,32 @@ pub fn author_warn(section: &str, message: impl Into<String>) -> Issue {
 
 pub fn author_info(section: &str, message: impl Into<String>) -> Issue {
     author_issue(Severity::Info, section, message)
+}
+
+/// Descriptive-video audio. A rendition can only be recognised as descriptive audio from its
+/// CHARACTERISTICS or, failing that, from how it is named.
+pub fn audio_is_dvs(r: &MediaRendition) -> bool {
+    let chars = r.characteristics.as_deref().unwrap_or("");
+    chars.contains("describes-video") || name_suggests_dvs(&r.name)
+}
+
+/// Audio mixed to make dialogue easier to follow.
+pub fn audio_enhances_speech(r: &MediaRendition) -> bool {
+    r.characteristics
+        .as_deref()
+        .is_some_and(|c| c.contains("enhances-speech-intelligibility"))
+}
+
+/// NAME wording broadcasters use for described video, so a DVS rendition that omits
+/// §2.12's CHARACTERISTICS is still recognised. Deliberately narrow: every rule keyed
+/// off this is a MUST.
+fn name_suggests_dvs(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("audio description")
+        || n.contains("described")
+        || n.contains("descriptive")
+        || n.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| word == "dvs")
 }
 
 /// Split a CODECS attribute into tokens.

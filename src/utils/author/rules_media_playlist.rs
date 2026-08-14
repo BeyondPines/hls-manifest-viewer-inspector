@@ -109,8 +109,15 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             "AUDIO group referenced but no EXT-X-MEDIA AUDIO with URI",
         ));
     }
+    // §8.10 is the catch-all LANGUAGE requirement for non-VIDEO renditions. Sections that state
+    // the same requirement for a narrower set of renditions own those renditions, so a missing
+    // LANGUAGE is reported once under its most specific section: §4.7 covers SUBTITLES and
+    // CLOSED-CAPTIONS, and §2.27 covers descriptive / speech-intelligibility audio.
     for r in &master.media_renditions {
-        if r.media_type != "VIDEO" && r.uri.is_some() && r.language.is_none() {
+        let covered_elsewhere = matches!(r.media_type.as_str(), "SUBTITLES" | "CLOSED-CAPTIONS")
+            || audio_is_dvs(r)
+            || audio_enhances_speech(r);
+        if r.media_type != "VIDEO" && !covered_elsewhere && r.uri.is_some() && r.language.is_none() {
             issues.push(author_error(
                 "8.10",
                 format!(

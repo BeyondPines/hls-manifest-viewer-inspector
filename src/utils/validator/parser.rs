@@ -168,7 +168,14 @@ pub fn parse_master_playlist(url: &str, content: &str) -> MasterPlaylist {
     master
 }
 
-/// Parse a media playlist from raw content, populating the MediaPlaylist struct
+/// Parse a media playlist from raw content, populating the MediaPlaylist struct.
+///
+/// Segment and EXT-X-MAP URIs are resolved against `url` **after** EXT-X-DEFINE substitution,
+/// so a `{$VAR}` reference that expands to an absolute URL survives. Definitions are collected
+/// as the playlist is read, which matches the spec requirement that a variable is defined
+/// before it is used. Variables inherited from a multivariant playlist must already be in
+/// `pl.definitions` on entry (see
+/// [`crate::utils::validator::apply_master_definitions`]).
 pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
     pl.url = url.to_string();
     pl.raw_content = content.to_string();
@@ -233,7 +240,9 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
             current_byterange = Some(rest.to_string());
         } else if let Some(rest) = line.strip_prefix("#EXT-X-MAP:") {
             let attrs = parse_attributes(rest);
-            current_map_uri = attrs.get("URI").map(|u| resolve_url(url, u));
+            current_map_uri = attrs
+                .get("URI")
+                .map(|u| super::absolute_fetch_uri(url, u, &pl.definitions));
             if let Some(uri) = attrs.get("URI") {
                 // Keep URI and BYTERANGE together and unresolved, so init probing can
                 // substitute EXT-X-DEFINE variables and fetch the right bytes.
@@ -312,8 +321,9 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
                     cumulative_duration = 0.0;
                     None
                 } else { last_pdt.map(|lp| lp + cumulative_duration) };
+                let uri = super::absolute_fetch_uri(url, line, &pl.definitions);
                 pl.segments.push(Segment {
-                    uri: resolve_url(url, line),
+                    uri,
                     duration: dur,
                     title: current_title.take(),
                     pdt: seg_pdt,
@@ -567,6 +577,51 @@ mod tests {
                 byterange: None
             }]
         );
+    }
+
+    // ── parse_media_playlist EXT-X-DEFINE ─────────────────────────────────────
+
+    #[test]
+    fn parse_media_substitutes_define_in_segment_uri_before_resolving() {
+        let mut pl = MediaPlaylist::new("v1".to_string(), String::new());
+        parse_media_playlist(
+            "https://ex.com/hls/prog.m3u8",
+            "#EXTM3U\n\
+             #EXT-X-DEFINE:NAME=\"base\",VALUE=\"https://cdn.example\"\n\
+             #EXTINF:4.0,\n{$base}/seg0.m4s\n",
+            &mut pl,
+        );
+        assert_eq!(pl.segments[0].uri, "https://cdn.example/seg0.m4s");
+    }
+
+    #[test]
+    fn parse_media_substitutes_define_inherited_from_the_multivariant_playlist() {
+        let mut pl = MediaPlaylist::new("v1".to_string(), String::new());
+        pl.definitions
+            .insert("base".to_string(), "https://cdn.example".to_string());
+        parse_media_playlist(
+            "https://ex.com/hls/prog.m3u8",
+            "#EXTM3U\n\
+             #EXT-X-MAP:URI=\"{$base}/init.mp4\"\n\
+             #EXTINF:4.0,\n{$base}/seg0.m4s\n",
+            &mut pl,
+        );
+        assert_eq!(pl.segments[0].uri, "https://cdn.example/seg0.m4s");
+        assert_eq!(
+            pl.segments[0].map_uri.as_deref(),
+            Some("https://cdn.example/init.mp4")
+        );
+    }
+
+    #[test]
+    fn parse_media_still_resolves_relative_segment_uris() {
+        let mut pl = MediaPlaylist::new("v1".to_string(), String::new());
+        parse_media_playlist(
+            "https://ex.com/hls/prog.m3u8",
+            "#EXTM3U\n#EXTINF:4.0,\nseg0.m4s\n",
+            &mut pl,
+        );
+        assert_eq!(pl.segments[0].uri, "https://ex.com/hls/seg0.m4s");
     }
 
     // ── parse_iso8601_to_epoch ────────────────────────────────────────────────

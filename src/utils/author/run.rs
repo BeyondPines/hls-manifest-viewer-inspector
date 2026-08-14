@@ -8,7 +8,7 @@ use crate::utils::network::{
 };
 use crate::utils::validator::parser::parse_media_playlist;
 use crate::utils::validator::types::{CheckGroup, Issue, MediaPlaylist, Severity};
-use crate::utils::validator::{absolute_fetch_uri, collect_stream, now_ms};
+use crate::utils::validator::{absolute_fetch_uri, apply_master_definitions, collect_stream, now_ms};
 
 use super::context::{
     AuthoringContext, InitProbeEntry, SegmentSample, ValidateAuthorOptions, WebVttSample,
@@ -319,6 +319,11 @@ async fn fetch_subtitle_playlists(
                 );
                 pl.media_type = "SUBTITLES".to_string();
                 pl.group_id = Some(group_id.clone());
+                apply_master_definitions(
+                    &resp.response_text,
+                    &master.definitions,
+                    &mut pl.definitions,
+                );
                 parse_media_playlist(fetch_uri, &resp.response_text, &mut pl);
                 playlists.push(pl);
             }
@@ -373,7 +378,11 @@ async fn collect_media_samples(
             entry.media_types.push(pl.media_type.clone());
         }
     }
-    let init_jobs: Vec<InitJob> = init_by_key.into_values().collect();
+    // Findings and probe notes name init segments, so the probe order has to come
+    // from the keys rather than from however the map happens to iterate.
+    let mut keyed_jobs: Vec<(String, InitJob)> = init_by_key.into_iter().collect();
+    keyed_jobs.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let init_jobs: Vec<InitJob> = keyed_jobs.into_iter().map(|(_, job)| job).collect();
 
     let init_fetches = futures::future::join_all(init_jobs.iter().map(|job| {
         let uri = job.uri.clone();
@@ -412,15 +421,11 @@ async fn collect_media_samples(
             let Some((idx, seg)) = pl.segments.iter().enumerate().next() else {
                 continue;
             };
-            let uri = if seg.uri.contains("://") {
-                seg.uri.clone()
-            } else {
-                absolute_fetch_uri(&pl.url, &seg.uri, &pl.definitions)
-            };
             ranged_jobs.push(SegmentJob {
                 playlist_name: pl.name.clone(),
                 segment_index: idx,
-                uri,
+                // Already variable-substituted and absolute — see parse_media_playlist.
+                uri: seg.uri.clone(),
                 duration: seg.duration,
                 range: seg.byterange.as_deref().and_then(parse_byterange),
                 is_iframe_playlist: true,
@@ -447,15 +452,10 @@ async fn collect_media_samples(
                 if pl.is_iframe && idx == 0 {
                     continue;
                 }
-                let uri = if seg.uri.contains("://") {
-                    seg.uri.clone()
-                } else {
-                    absolute_fetch_uri(&pl.url, &seg.uri, &pl.definitions)
-                };
                 ranged_jobs.push(SegmentJob {
                     playlist_name: pl.name.clone(),
                     segment_index: idx,
-                    uri,
+                    uri: seg.uri.clone(),
                     duration: seg.duration,
                     range: seg.byterange.as_deref().and_then(parse_byterange),
                     is_iframe_playlist: pl.is_iframe,
@@ -482,12 +482,7 @@ async fn collect_media_samples(
             if seg.map_uri.is_some() {
                 continue;
             }
-            let uri = if seg.uri.contains("://") {
-                seg.uri.clone()
-            } else {
-                absolute_fetch_uri(&pl.url, &seg.uri, &pl.definitions)
-            };
-            jobs.push((pl.name.clone(), uri));
+            jobs.push((pl.name.clone(), seg.uri.clone()));
         }
         let fetches = futures::future::join_all(jobs.iter().map(|(_, uri)| {
             let uri = uri.clone();

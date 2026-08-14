@@ -44,6 +44,10 @@ pub fn run_authoring_checks(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
     issues.extend(rules_llhls::check(ctx));
     issues.extend(rules_shareplay_spatial::check(ctx));
     issues.extend(rules_deep::check(ctx));
+    // Rules walk hash maps internally, so the order findings arrive in is not
+    // stable across runs. Sort worst-first, then by message, so the same stream
+    // always produces the same report.
+    issues.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.message.cmp(&b.message)));
     issues
 }
 
@@ -551,6 +555,34 @@ https://example.com/v.m3u8
     }
 
     #[test]
+    fn issues_come_back_worst_first_then_by_message() {
+        use std::cmp::Reverse;
+        let issues = master_only_issues(
+            r#"#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en",DEFAULT=YES,CHANNELS="6"
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=1280x720,CODECS="avc1.4d401f,ec-3",AUDIO="aud"
+https://example.com/v720.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=500000,RESOLUTION=640x360,CODECS="avc1.4d401e,ec-3",AUDIO="aud"
+https://example.com/v360.m3u8
+"#,
+            AuthorProfile::None,
+        );
+        assert!(issues.len() > 1, "need several issues to compare ordering");
+        let keys: Vec<_> = issues
+            .iter()
+            .map(|i| (Reverse(i.severity), i.message.as_str()))
+            .collect();
+        assert!(
+            keys.windows(2).all(|w| w[0] <= w[1]),
+            "issues must be sorted, got: {:?}",
+            issues
+                .iter()
+                .map(|i| (i.severity, &i.message))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn author_9_15_frame_rate_is_an_error() {
         let issues = master_only_issues(
             r#"#EXTM3U
@@ -578,6 +610,67 @@ https://example.com/v360.m3u8
         );
         let found = expect_issue(&issues, "§6.1:");
         assert_eq!(found.severity, Severity::Error);
+    }
+
+    /// A subtitle rendition missing LANGUAGE breaks both §4.7 and §8.10. §4.7 is the more
+    /// specific section, so it owns the finding and §8.10 stays quiet.
+    #[test]
+    fn missing_subtitle_language_is_reported_once_under_4_7() {
+        let issues = master_only_issues(
+            r#"#EXTM3U
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",AUTOSELECT=YES,URI="https://example.com/subs.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,AVERAGE-BANDWIDTH=800000,RESOLUTION=1280x720,CODECS="avc1.4d401f",FRAME-RATE=30,SUBTITLES="subs"
+https://example.com/v720.m3u8
+"#,
+            AuthorProfile::None,
+        );
+        let language_issues: Vec<&String> = issues
+            .iter()
+            .map(|i| &i.message)
+            .filter(|m| m.contains("MUST have LANGUAGE"))
+            .collect();
+        assert_eq!(language_issues.len(), 1, "{language_issues:?}");
+        assert!(language_issues[0].contains("§4.7"), "{language_issues:?}");
+    }
+
+    /// §8.10 still owns audio renditions, which no narrower section covers.
+    #[test]
+    fn missing_audio_language_is_still_reported_under_8_10() {
+        let issues = master_only_issues(
+            r#"#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",DEFAULT=YES,CHANNELS="2",URI="https://example.com/a.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,AVERAGE-BANDWIDTH=800000,RESOLUTION=1280x720,CODECS="avc1.4d401f,mp4a.40.2",FRAME-RATE=30,AUDIO="aud"
+https://example.com/v720.m3u8
+"#,
+            AuthorProfile::None,
+        );
+        let language_issues: Vec<&String> = issues
+            .iter()
+            .map(|i| &i.message)
+            .filter(|m| m.contains("MUST have LANGUAGE"))
+            .collect();
+        assert_eq!(language_issues.len(), 1, "{language_issues:?}");
+        assert!(language_issues[0].contains("§8.10"), "{language_issues:?}");
+    }
+
+    /// Descriptive audio missing LANGUAGE breaks §2.27 and §8.10; §2.27 is the narrower rule.
+    #[test]
+    fn missing_descriptive_audio_language_is_reported_once_under_2_27() {
+        let issues = master_only_issues(
+            r#"#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English AD",AUTOSELECT=YES,CHARACTERISTICS="public.accessibility.describes-video",URI="https://example.com/dvs.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,AVERAGE-BANDWIDTH=800000,RESOLUTION=1280x720,CODECS="avc1.4d401f,mp4a.40.2",FRAME-RATE=30,AUDIO="aud"
+https://example.com/v720.m3u8
+"#,
+            AuthorProfile::None,
+        );
+        let language_issues: Vec<&String> = issues
+            .iter()
+            .map(|i| &i.message)
+            .filter(|m| m.contains("MUST have LANGUAGE"))
+            .collect();
+        assert_eq!(language_issues.len(), 1, "{language_issues:?}");
+        assert!(language_issues[0].contains("§2.27"), "{language_issues:?}");
     }
 
     #[test]

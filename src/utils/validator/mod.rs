@@ -175,8 +175,11 @@ pub async fn collect_stream(url: &str) -> Result<CollectedStream, FetchError> {
                 pl.pathway_id = vi.pathway_id.clone();
                 pl.req_video_layout = vi.req_video_layout.clone();
                 pl.http_meta = http_meta_from_fetch(fetch_uri, &resp);
-                parse_media_playlist(fetch_uri, &resp.response_text, &mut pl);
+                // Seed inherited variables before parsing so segment and MAP URIs that
+                // reference them resolve; a local EXT-X-DEFINE still wins because the parser
+                // overwrites the inherited fallback as it reads the tag.
                 apply_master_definitions(&resp.response_text, &master.definitions, &mut pl.definitions);
+                parse_media_playlist(fetch_uri, &resp.response_text, &mut pl);
                 playlists.push(pl);
             }
             Err(e) => {
@@ -221,8 +224,8 @@ pub async fn collect_stream(url: &str) -> Result<CollectedStream, FetchError> {
                 // Derive audio codec from the STREAM-INF entry that references this group
                 pl.codecs = audio_group_codec.get(group_id.as_str()).cloned();
                 pl.http_meta = http_meta_from_fetch(fetch_uri, &resp);
-                parse_media_playlist(fetch_uri, &resp.response_text, &mut pl);
                 apply_master_definitions(&resp.response_text, &master.definitions, &mut pl.definitions);
+                parse_media_playlist(fetch_uri, &resp.response_text, &mut pl);
                 playlists.push(pl);
             }
             Err(e) => {
@@ -335,7 +338,7 @@ fn resolve_imports(
 /// pulled in).  Then, all remaining master definitions are inserted as fallbacks so that
 /// `{$VAR}` references in DATERANGE/X-ASSET-LIST URLs resolve even when the media playlist
 /// has no EXT-X-DEFINE:IMPORT lines (as is common with session-based ad-proxy streams).
-fn apply_master_definitions(
+pub(crate) fn apply_master_definitions(
     content: &str,
     master_defs: &std::collections::HashMap<String, String>,
     pl_defs: &mut std::collections::HashMap<String, String>,

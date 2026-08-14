@@ -5,18 +5,6 @@ use super::helpers::*;
 use super::severity::must;
 use crate::utils::validator::types::Issue;
 
-/// NAME wording broadcasters use for described video, so a DVS rendition that omits
-/// §2.12's CHARACTERISTICS is still recognised. Deliberately narrow: every rule keyed
-/// off this is a MUST.
-fn name_suggests_dvs(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    n.contains("audio description")
-        || n.contains("described")
-        || n.contains("descriptive")
-        || n.split(|c: char| !c.is_ascii_alphanumeric())
-            .any(|word| word == "dvs")
-}
-
 pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
     let mut issues = Vec::new();
     let Some(master) = ctx.master else {
@@ -127,11 +115,8 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
     for r in &audio_renditions {
         let chars = r.characteristics.as_deref().unwrap_or("");
         let has_dvs_characteristic = chars.contains("public.accessibility.describes-video");
-        // A rendition can only be recognised as descriptive audio from its
-        // CHARACTERISTICS or, failing that, from how it is named.
-        let is_dvs =
-            has_dvs_characteristic || chars.contains("describes-video") || name_suggests_dvs(&r.name);
-        let enhances_speech = chars.contains("enhances-speech-intelligibility");
+        let is_dvs = audio_is_dvs(r);
+        let enhances_speech = audio_enhances_speech(r);
 
         // §2.12 — the descriptive-audio characteristic itself, spelled in full.
         if is_dvs && !has_dvs_characteristic {
