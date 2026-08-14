@@ -193,7 +193,7 @@ https://example.com/v.m3u8
 
     #[test]
     fn policy_unused_ok() {
-        let _ = AuthorPolicy::for_profile(AuthorProfile::None, false);
+        let _ = AuthorPolicy::for_profile(AuthorProfile::None, false, false);
     }
 
     #[test]

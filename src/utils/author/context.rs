@@ -185,6 +185,19 @@ impl<'a> AuthoringContext<'a> {
                     })
             })
             .unwrap_or(false);
+        // `PROJ-AIV` is the projection immersive Apple video uses, and the only signal in a
+        // playlist that the spec's AIV guidance is what the content follows.
+        let immersive_aiv = master.is_some_and(|m| {
+            m.variants.iter().any(|v| {
+                v.req_video_layout
+                    .as_deref()
+                    .is_some_and(|l| l.to_ascii_uppercase().contains("PROJ-AIV"))
+            })
+        }) || playlists.iter().any(|p| {
+            p.req_video_layout
+                .as_deref()
+                .is_some_and(|l| l.to_ascii_uppercase().contains("PROJ-AIV"))
+        });
         let mut notes = Vec::new();
         notes.push(
             "TLS cipher/certificate validation (Apple Authoring Spec §12.1–12.3) is not available in-browser."
@@ -197,6 +210,12 @@ impl<'a> AuthoringContext<'a> {
             webvtt_samples.len(),
         ));
         notes.extend(init_brand_note(init_probes));
+        if immersive_aiv {
+            notes.push(
+                "This stream declares PROJ-AIV immersive video. Where the Authoring Spec's AIV guidance (§1.25 tiers, §16.6) contradicts a general rule, that rule is reported as information naming the conflict rather than as a failure."
+                    .to_string(),
+            );
+        }
         if !options.deep_checks {
             notes.push(
                 "Deep Author checks are off — enable to measure bandwidth, IDR interval, tfdt/TS continuity, and CC SEI."
@@ -212,7 +231,7 @@ impl<'a> AuthoringContext<'a> {
             master,
             playlists,
             master_http: master.map(|m| &m.http_meta),
-            policy: AuthorPolicy::for_profile(options.profile, all_stereo),
+            policy: AuthorPolicy::for_profile(options.profile, all_stereo, immersive_aiv),
             deep_checks: options.deep_checks,
             init_probes,
             segment_samples,

@@ -22,6 +22,33 @@ pub fn author_info(section: &str, message: impl Into<String>) -> Issue {
     author_issue(Severity::Info, section, message)
 }
 
+/// A finding that the Authoring Spec's own immersive AIV guidance may contradict.
+///
+/// Immersive AIV content as §1.25 and §16.6 describe it — 4320×4320 at 90 fps, 25 to
+/// 100 Mbps, MV-HEVC — cannot also satisfy the general limits on frame rate, HEVC level,
+/// bit rate and HDR frame rate. On such a stream the general rule is reported for
+/// information, naming the conflict, instead of failing a run over a stream that follows
+/// the spec's own recommendation.
+pub fn author_conflict_aware_issue(
+    policy: &super::profile::AuthorPolicy,
+    severity: Severity,
+    section: &str,
+    message: impl Into<String>,
+) -> Issue {
+    let message = message.into();
+    if !policy.aiv_spec_conflict(section) {
+        return author_issue(severity, section, message);
+    }
+    author_info(
+        section,
+        format!(
+            "Spec conflict (PROJ-AIV): {message}. This stream declares immersive AIV video, \
+             whose own guidance (§1.25 tiers at 4320×4320 and 90 fps, §16.6 MV-HEVC) cannot \
+             also meet this general requirement, so it is reported for information"
+        ),
+    )
+}
+
 /// Descriptive-video audio. A rendition can only be recognised as descriptive audio from its
 /// CHARACTERISTICS or, failing that, from how it is named.
 pub fn audio_is_dvs(r: &MediaRendition) -> bool {

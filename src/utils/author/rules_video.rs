@@ -103,7 +103,9 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
     for v in &variants {
         if let Some(fps) = v.frame_rate {
             if fps > 60.0 {
-                issues.push(author_error(
+                issues.push(author_conflict_aware_issue(
+                    &ctx.policy,
+                    must(),
                     "1.19",
                     format!("FRAME-RATE {fps} exceeds 60 on '{}'", v.uri),
                 ));
@@ -135,7 +137,8 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             } else {
                 should()
             };
-            issues.push(author_issue(
+            issues.push(author_conflict_aware_issue(
+                &ctx.policy,
                 sev,
                 "1.20",
                 "HDR present but no HDR variant at ≤30 fps",
@@ -224,7 +227,9 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             continue;
         };
         if bw.abs_diff(DEFAULT_VARIANT_TARGET_BPS) > DEFAULT_VARIANT_TOLERANCE_BPS {
-            issues.push(author_warn(
+            issues.push(author_conflict_aware_issue(
+                &ctx.policy,
+                should(),
                 "1.32",
                 format!(
                     "default {family} variant '{}' declares {} kbps; the first variant a client can play should be near ~{} kbps AVERAGE-BANDWIDTH",
@@ -244,7 +249,9 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
                 .is_some_and(|bw| IOS_CELLULAR_BPS.contains(&bw))
         });
         if !cellular {
-            issues.push(author_warn(
+            issues.push(author_conflict_aware_issue(
+                &ctx.policy,
+                should(),
                 "1.32",
                 "iOS: no lower-bitrate (~800 kbps) variant to start from on cellular",
             ));
@@ -282,7 +289,9 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         if !uhd.is_empty() {
             let ok = uhd.iter().any(|v| v.bandwidth.unwrap_or(u64::MAX) <= 15_000_000);
             if !ok {
-                issues.push(author_warn(
+                issues.push(author_conflict_aware_issue(
+                    &ctx.policy,
+                    should(),
                     "1.34",
                     "UHD present but no UHD variant at ≤15 Mbps",
                 ));
@@ -485,12 +494,10 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
                 let hevc_level = hevc_level_from_idc(raw);
                 init_hevc_levels.push(hevc_level);
                 if hevc_level > HEVC_MAX_LEVEL + 0.01 && !ctx.policy.is_exempt("1.6b") {
-                    issues.push(author_error(
-                        "1.6b",
-                        format!(
-                            "HEVC level {hevc_level} in init '{}' exceeds Main10 Level {HEVC_MAX_LEVEL}",
-                            entry.uri
-                        ),
+                    issues.push(hevc_level_issue(
+                        ctx,
+                        hevc_level,
+                        format!("HEVC level {hevc_level} in init '{}'", entry.uri),
                     ));
                 }
             }
@@ -502,7 +509,8 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             {
                 init_hevc_profiles.push(idc);
                 if idc != HEVC_MAIN10_PROFILE_IDC && !ctx.policy.is_exempt("1.6b") {
-                    issues.push(author_issue(
+                    issues.push(author_conflict_aware_issue(
+                        &ctx.policy,
                         must(),
                         "1.6b",
                         format!(
@@ -606,18 +614,17 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
                         let already_reported =
                             init_hevc_levels.iter().any(|l| (l - level).abs() < 0.01);
                         if !already_reported && level > HEVC_MAX_LEVEL + 0.01 {
-                            issues.push(author_error(
-                                "1.6b",
-                                format!(
-                                    "HEVC CODECS '{tok}' on '{}' is level {level:.1}, above Main 10 Level {HEVC_MAX_LEVEL}",
-                                    v.uri
-                                ),
+                            issues.push(hevc_level_issue(
+                                ctx,
+                                level,
+                                format!("HEVC CODECS '{tok}' on '{}' is level {level:.1}", v.uri),
                             ));
                         }
                     }
                     if let Some(idc) = hevc.profile_idc {
                         if idc != HEVC_MAIN10_PROFILE_IDC && !init_hevc_profiles.contains(&idc) {
-                            issues.push(author_issue(
+                            issues.push(author_conflict_aware_issue(
+                                &ctx.policy,
                                 must(),
                                 "1.6b",
                                 format!(
@@ -726,6 +733,26 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
 
     // AirPlay +1.41 — CENC pattern checks live in protection rules
     issues
+}
+
+/// A §1.6b level finding. The general ceiling is Main 10 Level 5.1, but immersive AIV as
+/// §1.25 describes it — 4320×4320 at 90 fps — needs Level 6.1, so on such a stream a level
+/// up to 6.1 is the encode the spec's own tiers ask for and is reported as the conflict it
+/// is. A level the AIV guidance does not explain stays an error.
+fn hevc_level_issue(ctx: &AuthoringContext<'_>, level: f64, subject: String) -> Issue {
+    let ceiling = ctx.policy.hevc_error_level_ceiling(HEVC_MAX_LEVEL);
+    if level > ceiling + 0.01 {
+        return author_error(
+            "1.6b",
+            format!("{subject}, above the maximum Level {ceiling} for this content"),
+        );
+    }
+    author_conflict_aware_issue(
+        &ctx.policy,
+        must(),
+        "1.6b",
+        format!("{subject}, above Main 10 Level {HEVC_MAX_LEVEL}"),
+    )
 }
 
 /// The variant a client starts on for each video codec family: the first one listed,
@@ -930,6 +957,105 @@ https://example.com/1080.m3u8
         assert!(
             issues.is_empty(),
             "a compliant default must not be reported because lower rungs exist: {issues:?}"
+        );
+    }
+
+    // ── PROJ-AIV spec conflicts ──────────────────────────────────────────────
+
+    /// An immersive AIV ladder as §1.25 describes one: 4320×4320 at 90 fps and 50 Mbps,
+    /// stereo MV-HEVC at Level 6.1 (`general_level_idc` 183).
+    const AIV_MASTER: &str = r#"#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=100000000,AVERAGE-BANDWIDTH=50000000,RESOLUTION=4320x4320,CODECS="hvc1.2.4.L183.B0",FRAME-RATE=90,VIDEO-RANGE=PQ,REQ-VIDEO-LAYOUT="CH-STEREO,PROJ-AIV"
+https://example.com/aiv.m3u8
+"#;
+    /// The same shape without the immersive layout, which no part of the spec asks for.
+    const NON_AIV_90FPS_MASTER: &str = r#"#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=100000000,AVERAGE-BANDWIDTH=50000000,RESOLUTION=4320x4320,CODECS="hvc1.2.4.L183.B0",FRAME-RATE=90,VIDEO-RANGE=PQ
+https://example.com/fast.m3u8
+"#;
+
+    #[test]
+    fn author_1_19_reports_aiv_frame_rate_as_a_spec_conflict() {
+        let issues = section_issues(AIV_MASTER, &[], &[], "1.19");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Info);
+        assert!(
+            issues[0].message.contains("Spec conflict (PROJ-AIV)")
+                && issues[0].message.contains("FRAME-RATE 90"),
+            "got: {}",
+            issues[0].message
+        );
+    }
+
+    #[test]
+    fn author_1_19_still_errors_on_90_fps_without_an_immersive_layout() {
+        let issues = section_issues(NON_AIV_90FPS_MASTER, &[], &[], "1.19");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(!issues[0].message.contains("Spec conflict"));
+    }
+
+    #[test]
+    fn author_1_6b_accepts_level_6_1_on_aiv_but_not_beyond() {
+        let at_ceiling = section_issues(AIV_MASTER, &[], &[], "1.6b");
+        assert!(
+            at_ceiling.iter().all(|i| i.severity == Severity::Info),
+            "Level 6.1 is the level the AIV tiers need, got: {at_ceiling:?}"
+        );
+
+        // Level 6.2 (`general_level_idc` 186) is not explained by the AIV tiers.
+        let beyond = section_issues(
+            &AIV_MASTER.replace("L183", "L186"),
+            &[],
+            &[],
+            "1.6b",
+        );
+        assert!(
+            beyond.iter().any(|i| i.severity == Severity::Error),
+            "a level above 6.1 stays an error on AIV content, got: {beyond:?}"
+        );
+    }
+
+    #[test]
+    fn author_1_6b_still_errors_above_5_1_without_an_immersive_layout() {
+        let issues = section_issues(NON_AIV_90FPS_MASTER, &[], &[], "1.6b");
+        assert!(
+            issues.iter().any(|i| i.severity == Severity::Error),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn aiv_bitrate_and_hdr_rules_become_spec_conflicts() {
+        for section in ["1.20", "1.32", "1.34"] {
+            let issues = section_issues(AIV_MASTER, &[], &[], section);
+            assert_eq!(issues.len(), 1, "§{section}: {issues:?}");
+            assert_eq!(issues[0].severity, Severity::Info, "§{section}");
+            assert!(
+                issues[0].message.contains("Spec conflict (PROJ-AIV)"),
+                "§{section}: {}",
+                issues[0].message
+            );
+        }
+    }
+
+    #[test]
+    fn non_conflicting_rules_still_fail_on_aiv_content() {
+        // §1.36 is about MV-HEVC carrying non-stereo video, which AIV does not excuse.
+        let playlists = vec![video_playlist(
+            "video/4320x4320 · 100000k",
+            "https://example.com/aiv.m3u8",
+        )];
+        let inits = vec![hevc_init(
+            "https://example.com/aiv-init.mp4",
+            "video/4320x4320 · 100000k",
+            true,
+        )];
+        let master = AIV_MASTER.replace(",REQ-VIDEO-LAYOUT=\"CH-STEREO,PROJ-AIV\"", "");
+        let issues = section_issues(&master, &playlists, &inits, "1.36");
+        assert!(
+            issues.iter().any(|i| i.severity == Severity::Error),
+            "{issues:?}"
         );
     }
 
