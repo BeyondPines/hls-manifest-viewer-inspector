@@ -259,11 +259,39 @@ pub fn parse_avc_codec(token: &str) -> Option<AvcCodec> {
     Some(AvcCodec { profile_idc, level })
 }
 
-/// HEVC `general_profile_idc` (1 = Main, 2 = Main 10) and level read from an
-/// `hvc1`/`hev1` CODECS token. Either field may be absent from a short token.
+/// HEVC tier: `general_tier_flag` is set for High tier and clear for Main tier, and the
+/// CODECS string spells the same distinction as the `L` or `H` prefix on its level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HevcTier {
+    Main,
+    High,
+}
+
+impl HevcTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Main => "Main",
+            Self::High => "High",
+        }
+    }
+
+    /// The tier an init probe reports. `general_tier_flag` arrives as a boolean, so both
+    /// its spellings and the tier names are accepted.
+    pub fn from_flag(flag: &str) -> Option<Self> {
+        match flag.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "high" => Some(Self::High),
+            "false" | "0" | "main" => Some(Self::Main),
+            _ => None,
+        }
+    }
+}
+
+/// HEVC `general_profile_idc` (1 = Main, 2 = Main 10), tier and level read from an
+/// `hvc1`/`hev1` CODECS token. Any field may be absent from a short token.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HevcCodec {
     pub profile_idc: Option<u32>,
+    pub tier: Option<HevcTier>,
     pub level: Option<f64>,
 }
 
@@ -281,15 +309,23 @@ pub fn parse_hevc_codec(token: &str) -> Option<HevcCodec> {
     }
     let parts: Vec<&str> = rest.split('.').collect();
     let profile_idc = parts.first().and_then(|p| strip_alpha(p).parse::<u32>().ok());
-    let level = parts
-        .iter()
-        .find(|p| {
-            let mut chars = p.chars();
-            matches!(chars.next(), Some('l') | Some('h')) && chars.all(|c| c.is_ascii_digit())
-        })
+    let tier_and_level = parts.iter().find(|p| {
+        let mut chars = p.chars();
+        matches!(chars.next(), Some('l') | Some('h')) && chars.all(|c| c.is_ascii_digit())
+    });
+    let tier = tier_and_level.and_then(|p| match p.chars().next() {
+        Some('l') => Some(HevcTier::Main),
+        Some('h') => Some(HevcTier::High),
+        _ => None,
+    });
+    let level = tier_and_level
         .and_then(|p| strip_alpha(p).parse::<f64>().ok())
         .map(hevc_level_from_idc);
-    Some(HevcCodec { profile_idc, level })
+    Some(HevcCodec {
+        profile_idc,
+        tier,
+        level,
+    })
 }
 
 /// Dolby Vision profile and level read from a `dvh1.PP.LL` / `dvhe.PP.LL` CODECS token.

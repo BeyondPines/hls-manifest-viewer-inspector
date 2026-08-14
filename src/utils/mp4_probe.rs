@@ -38,7 +38,7 @@ pub struct InitSegmentProbe {
     pub audio_sample_fourcc: Option<String>,
     pub video_profile: Option<String>,
     pub video_level: Option<String>,
-    /// HEVC general_tier_flag when available ("Main" / "High").
+    /// HEVC general_tier_flag as the atom reports it: "true" for High tier, "false" for Main.
     pub video_tier: Option<String>,
     pub has_ludt: bool,
     pub has_senc: bool,

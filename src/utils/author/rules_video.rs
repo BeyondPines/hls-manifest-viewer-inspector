@@ -641,6 +641,8 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         }
     }
 
+    issues.extend(codecs_vs_hvcc_issues(ctx, &variants));
+
     // §1.3a — at least one H.264 variant ≤ High@L4.1 when H.264 present
     if !ctx.policy.is_exempt("1.3a") {
         let h264_levels: Vec<f64> = ctx
@@ -809,6 +811,88 @@ fn playlist_url_matches(playlist_url: &str, variant_uri: &str) -> bool {
 
 /// Inits mapped by the media playlist behind `variant_uri`. Per-variant checks use this
 /// so a finding is never reported against a variant the init does not belong to.
+/// §9.1 — a CODECS attribute that names HEVC has to describe the HEVC the variant
+/// actually delivers: a player picks the variant from this string alone (RFC 8216
+/// §4.4.6.2), so a profile, tier or level that the `hvcC` contradicts either sends
+/// unplayable media to a device that trusted it or hides playable media from one that
+/// didn't. Only inits reached from this variant's own playlist are compared, and only
+/// where both sides parsed.
+fn codecs_vs_hvcc_issues(
+    ctx: &AuthoringContext<'_>,
+    variants: &[&MasterRendition],
+) -> Vec<Issue> {
+    let mut issues = Vec::new();
+    for v in variants {
+        let Some(codecs) = &v.codecs else { continue };
+        for tok in codec_tokens(codecs) {
+            if video_codec_family(tok) != Some("hevc") {
+                continue;
+            }
+            let Some(declared) = parse_hevc_codec(tok) else {
+                continue;
+            };
+            for entry in inits_for_variant(ctx, &v.uri) {
+                let probe = &entry.probe;
+                // dvh1/dvhe and MV-HEVC layers carry their own configuration records; an
+                // hvcC only speaks for the hvc1/hev1 token when the sample entry agrees.
+                let hevc_sample_entry = probe
+                    .video_sample_fourcc
+                    .as_deref()
+                    .is_some_and(|c| matches!(c.to_ascii_lowercase().as_str(), "hvc1" | "hev1"));
+                if !hevc_sample_entry {
+                    continue;
+                }
+                let mut mismatches: Vec<String> = Vec::new();
+                let actual_profile = probe
+                    .video_profile
+                    .as_deref()
+                    .and_then(|s| s.trim().parse::<u32>().ok());
+                if let (Some(want), Some(have)) = (declared.profile_idc, actual_profile) {
+                    if want != have {
+                        mismatches.push(format!(
+                            "profile {} declared, {} in hvcC",
+                            hevc_profile_name(want),
+                            hevc_profile_name(have)
+                        ));
+                    }
+                }
+                let actual_tier = probe.video_tier.as_deref().and_then(HevcTier::from_flag);
+                if let (Some(want), Some(have)) = (declared.tier, actual_tier) {
+                    if want != have {
+                        mismatches.push(format!(
+                            "{} tier declared, {} tier in hvcC",
+                            want.as_str(),
+                            have.as_str()
+                        ));
+                    }
+                }
+                let actual_level = probe
+                    .video_level
+                    .as_deref()
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .map(hevc_level_from_idc);
+                if let (Some(want), Some(have)) = (declared.level, actual_level) {
+                    if (want - have).abs() > 0.01 {
+                        mismatches.push(format!("level {want:.1} declared, {have:.1} in hvcC"));
+                    }
+                }
+                if !mismatches.is_empty() {
+                    issues.push(author_error(
+                        "9.1",
+                        format!(
+                            "CODECS '{tok}' on '{}' does not describe init '{}': {}",
+                            v.uri,
+                            entry.uri,
+                            mismatches.join("; ")
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    issues
+}
+
 fn inits_for_variant<'a>(
     ctx: &AuthoringContext<'a>,
     variant_uri: &str,
@@ -957,6 +1041,87 @@ https://example.com/1080.m3u8
         assert!(
             issues.is_empty(),
             "a compliant default must not be reported because lower rungs exist: {issues:?}"
+        );
+    }
+
+    // ── §9.1 CODECS against hvcC ─────────────────────────────────────────────
+
+    /// One HEVC rung declaring Main 10, Main tier, Level 4.1 (`L123`).
+    const HEVC_MASTER: &str = r#"#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=6000000,AVERAGE-BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS="hvc1.2.4.L123.B0",FRAME-RATE=30
+https://example.com/hevc.m3u8
+"#;
+
+    /// An HEVC init whose hvcC reports `general_profile_idc`, `general_tier_flag` and
+    /// `general_level_idc` exactly as the atom does.
+    fn hvcc_init(profile_idc: &str, tier_flag: &str, level_idc: &str) -> InitProbeEntry {
+        InitProbeEntry {
+            uri: "https://example.com/hevc-init.mp4".into(),
+            byterange: None,
+            playlist_names: vec!["hevc".into()],
+            media_types: vec!["VIDEO".into()],
+            probe: InitSegmentProbe {
+                major_brand: Some("iso6".into()),
+                video_sample_fourcc: Some("hvc1".into()),
+                video_profile: Some(profile_idc.into()),
+                video_tier: Some(tier_flag.into()),
+                video_level: Some(level_idc.into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn author_9_1_errors_when_codecs_level_contradicts_the_hvcc() {
+        let playlists = vec![video_playlist("hevc", "https://example.com/hevc.m3u8")];
+        // general_level_idc 153 is Level 5.1, not the Level 4.1 the CODECS string promises.
+        let inits = vec![hvcc_init("2", "false", "153")];
+        let issues = section_issues(HEVC_MASTER, &playlists, &inits, "9.1");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(
+            issues[0].message.contains("level 4.1 declared, 5.1 in hvcC"),
+            "got: {}",
+            issues[0].message
+        );
+    }
+
+    #[test]
+    fn author_9_1_errors_when_codecs_tier_and_profile_contradict_the_hvcc() {
+        let playlists = vec![video_playlist("hevc", "https://example.com/hevc.m3u8")];
+        // Main profile at High tier behind a CODECS string claiming Main 10 at Main tier.
+        let inits = vec![hvcc_init("1", "true", "123")];
+        let issues = section_issues(HEVC_MASTER, &playlists, &inits, "9.1");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(
+            issues[0]
+                .message
+                .contains("profile 2 (Main 10) declared, 1 (Main) in hvcC")
+                && issues[0].message.contains("Main tier declared, High tier in hvcC"),
+            "both mismatches belong in one finding, got: {}",
+            issues[0].message
+        );
+    }
+
+    #[test]
+    fn author_9_1_accepts_codecs_that_matches_the_hvcc() {
+        let playlists = vec![video_playlist("hevc", "https://example.com/hevc.m3u8")];
+        let inits = vec![hvcc_init("2", "false", "123")];
+        let issues = section_issues(HEVC_MASTER, &playlists, &inits, "9.1");
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
+    fn author_9_1_stays_quiet_when_the_hvcc_was_not_read() {
+        let playlists = vec![video_playlist("hevc", "https://example.com/hevc.m3u8")];
+        let mut init = hvcc_init("2", "false", "123");
+        init.probe.video_profile = None;
+        init.probe.video_tier = None;
+        init.probe.video_level = None;
+        let issues = section_issues(HEVC_MASTER, &playlists, &[init], "9.1");
+        assert!(
+            issues.is_empty(),
+            "an unread hvcC is not evidence of a mismatch: {issues:?}"
         );
     }
 
