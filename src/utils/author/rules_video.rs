@@ -817,10 +817,7 @@ fn playlist_url_matches(playlist_url: &str, variant_uri: &str) -> bool {
 /// unplayable media to a device that trusted it or hides playable media from one that
 /// didn't. Only inits reached from this variant's own playlist are compared, and only
 /// where both sides parsed.
-fn codecs_vs_hvcc_issues(
-    ctx: &AuthoringContext<'_>,
-    variants: &[&MasterRendition],
-) -> Vec<Issue> {
+fn codecs_vs_hvcc_issues(ctx: &AuthoringContext<'_>, variants: &[&MasterRendition]) -> Vec<Issue> {
     let mut issues = Vec::new();
     for v in variants {
         let Some(codecs) = &v.codecs else { continue };

@@ -271,6 +271,11 @@ pub struct PlaylistHttpMeta {
     pub request_url: String,
     pub final_url: String,
     pub content_encoding: Option<String>,
+    /// `Content-Length` from the response, which counts the bytes as sent.
+    pub content_length: Option<u64>,
+    /// Bytes of the playlist text after the browser decoded any content coding. Equal
+    /// lengths on both fields mean nothing was decoded, so nothing was compressed.
+    pub body_bytes: Option<u64>,
     pub last_modified: Option<String>,
     pub date: Option<String>,
 }

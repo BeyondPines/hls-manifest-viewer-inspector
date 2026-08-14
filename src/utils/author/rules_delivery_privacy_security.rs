@@ -2,6 +2,7 @@
 
 use super::context::AuthoringContext;
 use super::helpers::*;
+use super::severity::should;
 use crate::utils::validator::types::Issue;
 use url::Url;
 
@@ -88,10 +89,17 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
     issues
 }
 
+/// Playlist text this size is certain to shrink under gzip, so a `Content-Length` matching
+/// it byte for byte rules out compression rather than merely suggesting it. Below this a
+/// tiny playlist could plausibly encode to its own length and the evidence is dropped.
+const GZIP_EVIDENCE_MIN_BYTES: u64 = 1024;
+
 /// §10.1 — playlists SHOULD be served gzip-encoded. A browser that accepted a gzip response
 /// decodes it transparently and drops Content-Encoding from the Response we can read, so an
-/// absent header proves nothing: report it once for the whole stream as Info. A header naming
-/// some other encoding was really sent and is still worth an error.
+/// absent header proves nothing on its own. `Content-Length` counts the bytes as sent,
+/// though: when it equals the decoded text we hold, nothing was decoded, and a Warn is
+/// warranted for this SHOULD. Where that comparison isn't available the finding stays Info.
+/// A header naming some other encoding was really sent and is still worth an error.
 fn check_playlist_content_encoding(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
     let mut issues = Vec::new();
     let mut metas = Vec::new();
@@ -102,7 +110,8 @@ fn check_playlist_content_encoding(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         metas.push((pl.name.as_str(), &pl.http_meta));
     }
 
-    let mut unobserved = 0usize;
+    let mut unproven = 0usize;
+    let mut uncompressed: Vec<String> = Vec::new();
     for (name, meta) in &metas {
         if meta.request_url.is_empty() && meta.final_url.is_empty() {
             continue;
@@ -113,7 +122,12 @@ fn check_playlist_content_encoding(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             .unwrap_or("")
             .to_ascii_lowercase();
         if enc.is_empty() {
-            unobserved += 1;
+            match (meta.content_length, meta.body_bytes) {
+                (Some(sent), Some(held)) if sent == held && held >= GZIP_EVIDENCE_MIN_BYTES => {
+                    uncompressed.push(format!("'{name}' ({held} bytes)"));
+                }
+                _ => unproven += 1,
+            }
         } else if !enc.split(',').any(|e| e.trim() == "gzip") {
             issues.push(author_error(
                 "10.1",
@@ -121,11 +135,29 @@ fn check_playlist_content_encoding(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             ));
         }
     }
-    if unobserved > 0 {
+    if !uncompressed.is_empty() {
+        let named: Vec<&str> = uncompressed.iter().take(3).map(String::as_str).collect();
+        let rest = uncompressed.len().saturating_sub(named.len());
+        let and_more = if rest > 0 {
+            format!(" and {rest} more")
+        } else {
+            String::new()
+        };
+        issues.push(author_issue(
+            should(),
+            "10.1",
+            format!(
+                "{} playlist response(s) arrived uncompressed: Content-Length matches the playlist text byte for byte on {}{and_more}, so no content coding was applied",
+                uncompressed.len(),
+                named.join(", ")
+            ),
+        ));
+    }
+    if unproven > 0 {
         issues.push(author_info(
             "10.1",
             format!(
-                "no Content-Encoding observed on {unobserved} playlist response(s) — browsers decode gzip transparently and hide the header, so verify gzip delivery on the server or with curl"
+                "no Content-Encoding observed on {unproven} playlist response(s) — browsers decode gzip transparently and hide the header, so verify gzip delivery on the server or with curl"
             ),
         ));
     }
@@ -411,6 +443,56 @@ mod tests {
         assert_eq!(issues.len(), 1, "one report for the stream: {issues:?}");
         assert_eq!(issues[0].severity, Severity::Info);
         assert!(issues[0].message.contains("3 playlist response(s)"));
+    }
+
+    #[test]
+    fn author_10_1_warns_when_content_length_proves_no_compression() {
+        let mut pl = fetched_playlist("video/720p", "https://example.com/v.m3u8", &["0.m4s"]);
+        pl.http_meta.content_encoding = None;
+        pl.http_meta.content_length = Some(4096);
+        pl.http_meta.body_bytes = Some(4096);
+        let issues = issues_for_section(&[pl], "§10.1");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Warn);
+        assert!(
+            issues[0].message.contains("uncompressed")
+                && issues[0].message.contains("'video/720p' (4096 bytes)"),
+            "got: {}",
+            issues[0].message
+        );
+    }
+
+    #[test]
+    fn author_10_1_keeps_a_shrunken_content_length_out_of_the_warning() {
+        let mut pl = fetched_playlist("video/720p", "https://example.com/v.m3u8", &["0.m4s"]);
+        pl.http_meta.content_encoding = None;
+        // The browser decoded 4096 bytes of playlist out of 900 bytes on the wire.
+        pl.http_meta.content_length = Some(900);
+        pl.http_meta.body_bytes = Some(4096);
+        let issues = issues_for_section(&[pl], "§10.1");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(
+            issues[0].severity,
+            Severity::Info,
+            "a smaller Content-Length is consistent with gzip, so nothing is proven: {}",
+            issues[0].message
+        );
+    }
+
+    #[test]
+    fn author_10_1_ignores_equal_lengths_on_a_tiny_playlist() {
+        let mut pl = fetched_playlist("video/720p", "https://example.com/v.m3u8", &["0.m4s"]);
+        pl.http_meta.content_encoding = None;
+        pl.http_meta.content_length = Some(120);
+        pl.http_meta.body_bytes = Some(120);
+        let issues = issues_for_section(&[pl], "§10.1");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(
+            issues[0].severity,
+            Severity::Info,
+            "gzip can fail to shrink a very short playlist: {}",
+            issues[0].message
+        );
     }
 
     #[test]

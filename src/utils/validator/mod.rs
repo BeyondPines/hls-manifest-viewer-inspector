@@ -32,6 +32,8 @@ fn http_meta_from_fetch(request_url: &str, resp: &crate::utils::network::FetchTe
         request_url: request_url.to_string(),
         final_url: resp.final_url.clone(),
         content_encoding: resp.content_encoding.clone(),
+        content_length: resp.content_length,
+        body_bytes: Some(resp.response_text.len() as u64),
         last_modified: resp.last_modified.clone(),
         date: resp.date.clone(),
     }

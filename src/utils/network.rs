@@ -41,6 +41,9 @@ pub struct FetchTextResponse {
     /// Final response URL after redirects (may differ from the request URL).
     pub final_url: String,
     pub content_encoding: Option<String>,
+    /// `Content-Length` as the server sent it, which is the encoded length: a gzip
+    /// response declares fewer bytes here than the text this struct carries.
+    pub content_length: Option<u64>,
     pub last_modified: Option<String>,
     pub date: Option<String>,
 }
@@ -82,6 +85,8 @@ pub async fn fetch_text(request_url: String) -> Result<FetchTextResponse, FetchE
     let response = response_from(&request_url, None).await?;
     let final_url = response.url();
     let content_encoding = header_get(&response, "Content-Encoding");
+    let content_length =
+        header_get(&response, "Content-Length").and_then(|v| v.trim().parse::<u64>().ok());
     let last_modified = header_get(&response, "Last-Modified");
     let date = header_get(&response, "Date");
     let response_text = JsFuture::from(response.text().map_err(fetch_failed)?)
@@ -93,6 +98,7 @@ pub async fn fetch_text(request_url: String) -> Result<FetchTextResponse, FetchE
         response_text,
         final_url,
         content_encoding,
+        content_length,
         last_modified,
         date,
     })
