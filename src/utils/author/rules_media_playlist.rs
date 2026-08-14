@@ -232,16 +232,27 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         }
     }
 
-    // §8.22–8.25 — INDEPENDENT-SEGMENTS for xHE-AAC/APAC
+    // §8.23 / §8.25 — EXT-X-INDEPENDENT-SEGMENTS for xHE-AAC and APAC. §8.22 is the rule
+    // about aligned segment boundaries across renditions, so each codec is reported under
+    // the section that names it. Both are conditional on the segments starting with an IPF
+    // or an ASP, which cannot be read from the playlist, hence the wording.
     for pl in ctx.playlists {
-        let codecs = pl.codecs.as_deref().unwrap_or("");
-        let needs_indep = codecs.to_ascii_lowercase().contains("mp4a.40.42")
-            || codecs.to_ascii_lowercase().contains("apac");
-        if needs_indep && !pl.independent_segments && !master.independent_segments {
+        let codecs = pl.codecs.as_deref().unwrap_or("").to_ascii_lowercase();
+        let cited = if codecs.contains("mp4a.40.42") {
+            Some(("8.23", "xHE-AAC", "an Immediate Playout Frame (IPF)"))
+        } else if codecs.contains("apac") {
+            Some(("8.25", "APAC", "an Audio Synchronization Packet (ASP)"))
+        } else {
+            None
+        };
+        let Some((section, codec, opener)) = cited else {
+            continue;
+        };
+        if !pl.independent_segments && !master.independent_segments {
             issues.push(author_warn(
-                "8.22",
+                section,
                 format!(
-                    "'{}' uses xHE-AAC/APAC without INDEPENDENT-SEGMENTS",
+                    "'{}' carries {codec} without EXT-X-INDEPENDENT-SEGMENTS, which SHOULD be present when its segments start with {opener}",
                     pl.name
                 ),
             ));

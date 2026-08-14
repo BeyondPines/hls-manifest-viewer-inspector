@@ -718,17 +718,11 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         }
     }
 
-    // visionOS +1.40: when profile is visionOS and stereo, ensure REQ-VIDEO-LAYOUT
-    if ctx.policy.profile == super::profile::AuthorProfile::VisionOs {
-        for v in &variants {
-            if v.req_video_layout.is_none() {
-                issues.push(author_warn(
-                    "1.40",
-                    format!("visionOS: missing REQ-VIDEO-LAYOUT on '{}'", v.uri),
-                ));
-            }
-        }
-    }
+    // A missing REQ-VIDEO-LAYOUT belongs to §16.1, which asks for the attribute on the
+    // variants that carry spatial video and reads that from the media rather than from the
+    // platform profile. §1.40 is the visionOS rule about Dolby Vision stereo profiles, so
+    // reporting the attribute under it named a requirement that does not exist, on flat
+    // variants that need no layout.
 
     // AirPlay +1.41 — CENC pattern checks live in protection rules
     issues

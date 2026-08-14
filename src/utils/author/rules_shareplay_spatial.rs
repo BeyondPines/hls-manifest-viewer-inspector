@@ -141,15 +141,65 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         }
     }
 
-    // visionOS 16.6–16.7
-    if ctx.policy.profile == super::profile::AuthorProfile::VisionOs && expects_spatial {
-        issues.push(author_info(
-            "16.6",
-            "visionOS spatial playback: verify parallax/eye metadata in media (vexu children)",
+    // §16.6 (visionOS) — all stereo video MUST be encoded using MV-HEVC, which an init
+    // signals with an lhvC layered-HEVC configuration. The rule used to restate §16.4's
+    // parallax advice here, which said nothing about the encode it is written about.
+    if ctx.policy.profile == super::profile::AuthorProfile::VisionOs {
+        for pl in ctx.video_playlists() {
+            if !layout_is_stereo(pl.req_video_layout.as_deref()) {
+                continue;
+            }
+            // Only an init that was probed can show whether the encode is MV-HEVC; without
+            // one there is nothing to report either way.
+            let Some(entry) = ctx.probe_for_playlist(&pl.name) else {
+                continue;
+            };
+            if entry.probe.has_lhvc {
+                continue;
+            }
+            issues.push(author_error(
+                "16.6",
+                format!(
+                    "'{}' declares stereo video but its init '{}' carries no lhvC (MV-HEVC) configuration; stereo video MUST be encoded using MV-HEVC",
+                    pl.name, entry.uri
+                ),
+            ));
+        }
+    }
+
+    // §16.7 — immersive video MUST name both CH-STEREO and PROJ-AIV in REQ-VIDEO-LAYOUT.
+    // A layout that carries one of the pair is immersive content declaring itself
+    // incompletely, which is the mistake this can see from the multivariant playlist alone.
+    for v in &master.variants {
+        let Some(layout) = v.req_video_layout.as_deref() else {
+            continue;
+        };
+        let specifiers: Vec<String> = layout
+            .split(',')
+            .map(|t| t.trim().to_ascii_uppercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let has = |want: &str| specifiers.iter().any(|s| s == want);
+        let missing = match (has("CH-STEREO"), has("PROJ-AIV")) {
+            (true, false) => "PROJ-AIV",
+            (false, true) => "CH-STEREO",
+            _ => continue,
+        };
+        issues.push(author_error(
+            "16.7",
+            format!(
+                "'{}' declares REQ-VIDEO-LAYOUT '{layout}' but immersive video MUST use both CH-STEREO and PROJ-AIV; '{missing}' is missing",
+                v.uri
+            ),
         ));
     }
 
     issues
+}
+
+/// A REQ-VIDEO-LAYOUT naming a stereoscopic channel (§16.6).
+fn layout_is_stereo(layout: Option<&str>) -> bool {
+    layout.is_some_and(|l| l.to_ascii_lowercase().contains("stereo"))
 }
 
 /// §15.2 — at most one finding for the whole stream, naming interstitials whose playout
@@ -329,6 +379,49 @@ https://example.com/flat.m3u8
         assert!(issues[0].message.contains("stereo-init.mp4"));
     }
 
+    /// visionOS §16.6 findings for a stereo variant whose init reports `has_lhvc`.
+    fn vision_mv_hevc_issues(has_lhvc: bool) -> Vec<Issue> {
+        let master = mixed_master();
+        let playlists = vec![video_playlist(
+            "video/4096x4096 · 8000k",
+            "https://example.com/stereo.m3u8",
+            Some("CH-STEREO"),
+        )];
+        let mut inits = vec![init(
+            "https://example.com/stereo-init.mp4",
+            "video/4096x4096 · 8000k",
+            true,
+        )];
+        inits[0].probe.has_lhvc = has_lhvc;
+        let opts = ValidateAuthorOptions {
+            profile: super::super::profile::AuthorProfile::VisionOs,
+            deep_checks: false,
+        };
+        let segs: Vec<SegmentSample> = Vec::new();
+        let vtts: Vec<WebVttSample> = Vec::new();
+        let ctx = AuthoringContext::new(Some(&master), &playlists, &opts, &inits, &segs, &vtts);
+        check(&ctx)
+            .into_iter()
+            .filter(|i| i.message.contains("§16.6"))
+            .collect()
+    }
+
+    #[test]
+    fn author_16_6_accepts_mv_hevc_stereo() {
+        assert!(vision_mv_hevc_issues(true).is_empty());
+    }
+
+    #[test]
+    fn author_16_6_errors_when_stereo_is_not_mv_hevc() {
+        let issues = vision_mv_hevc_issues(false);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(
+            issues[0].severity,
+            crate::utils::validator::types::Severity::Error
+        );
+        assert!(issues[0].message.contains("lhvC"), "{issues:?}");
+    }
+
     /// All findings for `section` from a master-plus-playlists run.
     fn issues_for(
         master: &crate::utils::validator::types::MasterPlaylist,
@@ -475,6 +568,32 @@ https://example.com/stereo.m3u8
 "#
             ),
         )
+    }
+
+    #[test]
+    fn author_16_7_requires_ch_stereo_and_proj_aiv_together() {
+        for (layout, missing) in [("PROJ-AIV", "CH-STEREO"), ("CH-STEREO", "PROJ-AIV")] {
+            let master = master_with_layout(layout);
+            let issues = issues_for(&master, &[], &[], "§16.7");
+            assert_eq!(issues.len(), 1, "{layout}: {issues:?}");
+            assert_eq!(
+                issues[0].severity,
+                crate::utils::validator::types::Severity::Error
+            );
+            assert!(issues[0].message.contains(missing), "{}", issues[0].message);
+        }
+    }
+
+    #[test]
+    fn author_16_7_accepts_a_complete_immersive_layout() {
+        let master = master_with_layout("CH-STEREO,PROJ-AIV");
+        assert!(issues_for(&master, &[], &[], "§16.7").is_empty());
+    }
+
+    #[test]
+    fn author_16_7_ignores_a_layout_that_is_not_immersive() {
+        let master = master_with_layout("CH-MONO,PROJ-EQUI");
+        assert!(issues_for(&master, &[], &[], "§16.7").is_empty());
     }
 
     #[test]

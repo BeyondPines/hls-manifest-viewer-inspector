@@ -184,29 +184,47 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
     // §6.10 — fMP4 I-frame segments MUST include moof
     issues.extend(check_iframe_moof(ctx));
 
-    // visionOS 6.18/6.19 — spatial trick play notes
-    if ctx.policy.profile == super::profile::AuthorProfile::VisionOs && !iframes.is_empty() {
-        let stereo_video = videos.iter().any(|v| {
-            v.req_video_layout
-                .as_deref()
-                .is_some_and(|l| l.to_ascii_lowercase().contains("stereo"))
-        });
-        if stereo_video {
-            let stereo_iframe = iframes.iter().any(|v| {
-                v.req_video_layout
-                    .as_deref()
-                    .is_some_and(|l| l.to_ascii_lowercase().contains("stereo"))
-            });
-            if !stereo_iframe {
-                issues.push(author_warn(
-                    "6.18",
-                    "visionOS: stereo spatial video SHOULD have stereo I-frame playlists",
-                ));
+    // §6.18 (visionOS) — trick play content SHOULD be monoscopic and rectilinear. The rule
+    // used to ask for the opposite, reporting a compliant monoscopic I-frame ladder next to
+    // stereo video and staying quiet about the stereo trick play it should have named.
+    if ctx.policy.profile == super::profile::AuthorProfile::VisionOs {
+        for iframe in &iframes {
+            let Some(layout) = iframe.req_video_layout.as_deref() else {
+                continue;
+            };
+            let mut nonconforming: Vec<&str> = layout
+                .split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .filter(|t| !specifier_is_monoscopic_rectilinear(t))
+                .collect();
+            nonconforming.dedup();
+            if nonconforming.is_empty() {
+                continue;
             }
+            issues.push(author_warn(
+                "6.18",
+                format!(
+                    "trick play '{}' declares REQ-VIDEO-LAYOUT '{}'; trick play content SHOULD be monoscopic and rectilinear ({})",
+                    iframe.uri,
+                    layout,
+                    nonconforming.join(", ")
+                ),
+            ));
         }
     }
 
     issues
+}
+
+/// Whether one REQ-VIDEO-LAYOUT specifier keeps trick play monoscopic and rectilinear
+/// (§6.18). `CH-MONO` is the monoscopic channel specifier and `PROJ-RECT` the rectilinear
+/// projection; a stereo channel or any other projection is what the rule is about.
+fn specifier_is_monoscopic_rectilinear(specifier: &str) -> bool {
+    matches!(
+        specifier.to_ascii_uppercase().as_str(),
+        "CH-MONO" | "PROJ-RECT"
+    )
 }
 
 /// §6.10 — an fMP4 I-frame segment MUST carry a moof header.
@@ -333,6 +351,56 @@ https://example.com/v.m3u8
             has_moof: false,
             ..Default::default()
         }
+    }
+
+    /// visionOS §6.18 findings for a ladder whose stereo video is paired with an I-frame
+    /// rendition declaring `iframe_layout`.
+    fn vision_trickplay_issues(iframe_layout: &str) -> Vec<Issue> {
+        let content = format!(
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=8000000,AVERAGE-BANDWIDTH=7000000,RESOLUTION=4096x4096,CODECS=\"hvc1.2.4.L153.B0\",FRAME-RATE=30,REQ-VIDEO-LAYOUT=\"CH-STEREO\"\nhttps://example.com/v.m3u8\n#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=100000,AVERAGE-BANDWIDTH=90000,RESOLUTION=1280x720,CODECS=\"hvc1.2.4.L123.B0\",REQ-VIDEO-LAYOUT=\"{iframe_layout}\",URI=\"https://example.com/i.m3u8\"\n"
+        );
+        let master = parse_master_playlist("https://example.com/master.m3u8", &content);
+        let playlists: Vec<MediaPlaylist> = Vec::new();
+        let opts = ValidateAuthorOptions {
+            profile: super::super::profile::AuthorProfile::VisionOs,
+            deep_checks: false,
+        };
+        let inits: Vec<InitProbeEntry> = Vec::new();
+        let samples: Vec<SegmentSample> = Vec::new();
+        let vtts: Vec<WebVttSample> = Vec::new();
+        let ctx = AuthoringContext::new(Some(&master), &playlists, &opts, &inits, &samples, &vtts);
+        check(&ctx)
+            .into_iter()
+            .filter(|i| i.message.contains("§6.18"))
+            .collect()
+    }
+
+    #[test]
+    fn author_6_18_accepts_monoscopic_rectilinear_trick_play() {
+        assert!(
+            vision_trickplay_issues("CH-MONO,PROJ-RECT").is_empty(),
+            "monoscopic rectilinear trick play is what §6.18 asks for"
+        );
+    }
+
+    #[test]
+    fn author_6_18_reports_stereo_trick_play() {
+        let issues = vision_trickplay_issues("CH-STEREO");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Warn);
+        assert!(
+            issues[0].message.contains("CH-STEREO")
+                && issues[0].message.contains("monoscopic and rectilinear"),
+            "got: {}",
+            issues[0].message
+        );
+    }
+
+    #[test]
+    fn author_6_18_reports_a_projected_trick_play_rendition() {
+        let issues = vision_trickplay_issues("CH-MONO,PROJ-EQUI");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].message.contains("PROJ-EQUI"), "{issues:?}");
     }
 
     #[test]
