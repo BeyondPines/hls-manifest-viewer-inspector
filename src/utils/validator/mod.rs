@@ -810,7 +810,7 @@ async fn check_media_sequence_monotonicity(playlists: &[MediaPlaylist]) -> Vec<I
                                 "First fetch MSN={} → reload MSN={} (delta={} regression).",
                                 pl.media_sequence, new_msn, pl.media_sequence - new_msn
                             )),
-                            count: 1, seg_first: -1, seg_last: -1,
+                            ..Default::default()
                         });
                     }
             }
@@ -878,7 +878,7 @@ async fn check_playlist_delta_updates(playlists: &[MediaPlaylist]) -> (Vec<Issue
                             pl.name
                         ),
                         uri_note: None,
-                        count: 1, seg_first: -1, seg_last: -1,
+                        ..Default::default()
                     });
                 } else if skipped == 0 {
                     // 2. SKIPPED-SEGMENTS MUST be > 0
@@ -896,7 +896,7 @@ async fn check_playlist_delta_updates(playlists: &[MediaPlaylist]) -> (Vec<Issue
                             pl.name
                         ),
                         uri_note: None,
-                        count: 1, seg_first: -1, seg_last: -1,
+                        ..Default::default()
                     });
                 }
                 // 3. EXT-X-MEDIA-SEQUENCE MUST still be present in delta response
@@ -915,7 +915,7 @@ async fn check_playlist_delta_updates(playlists: &[MediaPlaylist]) -> (Vec<Issue
                             pl.name
                         ),
                         uri_note: None,
-                        count: 1, seg_first: -1, seg_last: -1,
+                        ..Default::default()
                     });
                 }
                 // 4. VERSION MUST be >= 9 when EXT-X-SKIP is used
@@ -933,7 +933,7 @@ async fn check_playlist_delta_updates(playlists: &[MediaPlaylist]) -> (Vec<Issue
                             pl.name, delta_pl.version
                         ),
                         uri_note: None,
-                        count: 1, seg_first: -1, seg_last: -1,
+                        ..Default::default()
                     });
                 }
 
@@ -978,9 +978,7 @@ async fn check_playlist_delta_updates(playlists: &[MediaPlaylist]) -> (Vec<Issue
                         pl.name, err_msg
                     ),
                     uri_note: None,
-                    count: 1,
-                    seg_first: -1,
-                    seg_last: -1,
+                    ..Default::default()
                 });
             }
         }

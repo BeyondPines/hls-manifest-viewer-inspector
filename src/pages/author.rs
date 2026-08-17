@@ -266,18 +266,36 @@ fn AuthorCheckTable(groups: Vec<CheckGroup>) -> impl IntoView {
                                                     Severity::Warn => ("#f59e0b", "⚠"),
                                                     Severity::Info => ("#60a5fa", "ℹ"),
                                                 };
+                                                // How sure the check is of its evidence is a
+                                                // different question from how serious the
+                                                // finding is, so a finding read from a sample
+                                                // or inferred says so next to its severity.
+                                                let confidence_note = iss.confidence.note();
                                                 view! {
                                                     <div style=format!(
                                                         "border-left: 3px solid {}; padding: 10px 12px; margin-bottom: 8px; \
                                                          border-radius: 0 6px 6px 0; background: rgba(255,255,255,.04);",
                                                         sev_color
                                                     )>
-                                                        <div style=format!(
-                                                            "font-size: .7rem; font-weight: 800; text-transform: uppercase; \
-                                                             letter-spacing: .06em; margin-bottom: 4px; color: {};",
-                                                            sev_color
-                                                        )>
-                                                            {format!("{} {}", sev_icon, iss.severity)}
+                                                        <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px;">
+                                                            <span style=format!(
+                                                                "font-size: .7rem; font-weight: 800; text-transform: uppercase; \
+                                                                 letter-spacing: .06em; color: {};",
+                                                                sev_color
+                                                            )>
+                                                                {format!("{} {}", sev_icon, iss.severity)}
+                                                            </span>
+                                                            {confidence_note.map(|note| view! {
+                                                                <span
+                                                                    title="This finding was not read straight from the stream — see the message for what was measured."
+                                                                    style="font-size: .65rem; font-weight: 700; text-transform: uppercase; \
+                                                                           letter-spacing: .06em; color: var(--color-sky-700); \
+                                                                           background: rgba(56,189,248,.12); border: 1px solid rgba(56,189,248,.3); \
+                                                                           border-radius: 4px; padding: 1px 6px; white-space: nowrap;"
+                                                                >
+                                                                    {note}
+                                                                </span>
+                                                            })}
                                                         </div>
                                                         <div style="font-size: .85rem; line-height: 1.6; color: var(--color-sky-950);">
                                                             {iss.message.clone()}

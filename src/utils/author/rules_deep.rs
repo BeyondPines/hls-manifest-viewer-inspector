@@ -4,8 +4,9 @@ use std::collections::HashMap;
 
 use super::context::{AuthoringContext, SegmentSample};
 use super::helpers::*;
+use super::severity::must;
 use crate::utils::mp4_probe::InitSegmentProbe;
-use crate::utils::validator::types::{Issue, MediaPlaylist, Severity};
+use crate::utils::validator::types::{Confidence, Issue, MediaPlaylist, Severity};
 
 /// The track whose media timeline a playlist's segments carry. A segment can hold
 /// several tracks, and a timed-metadata one usually runs on its own timescale, so a
@@ -292,28 +293,39 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             let peak = rate.peak + audio.addend();
             let mut bandwidth_flagged = false;
 
+            // Every rate below is measured over the sampled window rather than over the
+            // whole asset, so each finding records that its evidence is a sample however
+            // wide the deviation looks. `rate_severity` has already weighed how much of the
+            // playlist was read, so the severity it chose stands.
+
             // §1.26 / 1.28 — average vs AVERAGE-BANDWIDTH
             if let Some(avg) = pl.average_bandwidth {
                 let declared = avg as f64;
                 let deviation = (measured_avg - declared).abs() / declared;
                 if is_vod {
                     if deviation > 0.10 {
-                        issues.push(author_issue(
-                            rate_severity(&window, audio.is_accounted(), deviation),
-                            "1.26",
-                            format!(
-                                "'{name}' measured avg {measured_avg:.0} bps is outside ±10% of AVERAGE-BANDWIDTH {avg}{sample_note}"
-                            ),
-                        ));
+                        issues.push(
+                            author_issue(
+                                rate_severity(&window, audio.is_accounted(), deviation),
+                                "1.26",
+                                format!(
+                                    "'{name}' measured avg {measured_avg:.0} bps is outside ±10% of AVERAGE-BANDWIDTH {avg}{sample_note}"
+                                ),
+                            )
+                            .with_confidence(Confidence::Sampled),
+                        );
                     }
                 } else if measured_avg > declared * 1.10 {
                     // Live: sampled window is short vs ~1h — Warn instead of Error
-                    issues.push(author_warn(
-                        "1.28",
-                        format!(
-                            "'{name}' sampled avg {measured_avg:.0} bps exceeds 110% of AVERAGE-BANDWIDTH {avg}{sample_note}"
-                        ),
-                    ));
+                    issues.push(
+                        author_warn(
+                            "1.28",
+                            format!(
+                                "'{name}' sampled avg {measured_avg:.0} bps exceeds 110% of AVERAGE-BANDWIDTH {avg}{sample_note}"
+                            ),
+                        )
+                        .with_confidence(Confidence::Sampled),
+                    );
                 }
             }
 
@@ -325,54 +337,69 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
                     // Peak must be within 10% of BANDWIDTH for VOD — typically peak ≤ declared
                     if peak > declared * 1.10 {
                         bandwidth_flagged = true;
-                        issues.push(author_issue(
-                            rate_severity(&window, audio.is_accounted(), deviation),
-                            "1.27",
-                            format!(
-                                "'{name}' measured peak {peak:.0} bps exceeds BANDWIDTH {bw} by >10%{sample_note}"
-                            ),
-                        ));
+                        issues.push(
+                            author_issue(
+                                rate_severity(&window, audio.is_accounted(), deviation),
+                                "1.27",
+                                format!(
+                                    "'{name}' measured peak {peak:.0} bps exceeds BANDWIDTH {bw} by >10%{sample_note}"
+                                ),
+                            )
+                            .with_confidence(Confidence::Sampled),
+                        );
                     } else if peak < declared * 0.90 {
                         // The asset's real peak may sit outside the sampled window, so an
                         // apparently over-declared BANDWIDTH is only informational.
-                        issues.push(author_info(
-                            "1.27",
-                            format!(
-                                "'{name}' measured peak {peak:.0} bps is >10% below BANDWIDTH {bw} — the peak may be elsewhere in the asset{sample_note}"
-                            ),
-                        ));
+                        issues.push(
+                            author_info(
+                                "1.27",
+                                format!(
+                                    "'{name}' measured peak {peak:.0} bps is >10% below BANDWIDTH {bw} — the peak may be elsewhere in the asset{sample_note}"
+                                ),
+                            )
+                            .with_confidence(Confidence::Sampled),
+                        );
                     }
                 } else if peak > declared * 1.25 {
                     bandwidth_flagged = true;
-                    issues.push(author_issue(
-                        rate_severity(&window, audio.is_accounted(), deviation),
-                        "1.29",
-                        format!(
-                            "'{name}' measured peak {peak:.0} bps exceeds 125% of BANDWIDTH {bw}{sample_note}"
-                        ),
-                    ));
+                    issues.push(
+                        author_issue(
+                            rate_severity(&window, audio.is_accounted(), deviation),
+                            "1.29",
+                            format!(
+                                "'{name}' measured peak {peak:.0} bps exceeds 125% of BANDWIDTH {bw}{sample_note}"
+                            ),
+                        )
+                        .with_confidence(Confidence::Sampled),
+                    );
                 }
             }
 
             // §1.30 — VOD peak SHOULD be ≤ 200% of average bit rate
             if is_vod && measured_avg > 0.0 && peak > measured_avg * 2.0 {
-                issues.push(author_warn(
-                    "1.30",
-                    format!(
-                        "'{name}' peak {peak:.0} bps is more than 200% of measured avg {measured_avg:.0} bps{sample_note}"
-                    ),
-                ));
+                issues.push(
+                    author_warn(
+                        "1.30",
+                        format!(
+                            "'{name}' peak {peak:.0} bps is more than 200% of measured avg {measured_avg:.0} bps{sample_note}"
+                        ),
+                    )
+                    .with_confidence(Confidence::Sampled),
+                );
             }
 
             // §9.13 — BANDWIDTH must cover the peak of the playable combination
             if let Some(bw) = pl.bandwidth {
                 if !bandwidth_flagged && peak > bw as f64 * 1.01 {
-                    issues.push(author_warn(
-                        "9.13",
-                        format!(
-                            "'{name}' measured peak {peak:.0} bps exceeds declared BANDWIDTH {bw}{sample_note}"
-                        ),
-                    ));
+                    issues.push(
+                        author_warn(
+                            "9.13",
+                            format!(
+                                "'{name}' measured peak {peak:.0} bps exceeds declared BANDWIDTH {bw}{sample_note}"
+                            ),
+                        )
+                        .with_confidence(Confidence::Sampled),
+                    );
                 }
             }
 
@@ -380,12 +407,15 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             if is_iframe {
                 if let Some(bw) = pl.bandwidth {
                     if peak > bw as f64 * 1.10 {
-                        issues.push(author_warn(
-                            "6.9",
-                            format!(
-                                "I-frame '{name}' measured peak {peak:.0} bps exceeds BANDWIDTH {bw}{sample_note}"
-                            ),
-                        ));
+                        issues.push(
+                            author_warn(
+                                "6.9",
+                                format!(
+                                    "I-frame '{name}' measured peak {peak:.0} bps exceeds BANDWIDTH {bw}{sample_note}"
+                                ),
+                            )
+                            .with_confidence(Confidence::Sampled),
+                        );
                     }
                 }
             }
@@ -424,13 +454,18 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             if irap_total > 0 {
                 let interval = total_dur / irap_total as f64;
                 if interval > 2.5 {
-                    issues.push(author_warn(
-                        "1.13",
-                        format!(
-                            "'{name}' averages one key frame (IRAP) every ~{interval:.1}s over {} sampled segment(s) totalling {total_dur:.1}s, above the ~2s recommendation",
-                            samples.len()
-                        ),
-                    ));
+                    // The interval is an average over the sampled segments, so it stands in
+                    // for the asset rather than describing all of it.
+                    issues.push(
+                        author_warn(
+                            "1.13",
+                            format!(
+                                "'{name}' averages one key frame (IRAP) every ~{interval:.1}s over {} sampled segment(s) totalling {total_dur:.1}s, above the ~2s recommendation",
+                                samples.len()
+                            ),
+                        )
+                        .with_confidence(Confidence::Sampled),
+                    );
                 }
             }
 
@@ -455,16 +490,26 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
                 }
             }
             if !no_irap.is_empty() {
-                issues.push(author_error(
-                    "7.4",
-                    format!(
-                        "'{name}' — no IRAP (IDR, CRA or BLA) NAL found in {}: video segments MUST start with an IDR",
-                        describe_segments(&no_irap)
-                    ),
-                ));
+                // A segment with no random-access picture in it is a violation of the
+                // segments that were read, so the error stands; what it cannot speak for
+                // is the segments the sample skipped.
+                issues.push(
+                    author_error(
+                        "7.4",
+                        format!(
+                            "'{name}' — no IRAP (IDR, CRA or BLA) NAL found in {}: video segments MUST start with an IDR",
+                            describe_segments(&no_irap)
+                        ),
+                    )
+                    .with_confidence(Confidence::Sampled),
+                );
             }
             if !irap_not_at_start.is_empty() {
-                issues.push(author_warn(
+                // Where the first IRAP sits is inferred from sample offsets, which a
+                // conforming segment can also fail, so this MUST is reported as a warning.
+                issues.push(author_issue_with_confidence(
+                    Confidence::Heuristic,
+                    must(),
                     "7.4",
                     format!(
                         "'{name}' — the first IRAP sits well past the start of {}; video segments MUST start with an IDR (position read from sample offsets, best-effort)",
@@ -485,13 +530,21 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
                 } else {
                     ""
                 };
-                issues.push(author_warn(
-                    "7.4",
-                    format!(
-                        "'{name}' — {} open on a CRA or BLA rather than an IDR{idrs}; random access works, but §7.4 asks for an IDR{scope}",
-                        describe_segments(&open_gop)
-                    ),
-                ));
+                let confidence = if read_beyond_video_track {
+                    Confidence::Heuristic
+                } else {
+                    Confidence::Sampled
+                };
+                issues.push(
+                    author_warn(
+                        "7.4",
+                        format!(
+                            "'{name}' — {} open on a CRA or BLA rather than an IDR{idrs}; random access works, but §7.4 asks for an IDR{scope}",
+                            describe_segments(&open_gop)
+                        ),
+                    )
+                    .with_confidence(confidence),
+                );
             }
         }
 
@@ -651,10 +704,15 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             if !video_samples.is_empty()
                 && video_samples.iter().all(|s| !s.has_cc_sei_hint)
             {
-                issues.push(author_warn(
-                    "4.3",
-                    "closed captions declared but no CEA-608/708 SEI (GA94) hint found in deep video samples",
-                ));
+                // The finding is the absence of a byte pattern in the segments that were
+                // read: conforming captions can sit in segments the sample never opened.
+                issues.push(
+                    author_warn(
+                        "4.3",
+                        "closed captions declared but no CEA-608/708 SEI (GA94) hint found in deep video samples",
+                    )
+                    .with_confidence(Confidence::Heuristic),
+                );
             }
         }
     }

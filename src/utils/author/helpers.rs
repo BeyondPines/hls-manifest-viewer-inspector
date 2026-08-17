@@ -1,8 +1,15 @@
 //! Shared Author helpers: issue builders and codec classification.
 
-use crate::utils::validator::types::{Issue, MediaRendition, Severity};
+use crate::utils::validator::types::{Confidence, Issue, MediaRendition, Severity};
 
 pub fn author_issue(severity: Severity, section: &str, message: impl Into<String>) -> Issue {
+    // A citation is the only part of a finding a reader can check, so a section the
+    // catalog does not know is a bug in the rule rather than something to report.
+    debug_assert!(
+        super::catalog::is_citable(section),
+        "{}",
+        super::catalog::citation_problem(section).unwrap_or_default()
+    );
     Issue::new(
         severity,
         -1,
@@ -20,6 +27,27 @@ pub fn author_warn(section: &str, message: impl Into<String>) -> Issue {
 
 pub fn author_info(section: &str, message: impl Into<String>) -> Issue {
     author_issue(Severity::Info, section, message)
+}
+
+/// A finding whose evidence is weaker than a direct read of the stream.
+///
+/// Severity says how serious a violation would be; confidence says how sure the check is
+/// that it happened, and severity alone cannot carry both. A heuristic read of a bitstream
+/// reported as an `ERROR` reads exactly like a missing tag, so anything short of
+/// [`Confidence::Measured`] is capped at a warning here: a MUST that was only inferred is
+/// not grounds for failing a stream.
+///
+/// A rule that has already reasoned about its own sampling — §1.26 weighing how much of
+/// the asset it measured, or §7.4 finding no random-access picture at all in the bytes it
+/// read — keeps the severity it chose and records its confidence with
+/// [`Issue::with_confidence`] instead.
+pub fn author_issue_with_confidence(
+    confidence: Confidence,
+    severity: Severity,
+    section: &str,
+    message: impl Into<String>,
+) -> Issue {
+    author_issue(confidence.cap(severity), section, message).with_confidence(confidence)
 }
 
 /// A finding that the Authoring Spec's own immersive AIV guidance may contradict.
@@ -383,6 +411,29 @@ pub fn playlist_has_map(pl: &crate::utils::validator::types::MediaPlaylist) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inferred_findings_are_capped_at_a_warning() {
+        let heuristic =
+            author_issue_with_confidence(Confidence::Heuristic, Severity::Error, "7.4", "guessed");
+        assert_eq!(heuristic.severity, Severity::Warn);
+        assert_eq!(heuristic.confidence, Confidence::Heuristic);
+
+        let sampled =
+            author_issue_with_confidence(Confidence::Sampled, Severity::Error, "1.13", "sampled");
+        assert_eq!(sampled.severity, Severity::Warn);
+
+        // Measured evidence is the only kind that fails a stream.
+        let measured =
+            author_issue_with_confidence(Confidence::Measured, Severity::Error, "8.2", "read");
+        assert_eq!(measured.severity, Severity::Error);
+        assert_eq!(measured.confidence, Confidence::Measured);
+    }
+
+    #[test]
+    fn findings_are_measured_by_default() {
+        assert_eq!(author_error("8.2", "read").confidence, Confidence::Measured);
+    }
 
     #[test]
     fn parses_avc_hex_and_dotted_forms() {

@@ -2,6 +2,7 @@
 
 #![allow(clippy::collapsible_if)]
 
+mod catalog;
 mod context;
 mod helpers;
 mod profile;
@@ -451,6 +452,8 @@ https://example.com/v.m3u8
             )
         });
         assert_eq!(found.severity, Severity::Error);
+        // The rate was measured over the segments the deep pass read, not the whole asset.
+        assert_eq!(found.confidence, Confidence::Sampled);
         assert!(
             found.message.contains("including audio") && found.message.contains("900000 bps"),
             "expected combined rate with audio, got: {}",
@@ -768,7 +771,10 @@ https://example.com/v.m3u8
             ..Default::default()
         });
         assert_eq!(issues.len(), 1, "{issues:?}");
+        // A segment with no random-access picture in it is conclusive for the segments that
+        // were read, so the error stands, but it only speaks for the sample.
         assert_eq!(issues[0].severity, Severity::Error);
+        assert_eq!(issues[0].confidence, Confidence::Sampled);
         assert!(
             issues[0].message.contains("no IRAP")
                 && issues[0].message.contains("2 sampled segment(s) (#0, #1)"),

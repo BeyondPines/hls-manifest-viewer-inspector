@@ -22,9 +22,61 @@ impl std::fmt::Display for Severity {
     }
 }
 
+/// How sure a check is of the evidence behind a finding, which is a different question
+/// from how serious the finding would be.
+///
+/// A rule that read a playlist knows what it saw. A rule that measured a handful of
+/// sampled segments, or read NAL syntax out of a payload it could not scope to one track,
+/// does not — and reporting both as an `ERROR` made the second look as firm as the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum Confidence {
+    /// Read directly from the playlists, the init segments or the HTTP responses.
+    #[default]
+    Measured,
+    /// Measured, but from a bounded sample of the media rather than all of it.
+    Sampled,
+    /// Inferred from a heuristic that can be wrong about conforming content.
+    Heuristic,
+}
+
+impl Confidence {
+    /// The most severe a finding at this confidence may be. `Error` is reserved for
+    /// evidence read straight from the stream, so a MUST that was only inferred is
+    /// reported as a warning rather than failing the run.
+    pub fn cap(self, severity: Severity) -> Severity {
+        match self {
+            Self::Measured => severity,
+            Self::Sampled | Self::Heuristic => severity.min(Severity::Warn),
+        }
+    }
+
+    /// Short label for findings whose evidence is worth qualifying in the UI. `Measured`
+    /// is the norm, so it is not worth the pixels.
+    pub fn note(self) -> Option<&'static str> {
+        match self {
+            Self::Measured => None,
+            Self::Sampled => Some("sampled evidence"),
+            Self::Heuristic => Some("heuristic"),
+        }
+    }
+}
+
+impl std::fmt::Display for Confidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Confidence::Measured => write!(f, "MEASURED"),
+            Confidence::Sampled => write!(f, "SAMPLED"),
+            Confidence::Heuristic => write!(f, "HEURISTIC"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Issue {
     pub severity: Severity,
+    /// How the evidence for this finding was obtained. Findings default to
+    /// [`Confidence::Measured`], which is what every RFC 8216bis check reads.
+    pub confidence: Confidence,
     pub segment_index: i32,
     pub rendition_a: Option<String>,
     pub rendition_b: Option<String>,
@@ -42,6 +94,7 @@ impl Default for Issue {
     fn default() -> Self {
         Self {
             severity: Severity::Warn,
+            confidence: Confidence::Measured,
             segment_index: -1,
             rendition_a: None,
             rendition_b: None,
@@ -60,6 +113,7 @@ impl Issue {
     pub fn error(message: String) -> Self {
         Self {
             severity: Severity::Error,
+            confidence: Confidence::Measured,
             segment_index: -1,
             rendition_a: None,
             rendition_b: None,
@@ -76,6 +130,7 @@ impl Issue {
     pub fn warn(message: String) -> Self {
         Self {
             severity: Severity::Warn,
+            confidence: Confidence::Measured,
             segment_index: -1,
             rendition_a: None,
             rendition_b: None,
@@ -92,6 +147,7 @@ impl Issue {
     pub fn info(message: String) -> Self {
         Self {
             severity: Severity::Info,
+            confidence: Confidence::Measured,
             segment_index: -1,
             rendition_a: None,
             rendition_b: None,
@@ -109,6 +165,7 @@ impl Issue {
     pub fn new(severity: Severity, segment_index: i32, message: String) -> Self {
         Self {
             severity,
+            confidence: Confidence::Measured,
             segment_index,
             rendition_a: None,
             rendition_b: None,
@@ -120,6 +177,14 @@ impl Issue {
             seg_first: -1,
             seg_last: -1,
         }
+    }
+
+    /// Record how the evidence for this finding was obtained, keeping the severity the
+    /// rule chose. Rules that have already reasoned about their own sampling use this;
+    /// rules that have not should let the severity be capped for them.
+    pub fn with_confidence(mut self, confidence: Confidence) -> Self {
+        self.confidence = confidence;
+        self
     }
 }
 
@@ -488,5 +553,38 @@ impl ValidationReport {
         self.total_warnings = self.issues.iter().filter(|i| i.severity == Severity::Warn).count();
         self.total_info = self.issues.iter().filter(|i| i.severity == Severity::Info).count();
         self.result = if self.total_errors > 0 { "FAIL".to_string() } else { "PASS".to_string() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn findings_are_measured_unless_a_check_says_otherwise() {
+        assert_eq!(Issue::error("boom".to_string()).confidence, Confidence::Measured);
+        assert_eq!(Issue::default().confidence, Confidence::Measured);
+        assert_eq!(
+            Issue::warn("hmm".to_string())
+                .with_confidence(Confidence::Heuristic)
+                .confidence,
+            Confidence::Heuristic
+        );
+    }
+
+    #[test]
+    fn only_measured_evidence_can_carry_an_error() {
+        assert_eq!(Confidence::Measured.cap(Severity::Error), Severity::Error);
+        assert_eq!(Confidence::Sampled.cap(Severity::Error), Severity::Warn);
+        assert_eq!(Confidence::Heuristic.cap(Severity::Error), Severity::Warn);
+        // Capping is a ceiling, so it never promotes a lesser finding.
+        assert_eq!(Confidence::Heuristic.cap(Severity::Info), Severity::Info);
+    }
+
+    #[test]
+    fn measured_findings_need_no_qualifier() {
+        assert_eq!(Confidence::Measured.note(), None);
+        assert!(Confidence::Sampled.note().is_some());
+        assert!(Confidence::Heuristic.note().is_some());
     }
 }

@@ -47,7 +47,7 @@ pub fn check_target_duration_compliance(playlists: &[MediaPlaylist]) -> Vec<Issu
                     pl.name
                 ),
                 uri_note: None,
-                count: 1, seg_first: -1, seg_last: -1,
+                ..Default::default()
             });
             continue;
         }
@@ -69,7 +69,7 @@ pub fn check_target_duration_compliance(playlists: &[MediaPlaylist]) -> Vec<Issu
                         idx, pl.name, seg.duration, rounded, target_int
                     ),
                     uri_note: None,
-                    count: 1, seg_first: -1, seg_last: -1,
+                    ..Default::default()
                 });
             }
         }
@@ -91,7 +91,7 @@ pub fn check_target_duration_compliance(playlists: &[MediaPlaylist]) -> Vec<Issu
                         target_int, pl.name, max_extinf, rounded_max
                     ),
                     uri_note: None,
-                    count: 1, seg_first: -1, seg_last: -1,
+                    ..Default::default()
                 });
             }
         }
@@ -864,7 +864,7 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
                     pl.name
                 ),
                 uri_note: None,
-                count: 1, seg_first: -1, seg_last: -1,
+                ..Default::default()
             });
         }
 
@@ -885,7 +885,7 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
                         pl.name
                     ),
                     uri_note: None,
-                    count: 1, seg_first: -1, seg_last: -1,
+                    ..Default::default()
                 });
             }
         }
@@ -907,7 +907,7 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
                             idx, pl.name, part.duration, pt
                         ),
                         uri_note: None,
-                        count: 1, seg_first: -1, seg_last: -1,
+                        ..Default::default()
                     });
                 }
             }
@@ -939,7 +939,7 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
                                     seg_idx, pl.name
                                 ),
                                 uri_note: None,
-                                count: 1, seg_first: -1, seg_last: -1,
+                                ..Default::default()
                             });
                         }
                     pending_independent.clear();
@@ -966,7 +966,7 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
                         pl.name
                     ),
                     uri_note: None,
-                    count: 1, seg_first: -1, seg_last: -1,
+                    ..Default::default()
                 });
             }
         }
@@ -987,7 +987,7 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
                     pl.name
                 ),
                 uri_note: None,
-                count: 1, seg_first: -1, seg_last: -1,
+                ..Default::default()
             });
         }
 
@@ -1010,7 +1010,7 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
                         uri_note: Some(format!(
                             "ratio={:.2}×, minimum 6.00×", csu / pl.target_duration
                         )),
-                        count: 1, seg_first: -1, seg_last: -1,
+                        ..Default::default()
                     });
                 }
 
@@ -1031,7 +1031,7 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
                             pl.name, phb, pt, pt * 2.0
                         ),
                         uri_note: Some(format!("ratio={:.3}×, MUST be ≥ 2.000×", phb / pt)),
-                        count: 1, seg_first: -1, seg_last: -1,
+                        ..Default::default()
                     });
                 } else if phb < pt * 3.0 - 0.001 {
                     issues.push(Issue {
@@ -1047,7 +1047,7 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
                             pl.name, phb, pt, pt * 3.0
                         ),
                         uri_note: Some(format!("ratio={:.3}×, SHOULD be ≥ 3.000×", phb / pt)),
-                        count: 1, seg_first: -1, seg_last: -1,
+                        ..Default::default()
                     });
                 }
             }
@@ -1069,7 +1069,7 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
                         uri_note: Some(format!(
                             "ratio={:.2}×, minimum 3.00×", hb / pl.target_duration
                         )),
-                        count: 1, seg_first: -1, seg_last: -1,
+                        ..Default::default()
                     });
                 }
         }
@@ -1193,7 +1193,7 @@ pub fn check_media_sequence_continuity(playlists: &[MediaPlaylist]) -> Vec<Issue
                             pl.name, uri_msn
                         ),
                         uri_note: None,
-                        count: 1, seg_first: -1, seg_last: -1,
+                        ..Default::default()
                     });
                 }
         }
@@ -1229,7 +1229,7 @@ pub fn check_media_sequence_continuity(playlists: &[MediaPlaylist]) -> Vec<Issue
                             pl.name, tl + 1, sl + 1
                         ),
                         uri_note: None,
-                        count: 1, seg_first: -1, seg_last: -1,
+                        ..Default::default()
                     });
                 }
         }
@@ -1255,7 +1255,7 @@ pub fn check_media_sequence_continuity(playlists: &[MediaPlaylist]) -> Vec<Issue
                             pl.media_sequence, pl.skipped_segments, idx
                         ),
                         uri_note: None,
-                        count: 1, seg_first: -1, seg_last: -1,
+                        ..Default::default()
                     });
                 }
         }
@@ -1320,7 +1320,7 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
                     uri_b: None,
                     message: format!("Interstitial: DATERANGE in '{}' missing ID (MUST)", pl.name),
                     uri_note: None,
-                    count: 1, seg_first: -1, seg_last: -1,
+                    ..Default::default()
                 });
             }
 
@@ -1336,7 +1336,7 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
                     uri_b: None,
                     message: format!("Interstitial: [{}] missing START-DATE in '{}'", dr_id, pl.name),
                     uri_note: None,
-                    count: 1, seg_first: -1, seg_last: -1,
+                    ..Default::default()
                 });
             }
 
@@ -1352,7 +1352,7 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
                     uri_b: None,
                     message: format!("Interstitial: [{}] missing X-ASSET-URI/X-ASSET-LIST in '{}'", dr_id, pl.name),
                     uri_note: None,
-                    count: 1, seg_first: -1, seg_last: -1,
+                    ..Default::default()
                 });
             }
 
@@ -1368,7 +1368,7 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
                     uri_b: None,
                     message: format!("Interstitial: [{}] has both X-ASSET-URI and X-ASSET-LIST in '{}' (MUST NOT)", dr_id, pl.name),
                     uri_note: None,
-                    count: 1, seg_first: -1, seg_last: -1,
+                    ..Default::default()
                 });
             }
 
@@ -1391,7 +1391,7 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
                                 dr_id, p, pl.name
                             ),
                             uri_note: None,
-                            count: 1, seg_first: -1, seg_last: -1,
+                            ..Default::default()
                         });
                     }
                 }
@@ -1416,7 +1416,7 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
                                 dr_id, p, pl.name
                             ),
                             uri_note: None,
-                            count: 1, seg_first: -1, seg_last: -1,
+                            ..Default::default()
                         });
                     }
                 }
@@ -1439,7 +1439,7 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
                             dr_id, cmv, pl.name
                         ),
                         uri_note: None,
-                        count: 1, seg_first: -1, seg_last: -1,
+                        ..Default::default()
                     });
                 }
 
@@ -1460,7 +1460,7 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
                             dr_id, to, pl.name
                         ),
                         uri_note: None,
-                        count: 1, seg_first: -1, seg_last: -1,
+                        ..Default::default()
                     });
                 }
 
@@ -1481,7 +1481,7 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
                             dr_id, ts, pl.name
                         ),
                         uri_note: None,
-                        count: 1, seg_first: -1, seg_last: -1,
+                        ..Default::default()
                     });
                 }
 
@@ -1509,7 +1509,7 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
                             dr_id, label_id, invalid_chars, pl.name
                         ),
                         uri_note: None,
-                        count: 1, seg_first: -1, seg_last: -1,
+                        ..Default::default()
                     });
                 }
             }
