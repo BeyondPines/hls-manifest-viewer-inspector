@@ -329,8 +329,18 @@ impl BoundaryDrift<'_> {
 /// once per segment and a per-playlist finding once per rendition. Each rendition is
 /// compared against the reference up to the first boundary that misses, and the pair that
 /// drifted furthest is named for the whole stream.
+///
+/// Only playlists that have reached EXT-X-ENDLIST take part. Cumulative EXTINF names the
+/// same instant in two playlists only while both begin at the same media time, and a live
+/// or EVENT window slides a segment at a time under each rendition independently: an audio
+/// window a segment ahead of the video one reads as drift however well the encodings agree.
+/// Alignment across a sliding window is left to the rules that follow PROGRAM-DATE-TIME.
 fn check_segment_boundary_alignment(ctx: &AuthoringContext<'_>) -> Option<Issue> {
-    let av = || ctx.video_playlists().chain(ctx.audio_playlists());
+    let av = || {
+        ctx.video_playlists()
+            .chain(ctx.audio_playlists())
+            .filter(|pl| pl.has_endlist)
+    };
     // A playlist of one segment has no internal boundary to compare against.
     let reference = av().find(|pl| pl.segments.len() > 1)?;
     let tolerance = boundary_tolerance_s(reference);
@@ -753,6 +763,35 @@ https://example.com/v.m3u8
                 && issues[0].message.contains("and 1 more rendition(s)"),
             "expected the worst drift named and the rest counted, got: {}",
             issues[0].message
+        );
+    }
+
+    /// The same rendition still being appended to, holding a sliding window of `durations`.
+    fn live_rendition(name: &str, media_type: &str, durations: &[f64]) -> MediaPlaylist {
+        let mut pl = rendition(name, media_type, durations);
+        pl.has_endlist = false;
+        pl.playlist_type = None;
+        pl
+    }
+
+    /// Each rendition is reloaded on its own, so the two windows on hand need not start at
+    /// the same media time. Cumulative EXTINF from the top of an audio window a segment
+    /// ahead of the video one lands nowhere near it, and with segments of unequal length the
+    /// gap outlives the first boundary — but both encodings cut at the same instants, so
+    /// §8.22 has nothing to report.
+    #[test]
+    fn author_8_22_ignores_live_windows_that_start_at_different_segments() {
+        let issues = issues_for(
+            &[
+                live_rendition("video/1280x720", "VIDEO", &[4.0, 8.0, 4.0, 8.0]),
+                live_rendition("audio/English (aud)", "AUDIO", &[8.0, 4.0, 8.0, 4.0]),
+            ],
+            "§8.22",
+        );
+        assert!(
+            issues.is_empty(),
+            "a sliding window says nothing about boundary alignment, got: {:?}",
+            issues.iter().map(|i| &i.message).collect::<Vec<_>>()
         );
     }
 
