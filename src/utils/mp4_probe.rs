@@ -1121,11 +1121,10 @@ mod tests {
         boxed(b"trak", &trak)
     }
 
-    /// Init carrying a timed-metadata track at 90 kHz ahead of a 600 Hz video track,
-    /// which is the layout that used to hand every rule the metadata timescale.
-    fn init_with_metadata_track_first() -> Vec<u8> {
-        use mp4_atom::{Encode, FourCC, Ftyp, Visual};
-        let mut out = encoded(&Ftyp {
+    /// The `ftyp` a packager writes ahead of an HLS fMP4 init.
+    fn ftyp() -> Vec<u8> {
+        use mp4_atom::{FourCC, Ftyp};
+        encoded(&Ftyp {
             major_brand: FourCC::new(b"iso5"),
             minor_version: 0,
             compatible_brands: vec![
@@ -1133,19 +1132,140 @@ mod tests {
                 FourCC::new(b"iso5"),
                 FourCC::new(b"hlsf"),
             ],
-        });
-        let mut visual = Vec::new();
+        })
+    }
+
+    /// The fixed part of a `VisualSampleEntry`, which every codec configuration box
+    /// inside a video sample entry sits behind.
+    fn visual() -> Vec<u8> {
+        use mp4_atom::{Encode, Visual};
+        let mut out = Vec::new();
         Visual {
             width: 1280,
             height: 720,
             ..Default::default()
         }
-        .encode(&mut visual)
+        .encode(&mut out)
         .expect("visual sample entry encodes");
+        out
+    }
+
+    /// Init carrying a timed-metadata track at 90 kHz ahead of a 600 Hz video track,
+    /// which is the layout that used to hand every rule the metadata timescale.
+    fn init_with_metadata_track_first() -> Vec<u8> {
+        let mut out = ftyp();
         let mut moov = trak(1, b"meta", 90_000, &boxed(b"mebx", &[0u8; 8]));
-        moov.extend(trak(2, b"vide", 600, &boxed(b"hvc1", &visual)));
+        moov.extend(trak(2, b"vide", 600, &boxed(b"hvc1", &visual())));
         out.extend(boxed(b"moov", &moov));
         out
+    }
+
+    /// An `hvcC` as an HEVC encoder writes it. `general_level_idc` is level × 30, so
+    /// Level 5.1 is 153, and `general_tier_flag` is set for High tier.
+    fn hvcc(profile_idc: u8, tier_flag: bool, level_idc: u8) -> Vec<u8> {
+        use mp4_atom::Hvcc;
+        encoded(&Hvcc {
+            general_profile_idc: profile_idc,
+            general_tier_flag: tier_flag,
+            general_level_idc: level_idc,
+            general_profile_compatibility_flags: [0x60, 0, 0, 0],
+            chroma_format_idc: 1,
+            bit_depth_luma_minus8: 2,
+            bit_depth_chroma_minus8: 2,
+            num_temporal_layers: 1,
+            temporal_id_nested: true,
+            length_size_minus_one: 3,
+            ..Hvcc::new()
+        })
+    }
+
+    /// A single-video-track HEVC init whose `hvc1` sample entry carries `hvcC`.
+    fn hevc_init(profile_idc: u8, tier_flag: bool, level_idc: u8) -> Vec<u8> {
+        let mut entry = visual();
+        entry.extend(hvcc(profile_idc, tier_flag, level_idc));
+        let mut out = ftyp();
+        out.extend(boxed(
+            b"moov",
+            &trak(1, b"vide", 90_000, &boxed(b"hvc1", &entry)),
+        ));
+        out
+    }
+
+    /// The codec configuration and container flags an Author rule reads out of an HEVC
+    /// init: §9.1 compares `video_profile` / `video_tier` / `video_level` against the
+    /// CODECS attribute, and §1.6b turns `general_level_idc` 153 into Level 5.1. Every
+    /// one of them arrives as the string `mp4-atom` prints the `hvcC` property under, so
+    /// a renamed property key would silently empty the fields rather than fail a parse.
+    #[test]
+    fn init_probe_reads_hevc_profile_tier_and_level_from_the_hvcc() {
+        let main10_main_tier = probe_init_segment(&hevc_init(2, false, 153));
+        assert_eq!(main10_main_tier.video_sample_fourcc.as_deref(), Some("hvc1"));
+        assert_eq!(main10_main_tier.video_profile.as_deref(), Some("2"));
+        assert_eq!(main10_main_tier.video_tier.as_deref(), Some("false"));
+        assert_eq!(main10_main_tier.video_level.as_deref(), Some("153"));
+
+        // High tier at Level 4.0, which the CODECS string spells `hev1.1.6.H120`.
+        let main_high_tier = probe_init_segment(&hevc_init(1, true, 120));
+        assert_eq!(main_high_tier.video_profile.as_deref(), Some("1"));
+        assert_eq!(main_high_tier.video_tier.as_deref(), Some("true"));
+        assert_eq!(main_high_tier.video_level.as_deref(), Some("120"));
+    }
+
+    /// A `cbcs` sample encryption scheme over MV-HEVC spatial video: the `encv` sample
+    /// entry names its original format in `frma`, the scheme in `schm`, and the key and
+    /// 1:9 encryption pattern in `tenc`, alongside the `lhvC` and `vexu` boxes that
+    /// §1.36 and the spatial rules key off.
+    fn encrypted_mv_hevc_init() -> Vec<u8> {
+        // 6-byte LHEVCDecoderConfigurationRecord carrying no parameter set arrays.
+        let lhvc = boxed(b"lhvC", &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let mut vexu = boxed(b"eyes", &boxed(b"stri", &[0x00, 0x00, 0x00, 0x00, 0x03]));
+        vexu = boxed(b"vexu", &vexu);
+
+        let mut schm = 0u32.to_be_bytes().to_vec(); // version 0, no flags
+        schm.extend_from_slice(b"cbcs");
+        schm.extend_from_slice(&0u32.to_be_bytes()); // scheme_version
+
+        let mut tenc = 0x0100_0000u32.to_be_bytes().to_vec(); // version 1, no flags
+        tenc.push(0); // reserved
+        tenc.push(0x19); // default_crypt_byte_block 1 : default_skip_byte_block 9
+        tenc.push(1); // default_is_protected
+        tenc.push(16); // default_per_sample_iv_size
+        tenc.extend_from_slice(&[0xAB; 16]); // default_KID
+
+        let mut sinf = boxed(b"frma", b"hvc1");
+        sinf.extend(boxed(b"schm", &schm));
+        sinf.extend(boxed(b"schi", &boxed(b"tenc", &tenc)));
+
+        let mut entry = visual();
+        entry.extend(hvcc(2, false, 153));
+        entry.extend(lhvc);
+        entry.extend(vexu);
+        entry.extend(boxed(b"sinf", &sinf));
+
+        let mut out = ftyp();
+        out.extend(boxed(
+            b"moov",
+            &trak(1, b"vide", 90_000, &boxed(b"encv", &entry)),
+        ));
+        out
+    }
+
+    #[test]
+    fn init_probe_reads_encryption_and_layered_hevc_boxes() {
+        let probe = probe_init_segment(&encrypted_mv_hevc_init());
+        // `frma` restores the format the samples were before they were encrypted, so
+        // codec rules see `hvc1` rather than the `encv` placeholder.
+        assert_eq!(probe.video_sample_fourcc.as_deref(), Some("hvc1"));
+        assert!(probe.had_encrypted_sample_entry);
+        assert_eq!(probe.scheme_type.as_deref(), Some("cbcs"));
+        assert!(probe.has_tenc && probe.has_video_tenc);
+        assert_eq!(probe.video_crypt_byte_block, Some(1));
+        assert_eq!(probe.video_skip_byte_block, Some(9));
+        assert!(probe.has_lhvc, "lhvC signals the MV-HEVC §1.36 is about");
+        assert!(probe.has_vexu);
+        // The configuration box still reads through the encrypted sample entry.
+        assert_eq!(probe.video_profile.as_deref(), Some("2"));
+        assert_eq!(probe.video_level.as_deref(), Some("153"));
     }
 
     /// One `traf` plus the samples it points at, for [`media_segment`].
