@@ -620,6 +620,110 @@ https://example.com/v.m3u8
         );
     }
 
+    // ── §8.4 PROGRAM-DATE-TIME, §8.7 ENDLIST, §8.11 window length ────────────
+
+    /// Findings citing exactly `rule`. The citation is followed by a colon, which keeps
+    /// §8.1 from also matching §8.11 and §8.2 from matching §8.22.
+    fn rule_issues(content: &str, rule: &str) -> Vec<Issue> {
+        playlist_issues(content, &format!("§{rule}:"))
+    }
+
+    /// A live media playlist: a sliding window of `segments` segments with neither
+    /// EXT-X-ENDLIST nor EXT-X-PLAYLIST-TYPE, which is what makes §8.4, §8.11 and §8.12
+    /// treat it as still being appended to. `with_pdt` maps each segment onto the wall
+    /// clock, which is what §8.4 asks a live playlist for.
+    fn live_window(segments: usize, with_pdt: bool) -> String {
+        let mut body = String::new();
+        for i in 0..segments {
+            if with_pdt {
+                body.push_str(&format!(
+                    "#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:{:02}.000Z\n",
+                    i * 6
+                ));
+            }
+            body.push_str(&format!("#EXTINF:6.00000,\n{i}.m4s\n"));
+        }
+        format!("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:100\n{body}")
+    }
+
+    /// A completed playlist: EXT-X-ENDLIST plus the EXT-X-PLAYLIST-TYPE:VOD that §8.6
+    /// requires alongside it. `endlist` drops the tag, which is §8.7's finding.
+    fn vod_playlist(endlist: bool) -> String {
+        let end = if endlist { "#EXT-X-ENDLIST\n" } else { "" };
+        format!(
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-PLAYLIST-TYPE:VOD\n\
+             #EXTINF:6.00000,\n0.m4s\n#EXTINF:6.00000,\n1.m4s\n{end}"
+        )
+    }
+
+    #[test]
+    fn author_8_4_errors_when_a_live_playlist_has_no_program_date_time() {
+        let issues = rule_issues(&live_window(6, false), "8.4");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(
+            issues[0].message.contains("PROGRAM-DATE-TIME"),
+            "got: {}",
+            issues[0].message
+        );
+    }
+
+    /// One EXT-X-PROGRAM-DATE-TIME anchors the whole playlist, so the rule is satisfied
+    /// as soon as any segment carries one.
+    #[test]
+    fn author_8_4_accepts_a_live_playlist_that_carries_program_date_time() {
+        assert!(rule_issues(&live_window(6, true), "8.4").is_empty());
+    }
+
+    /// §8.4 is about playlists still being appended to. A completed one names its own
+    /// timeline through its duration and needs no wall-clock anchor.
+    #[test]
+    fn author_8_4_ignores_a_completed_playlist() {
+        assert!(rule_issues(&vod_playlist(true), "8.4").is_empty());
+    }
+
+    #[test]
+    fn author_8_7_errors_when_playlist_type_vod_has_no_endlist() {
+        let issues = rule_issues(&vod_playlist(false), "8.7");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(
+            issues[0].message.contains("EXT-X-ENDLIST"),
+            "got: {}",
+            issues[0].message
+        );
+    }
+
+    #[test]
+    fn author_8_7_accepts_playlist_type_vod_with_endlist() {
+        assert!(rule_issues(&vod_playlist(true), "8.7").is_empty());
+    }
+
+    /// A player joining a live stream needs enough segments behind the live edge to build
+    /// a buffer from, so the window may not be shorter than six segments.
+    #[test]
+    fn author_8_11_errors_on_a_live_window_of_fewer_than_six_segments() {
+        let issues = rule_issues(&live_window(5, true), "8.11");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(
+            issues[0].message.contains("has 5 segments"),
+            "the finding should say how many segments it counted, got: {}",
+            issues[0].message
+        );
+    }
+
+    #[test]
+    fn author_8_11_accepts_a_live_window_of_six_segments() {
+        assert!(rule_issues(&live_window(6, true), "8.11").is_empty());
+    }
+
+    /// A completed playlist has no live edge, so a two-segment VOD asset is not short.
+    #[test]
+    fn author_8_11_ignores_a_completed_playlist() {
+        assert!(rule_issues(&vod_playlist(true), "8.11").is_empty());
+    }
+
     fn issues_for(playlists: &[MediaPlaylist], section: &str) -> Vec<Issue> {
         let master = master();
         let opts = ValidateAuthorOptions::default();

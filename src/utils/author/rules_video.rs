@@ -1389,6 +1389,139 @@ https://example.com/1080.m3u8
         assert!(section_issues(master, &[], &[], "1.11").is_empty());
     }
 
+    // ── §1.5 container ───────────────────────────────────────────────────────
+
+    /// A completed video rendition declaring `codecs`, whose segments have `extension`.
+    /// `map` writes an EXT-X-MAP, which is what makes a playlist an fMP4 one.
+    fn container_playlist(codecs: &str, extension: &str, map: bool) -> MediaPlaylist {
+        let mut pl = video_playlist("video/1920x1080", "https://example.com/1080.m3u8");
+        pl.codecs = Some(codecs.into());
+        for i in 0..2 {
+            pl.segments.push(crate::utils::validator::types::Segment {
+                uri: format!("{i}.{extension}"),
+                duration: 4.0,
+                title: None,
+                pdt: None,
+                discontinuity: false,
+                byterange: None,
+                is_ad: false,
+                map_uri: map.then(|| "init.mp4".to_string()),
+            });
+        }
+        pl
+    }
+
+    /// HEVC, Dolby Vision and AV1 are only carried in fMP4, so a playlist of transport
+    /// stream segments with no EXT-X-MAP contradicts the codec it declares.
+    #[test]
+    fn author_1_5_errors_when_an_hevc_family_playlist_looks_like_transport_stream() {
+        for codecs in ["hvc1.2.4.L123.B0", "dvh1.05.03", "av01.0.13M.10"] {
+            let pl = container_playlist(codecs, "ts", false);
+            let issues = section_issues(TWO_RUNG_LADDER, &[pl], &[], "1.5");
+            assert_eq!(issues.len(), 1, "{codecs}: {issues:?}");
+            assert_eq!(issues[0].severity, Severity::Error);
+            assert!(
+                issues[0].message.contains("EXT-X-MAP"),
+                "got: {}",
+                issues[0].message
+            );
+        }
+    }
+
+    /// An EXT-X-MAP makes the segments fMP4 whatever their file extension says, and an
+    /// H.264 rendition may be transport stream to begin with.
+    #[test]
+    fn author_1_5_accepts_an_init_segment_or_an_avc_transport_stream() {
+        let mapped = container_playlist("hvc1.2.4.L123.B0", "ts", true);
+        assert!(section_issues(TWO_RUNG_LADDER, &[mapped], &[], "1.5").is_empty());
+
+        let avc = container_playlist("avc1.640029", "ts", false);
+        assert!(section_issues(TWO_RUNG_LADDER, &[avc], &[], "1.5").is_empty());
+    }
+
+    // ── §1.37 AV1 level, §1.38 APMP mono projection ──────────────────────────
+
+    /// An AV1 rung whose CODECS token declares `level_and_tier` as its third element,
+    /// which RFC 6381 writes as two digits of level × 10 followed by the tier letter:
+    /// `13M` is Level 1.3, Main tier.
+    fn av1_master(level_and_tier: &str) -> String {
+        format!(
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=6000000,AVERAGE-BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS=\"av01.0.{level_and_tier}.10\",FRAME-RATE=30\nhttps://example.com/av1.m3u8\n"
+        )
+    }
+
+    #[test]
+    fn author_1_37_errors_on_an_av1_level_above_6_2() {
+        // Level 7.0, one step past the 6.2 ceiling Apple's decoders support.
+        let issues = section_issues(&av1_master("70"), &[], &[], "1.37");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(
+            issues[0].message.contains("av01.0.70.10")
+                && issues[0].message.contains("level 6.2"),
+            "the finding should name the token and the ceiling, got: {}",
+            issues[0].message
+        );
+    }
+
+    #[test]
+    fn author_1_37_accepts_av1_at_and_below_the_ceiling() {
+        for level in ["62", "50", "13"] {
+            let issues = section_issues(&av1_master(level), &[], &[], "1.37");
+            assert!(issues.is_empty(), "level {level}: {issues:?}");
+        }
+    }
+
+    /// The level and the tier share one CODECS element, and `av1_level_ok` parses that
+    /// element as a number — so `70M` does not parse and the rule passes the token rather
+    /// than guessing at it. Every AV1 token a packager writes carries the tier letter, so
+    /// as it stands §1.37 measures nothing on a real stream. Pinned so that the day the
+    /// parse learns to read the tier, this expectation is what has to change.
+    #[test]
+    fn author_1_37_does_not_yet_read_a_level_written_with_its_tier() {
+        assert!(av1_level_ok("av01.0.70M.10"));
+        assert!(section_issues(&av1_master("70M"), &[], &[], "1.37").is_empty());
+    }
+
+    /// An APMP projection with an `av01` token: the projections Apple's multi-projection
+    /// format defines are carried in HEVC, so an AV1 rung declaring one cannot be decoded.
+    #[test]
+    fn author_1_38_errors_when_a_mono_projection_is_not_hevc() {
+        for projection in ["PROJ-EQUI", "PROJ-RECT"] {
+            let master = format!(
+                "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=6000000,AVERAGE-BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS=\"avc1.640029\",FRAME-RATE=30,REQ-VIDEO-LAYOUT=\"CH-MONO,{projection}\"\nhttps://example.com/apmp.m3u8\n"
+            );
+            let issues = section_issues(&master, &[], &[], "1.38");
+            assert_eq!(issues.len(), 1, "{projection}: {issues:?}");
+            assert_eq!(issues[0].severity, Severity::Error);
+            assert!(
+                issues[0].message.contains("requires HEVC CODECS"),
+                "got: {}",
+                issues[0].message
+            );
+        }
+    }
+
+    #[test]
+    fn author_1_38_accepts_a_mono_projection_carried_in_hevc() {
+        let master = r#"#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=6000000,AVERAGE-BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS="hvc1.2.4.L123.B0",FRAME-RATE=30,REQ-VIDEO-LAYOUT="CH-MONO,PROJ-EQUI"
+https://example.com/apmp.m3u8
+"#;
+        assert!(section_issues(master, &[], &[], "1.38").is_empty());
+    }
+
+    /// §1.38 is written about monoscopic projections. A stereo one is §1.36's and §16's
+    /// subject, so the codec requirement this rule states does not reach it.
+    #[test]
+    fn author_1_38_ignores_a_stereo_projection() {
+        let master = r#"#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=6000000,AVERAGE-BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS="avc1.640029",FRAME-RATE=30,REQ-VIDEO-LAYOUT="CH-STEREO,PROJ-EQUI"
+https://example.com/apmp.m3u8
+"#;
+        assert!(section_issues(master, &[], &[], "1.38").is_empty());
+    }
+
     #[test]
     fn playlist_url_matching_resolves_relative_variant_uris() {
         assert!(playlist_url_matches(

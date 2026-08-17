@@ -482,4 +482,114 @@ mod tests {
         assert!(find(&issues, "§2.12").is_none(), "{issues:?}");
         assert!(find(&issues, "§2.27").is_none(), "{issues:?}");
     }
+
+    // ── §2.19 APAC loudness, §2.25 container ─────────────────────────────────
+
+    /// Audio findings citing exactly `rule`. The citation is followed by a colon, which
+    /// keeps §2.2 from also matching §2.25 and §2.27.
+    fn rule_issues(playlists: &[MediaPlaylist], inits: &[InitProbeEntry], rule: &str) -> Vec<Issue> {
+        let master = parse_master_playlist(
+            "https://example.com/master.m3u8",
+            "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",LANGUAGE=\"en\",AUTOSELECT=YES,DEFAULT=YES,URI=\"a.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,AVERAGE-BANDWIDTH=1800000,RESOLUTION=1280x720,CODECS=\"avc1.4d401f,mp4a.40.42\",FRAME-RATE=30,AUDIO=\"aud\"\nhttps://example.com/v.m3u8\n",
+        );
+        let opts = ValidateAuthorOptions::default();
+        let segs: Vec<SegmentSample> = Vec::new();
+        let vtts: Vec<WebVttSample> = Vec::new();
+        let ctx = AuthoringContext::new(Some(&master), playlists, &opts, inits, &segs, &vtts);
+        let needle = format!("§{rule}:");
+        check(&ctx)
+            .into_iter()
+            .filter(|i| i.message.contains(&needle))
+            .collect()
+    }
+
+    /// An APAC audio init, optionally carrying the `ludt` loudness box that §2.19 says
+    /// APAC must not use — APAC signals its loudness in the bitstream instead.
+    fn apac_init(has_ludt: bool) -> InitProbeEntry {
+        InitProbeEntry {
+            uri: "https://example.com/apac-init.mp4".into(),
+            byterange: None,
+            playlist_names: vec!["audio/English (aud)".into()],
+            media_types: vec!["AUDIO".into()],
+            probe: crate::utils::mp4_probe::InitSegmentProbe {
+                major_brand: Some("iso6".into()),
+                audio_sample_fourcc: Some("apac".into()),
+                has_ludt,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn author_2_19_errors_when_an_apac_init_carries_a_ludt_box() {
+        let issues = rule_issues(&[], &[apac_init(true)], "2.19");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(
+            issues[0].message.contains("MUST NOT include a ludt"),
+            "got: {}",
+            issues[0].message
+        );
+    }
+
+    /// The `ludt` requirement runs the other way for every other codec, so an APAC init
+    /// without one is what the rule asks for rather than the warning AAC would earn.
+    #[test]
+    fn author_2_19_accepts_an_apac_init_without_a_ludt_box() {
+        assert!(rule_issues(&[], &[apac_init(false)], "2.19").is_empty());
+    }
+
+    /// An audio rendition whose segments have `extension`, declaring `codecs`. `map`
+    /// writes an EXT-X-MAP, which is what turns a playlist into an fMP4 one.
+    fn audio_rendition(codecs: &str, extension: &str, map: bool) -> MediaPlaylist {
+        let mut pl = MediaPlaylist::new(
+            "audio/English (aud)".into(),
+            "https://example.com/a.m3u8".into(),
+        );
+        pl.media_type = "AUDIO".into();
+        pl.codecs = Some(codecs.into());
+        pl.target_duration = 6.0;
+        pl.has_endlist = true;
+        pl.playlist_type = Some("VOD".into());
+        for i in 0..2 {
+            pl.segments.push(crate::utils::validator::types::Segment {
+                uri: format!("{i}.{extension}"),
+                duration: 6.0,
+                title: None,
+                pdt: None,
+                discontinuity: false,
+                byterange: None,
+                is_ad: false,
+                map_uri: map.then(|| "init.mp4".to_string()),
+            });
+        }
+        pl
+    }
+
+    #[test]
+    fn author_2_25_errors_when_xhe_aac_is_carried_in_transport_stream() {
+        let issues = rule_issues(&[audio_rendition("mp4a.40.42", "ts", false)], &[], "2.25");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(
+            issues[0].message.contains("EXT-X-MAP"),
+            "got: {}",
+            issues[0].message
+        );
+    }
+
+    #[test]
+    fn author_2_25_accepts_the_same_codecs_in_fmp4() {
+        for codecs in ["mp4a.40.42", "apac", "alac", "flac"] {
+            let issues = rule_issues(&[audio_rendition(codecs, "m4s", true)], &[], "2.25");
+            assert!(issues.is_empty(), "{codecs}: {issues:?}");
+        }
+    }
+
+    /// AAC-LC is allowed in a transport stream, so the container rule §2.25 states for the
+    /// newer codecs does not reach it.
+    #[test]
+    fn author_2_25_ignores_aac_lc_in_transport_stream() {
+        assert!(rule_issues(&[audio_rendition("mp4a.40.2", "ts", false)], &[], "2.25").is_empty());
+    }
 }

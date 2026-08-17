@@ -719,3 +719,113 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
 
     issues
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::context::{InitProbeEntry, ValidateAuthorOptions, WebVttSample};
+    use super::*;
+    use crate::utils::validator::types::Segment;
+
+    /// A VOD transport-stream rendition of `count` six-second segments, with BANDWIDTH
+    /// declared to match what [`ts_sample`] measures so the rate rules stay quiet.
+    fn ts_playlist(count: usize) -> MediaPlaylist {
+        let mut pl =
+            MediaPlaylist::new("video/1280x720".into(), "https://example.com/v.m3u8".into());
+        pl.media_type = "VIDEO".into();
+        pl.target_duration = 6.0;
+        pl.has_endlist = true;
+        pl.playlist_type = Some("VOD".into());
+        pl.bandwidth = Some(1_000_000);
+        pl.average_bandwidth = Some(1_000_000);
+        for i in 0..count {
+            pl.segments.push(Segment {
+                uri: format!("{i}.ts"),
+                duration: 6.0,
+                title: None,
+                pdt: None,
+                discontinuity: false,
+                byterange: None,
+                is_ad: false,
+                map_uri: None,
+            });
+        }
+        pl
+    }
+
+    /// One sampled transport-stream segment. `continuity_ok` is what the TS packet scan
+    /// concluded about the segment's continuity counters: `None` means it was not read.
+    fn ts_sample(index: usize, continuity_ok: Option<bool>) -> SegmentSample {
+        SegmentSample {
+            playlist_name: "video/1280x720".into(),
+            segment_index: index,
+            uri: format!("{index}.ts"),
+            extinf_s: 6.0,
+            bytes: 750_000,
+            looks_like_ts: true,
+            has_idr_nal_hint: true,
+            idr_at_start: true,
+            has_irap_nal_hint: true,
+            irap_at_start: true,
+            irap_count: 1,
+            nal_scan_scoped_to_video: true,
+            ts_continuity_ok: continuity_ok,
+            ..Default::default()
+        }
+    }
+
+    /// Deep findings citing exactly `rule`.
+    fn rule_issues(samples: &[SegmentSample], rule: &str) -> Vec<Issue> {
+        let playlists = vec![ts_playlist(samples.len().max(6))];
+        let opts = ValidateAuthorOptions {
+            profile: super::super::profile::AuthorProfile::None,
+            deep_checks: true,
+        };
+        let inits: Vec<InitProbeEntry> = Vec::new();
+        let vtts: Vec<WebVttSample> = Vec::new();
+        let ctx = AuthoringContext::new(None, &playlists, &opts, &inits, samples, &vtts);
+        let needle = format!("§{rule}:");
+        check(&ctx)
+            .into_iter()
+            .filter(|i| i.message.contains(&needle))
+            .collect()
+    }
+
+    #[test]
+    fn author_7_2_errors_on_a_transport_stream_continuity_break() {
+        let samples = vec![ts_sample(0, Some(true)), ts_sample(1, Some(false))];
+        let issues = rule_issues(&samples, "7.2");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(
+            issues[0].message.contains("video/1280x720[#1]"),
+            "the finding should name the segment: {}",
+            issues[0].message
+        );
+    }
+
+    #[test]
+    fn author_7_2_stays_quiet_when_the_counters_are_continuous() {
+        let samples = vec![ts_sample(0, Some(true)), ts_sample(1, Some(true))];
+        assert!(rule_issues(&samples, "7.2").is_empty());
+    }
+
+    /// A continuity verdict of `None` is "not read", which is not evidence of a break.
+    #[test]
+    fn author_7_2_stays_quiet_when_continuity_was_not_measured() {
+        let samples = vec![ts_sample(0, None), ts_sample(1, None)];
+        assert!(rule_issues(&samples, "7.2").is_empty());
+    }
+
+    /// Phase C runs only when the caller asked for deep checks; nothing is sampled
+    /// otherwise, so no measured finding can be reported.
+    #[test]
+    fn deep_checks_are_skipped_unless_requested() {
+        let playlists = vec![ts_playlist(6)];
+        let samples = vec![ts_sample(0, Some(false))];
+        let opts = ValidateAuthorOptions::default();
+        let inits: Vec<InitProbeEntry> = Vec::new();
+        let vtts: Vec<WebVttSample> = Vec::new();
+        let ctx = AuthoringContext::new(None, &playlists, &opts, &inits, &samples, &vtts);
+        assert!(check(&ctx).is_empty());
+    }
+}

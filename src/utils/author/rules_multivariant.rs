@@ -532,6 +532,160 @@ mod tests {
             .collect()
     }
 
+    /// Findings citing exactly `rule`. A citation is followed by a colon, so this keeps
+    /// §9.2 from also matching §9.20.
+    fn rule_issues(master_text: &str, rule: &str) -> Vec<Issue> {
+        issues_for(master_text, &format!("§{rule}:"))
+    }
+
+    // ── §9.1–9.4 STREAM-INF / I-FRAME-STREAM-INF attributes ──────────────────
+
+    /// A two-rung H.264 ladder with a trick-play rendition, carrying every attribute
+    /// §9.1–9.4 asks for. Tests drop one attribute at a time from it.
+    const COMPLETE_LADDER: &str = r#"#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=6000000,AVERAGE-BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS="avc1.640029",FRAME-RATE=30
+v1080.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=3000000,AVERAGE-BANDWIDTH=2500000,RESOLUTION=1280x720,CODECS="avc1.64001f",FRAME-RATE=30
+v720.m3u8
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=200000,RESOLUTION=1920x1080,CODECS="avc1.640029",URI="iframe.m3u8"
+"#;
+
+    #[test]
+    fn author_9_1_to_9_4_accept_a_fully_described_ladder() {
+        for rule in ["9.1", "9.2", "9.3", "9.4"] {
+            let issues = rule_issues(COMPLETE_LADDER, rule);
+            assert!(
+                issues.is_empty(),
+                "§{rule} on a compliant ladder: {:?}",
+                issues.iter().map(|i| &i.message).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn author_9_2_errors_when_a_video_variant_omits_resolution() {
+        let issues = rule_issues(
+            &COMPLETE_LADDER.replace("RESOLUTION=1280x720,", ""),
+            "9.2",
+        );
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(
+            issues[0].message.contains("v720.m3u8"),
+            "the finding should name the variant, got: {}",
+            issues[0].message
+        );
+    }
+
+    /// RESOLUTION describes a picture, so a variant carrying only audio has none to
+    /// declare. §9.14's AVERAGE-BANDWIDTH requirement still applies to it.
+    #[test]
+    fn author_9_2_ignores_an_audio_only_variant() {
+        let issues = rule_issues(
+            r#"#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=3000000,AVERAGE-BANDWIDTH=2500000,RESOLUTION=1280x720,CODECS="avc1.64001f",FRAME-RATE=30
+v720.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=128000,AVERAGE-BANDWIDTH=120000,CODECS="mp4a.40.2"
+audio.m3u8
+"#,
+            "9.2",
+        );
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
+    fn author_9_3_errors_when_an_iframe_variant_omits_codecs() {
+        let issues = rule_issues(
+            &COMPLETE_LADDER.replace(r#"CODECS="avc1.640029",URI"#, "URI"),
+            "9.3",
+        );
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(
+            issues[0].message.contains("I-FRAME-STREAM-INF")
+                && issues[0].message.contains("iframe.m3u8"),
+            "got: {}",
+            issues[0].message
+        );
+    }
+
+    /// An I-frame rendition always carries video, so unlike §9.2 there is no audio-only
+    /// case to excuse a missing RESOLUTION.
+    #[test]
+    fn author_9_4_errors_when_an_iframe_variant_omits_resolution() {
+        let issues = rule_issues(
+            &COMPLETE_LADDER.replace("RESOLUTION=1920x1080,CODECS=\"avc1.640029\",URI", "CODECS=\"avc1.640029\",URI"),
+            "9.4",
+        );
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(issues[0].message.contains("iframe.m3u8"), "{issues:?}");
+    }
+
+    /// §9.2's audio-only excuse is read off CODECS, so a variant that declares neither
+    /// attribute is reported under both rules: nothing says it carries no picture. The
+    /// §9.16 rendition rules take the opposite reading of the same variant and treat it
+    /// as audio, which is why each states its own test rather than sharing a helper.
+    #[test]
+    fn author_9_1_and_9_2_both_report_a_variant_that_declares_neither() {
+        let content = r#"#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=3000000,AVERAGE-BANDWIDTH=2500000,FRAME-RATE=30
+v720.m3u8
+"#;
+        for rule in ["9.1", "9.2"] {
+            let issues = rule_issues(content, rule);
+            assert_eq!(issues.len(), 1, "§{rule}: {issues:?}");
+            assert_eq!(issues[0].severity, Severity::Error);
+            assert!(issues[0].message.contains("v720.m3u8"), "{issues:?}");
+        }
+    }
+
+    // ── §9.19 SCORE, §9.20 APAC profile/level ────────────────────────────────
+
+    /// SCORE ranks the variants against each other, so a player can only use it when
+    /// every variant carries one — a half-scored ladder has no ordering at all.
+    #[test]
+    fn author_9_19_errors_when_only_some_variants_carry_score() {
+        // The 1080 rung is scored and the 720 rung is not.
+        let partial = COMPLETE_LADDER.replace(
+            r#"CODECS="avc1.640029",FRAME-RATE=30"#,
+            r#"CODECS="avc1.640029",FRAME-RATE=30,SCORE=2.0"#,
+        );
+        let issues = rule_issues(&partial, "9.19");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(
+            issues[0].message.contains("all variants or none"),
+            "got: {}",
+            issues[0].message
+        );
+    }
+
+    #[test]
+    fn author_9_19_accepts_score_on_every_variant_or_on_none() {
+        assert!(rule_issues(COMPLETE_LADDER, "9.19").is_empty());
+        let every = COMPLETE_LADDER.replace("FRAME-RATE=30", "FRAME-RATE=30,SCORE=2.0");
+        let issues = rule_issues(&every, "9.19");
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
+    fn author_9_20_asks_apac_codecs_for_a_profile_and_level() {
+        let bare = rule_issues(
+            &COMPLETE_LADDER.replace(r#"CODECS="avc1.64001f""#, r#"CODECS="avc1.64001f,apac""#),
+            "9.20",
+        );
+        assert_eq!(bare.len(), 1, "{bare:?}");
+        assert_eq!(bare[0].severity, Severity::Warn);
+        assert!(bare[0].message.contains("'apac'"), "got: {}", bare[0].message);
+
+        let qualified = rule_issues(
+            &COMPLETE_LADDER.replace(r#"CODECS="avc1.64001f""#, r#"CODECS="avc1.64001f,apac.31.00""#),
+            "9.20",
+        );
+        assert!(qualified.is_empty(), "{qualified:?}");
+    }
+
     #[test]
     fn author_9_16_ignores_audio_only_variants() {
         let issues = issues_for(

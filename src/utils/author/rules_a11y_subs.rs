@@ -494,4 +494,49 @@ https://example.com/v.m3u8
         assert!(find(&issues, "§5.8").is_none(), "{issues:?}");
         assert!(find(&issues, "§5.11").is_none(), "{issues:?}");
     }
+
+    /// §5.2 only applies under the AirPlay2 amendment, so its fixture selects that profile
+    /// and writes the subtitle CODECS into the multivariant playlist the rule reads.
+    fn airplay_issues(subtitle_codecs: &str) -> Vec<Issue> {
+        let content = format!(
+            "#EXTM3U\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"English\",LANGUAGE=\"en\",AUTOSELECT=YES,DEFAULT=YES,CODECS=\"{subtitle_codecs}\",URI=\"subs.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,AVERAGE-BANDWIDTH=1800000,RESOLUTION=1280x720,CODECS=\"avc1.4d401f,mp4a.40.2\",FRAME-RATE=30,SUBTITLES=\"subs\"\nhttps://example.com/v.m3u8\n"
+        );
+        let master = parse_master_playlist("https://example.com/master.m3u8", &content);
+        let opts = ValidateAuthorOptions {
+            profile: crate::utils::author::profile::AuthorProfile::AirPlay2,
+            deep_checks: false,
+        };
+        let playlists: Vec<MediaPlaylist> = Vec::new();
+        let inits: Vec<InitProbeEntry> = Vec::new();
+        let segs: Vec<SegmentSample> = Vec::new();
+        let vtts: Vec<WebVttSample> = Vec::new();
+        let ctx = AuthoringContext::new(Some(&master), &playlists, &opts, &inits, &segs, &vtts);
+        check(&ctx)
+    }
+
+    #[test]
+    fn author_5_2_errors_on_imsc1_subtitles_under_the_airplay_profile() {
+        for codecs in ["stpp.ttml.im1t", "im1t"] {
+            let issues = airplay_issues(codecs);
+            let issue = find(&issues, "§5.2").unwrap_or_else(|| panic!("{codecs}: {issues:?}"));
+            assert_eq!(issue.severity, Severity::Error);
+            assert!(issue.message.contains("WebVTT"), "{}", issue.message);
+        }
+    }
+
+    #[test]
+    fn author_5_2_accepts_webvtt_subtitles_under_the_airplay_profile() {
+        let issues = airplay_issues("wvtt");
+        assert!(find(&issues, "§5.2").is_none(), "{issues:?}");
+    }
+
+    /// Without the AirPlay2 amendment IMSC1 is a permitted subtitle format, so the same
+    /// playlist earns no §5.2 finding on the General profile.
+    #[test]
+    fn author_5_2_does_not_apply_to_the_general_profile() {
+        let issues = master_issues(
+            "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"English\",LANGUAGE=\"en\",AUTOSELECT=YES,DEFAULT=YES,CODECS=\"stpp.ttml.im1t\",URI=\"subs.m3u8\"\n",
+        );
+        assert!(find(&issues, "§5.2").is_none(), "{issues:?}");
+    }
 }

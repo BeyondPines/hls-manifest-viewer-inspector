@@ -375,6 +375,112 @@ https://example.com/v.m3u8
             .collect()
     }
 
+    // ── §6.8 EXT-X-I-FRAMES-ONLY, §6.11 live TARGETDURATION ──────────────────
+
+    /// Trick-play findings citing exactly `rule`, over the ladder `master()` describes.
+    /// The citation is followed by a colon, which keeps §6.1 from matching §6.10–6.18.
+    fn rule_issues(playlists: &[MediaPlaylist], rule: &str) -> Vec<Issue> {
+        let master = master();
+        let opts = ValidateAuthorOptions::default();
+        let inits: Vec<InitProbeEntry> = Vec::new();
+        let segs: Vec<SegmentSample> = Vec::new();
+        let vtts: Vec<WebVttSample> = Vec::new();
+        let ctx = AuthoringContext::new(Some(&master), playlists, &opts, &inits, &segs, &vtts);
+        let needle = format!("§{rule}:");
+        check(&ctx)
+            .into_iter()
+            .filter(|i| i.message.contains(&needle))
+            .collect()
+    }
+
+    /// A rendition of `media_type` at `target_duration`. `live` leaves off both
+    /// EXT-X-ENDLIST and EXT-X-PLAYLIST-TYPE, which is what puts §6.11 in scope.
+    fn rendition(name: &str, target_duration: f64, live: bool) -> MediaPlaylist {
+        let mut pl = MediaPlaylist::new(name.into(), format!("https://example.com/{name}.m3u8"));
+        pl.media_type = "VIDEO".into();
+        pl.target_duration = target_duration;
+        pl.has_endlist = !live;
+        pl.playlist_type = (!live).then(|| "VOD".to_string());
+        pl
+    }
+
+    /// An I-frame rendition of the same asset, which §6.8 requires to declare that it
+    /// holds nothing but I-frames.
+    fn trick_play(target_duration: f64, live: bool, iframes_only: bool) -> MediaPlaylist {
+        let mut pl = rendition("iframe/1280x720", target_duration, live);
+        pl.is_iframe = true;
+        pl.iframes_only = iframes_only;
+        pl
+    }
+
+    #[test]
+    fn author_6_8_errors_when_an_iframe_playlist_omits_iframes_only() {
+        let issues = rule_issues(&[trick_play(6.0, false, false)], "6.8");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(
+            issues[0].message.contains("EXT-X-I-FRAMES-ONLY")
+                && issues[0].message.contains("iframe/1280x720"),
+            "got: {}",
+            issues[0].message
+        );
+    }
+
+    #[test]
+    fn author_6_8_accepts_an_iframe_playlist_that_declares_iframes_only() {
+        assert!(rule_issues(&[trick_play(6.0, false, true)], "6.8").is_empty());
+    }
+
+    /// On a live stream a player scrubbing through trick play reloads both playlists on
+    /// the same cadence, so their target durations have to agree.
+    #[test]
+    fn author_6_11_errors_when_live_trick_play_target_duration_differs() {
+        let issues = rule_issues(
+            &[
+                rendition("video/1280x720", 6.0, true),
+                trick_play(10.0, true, true),
+            ],
+            "6.11",
+        );
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(
+            issues[0].message.contains("10") && issues[0].message.contains('6'),
+            "the finding should name both target durations, got: {}",
+            issues[0].message
+        );
+    }
+
+    #[test]
+    fn author_6_11_accepts_matching_live_target_durations() {
+        assert!(
+            rule_issues(
+                &[
+                    rendition("video/1280x720", 6.0, true),
+                    trick_play(6.0, true, true),
+                ],
+                "6.11",
+            )
+            .is_empty()
+        );
+    }
+
+    /// §6.12 lets a completed asset's trick play segment on its own cadence, so the same
+    /// mismatched target durations are only reported while the stream is live.
+    #[test]
+    fn author_6_11_ignores_a_completed_asset() {
+        assert!(
+            rule_issues(
+                &[
+                    rendition("video/1280x720", 6.0, false),
+                    trick_play(10.0, false, true),
+                ],
+                "6.11",
+            )
+            .is_empty()
+        );
+    }
+
     #[test]
     fn author_6_18_accepts_monoscopic_rectilinear_trick_play() {
         assert!(
