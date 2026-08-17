@@ -55,6 +55,9 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         }
     }
 
+    // §8.22 — renditions of one asset SHOULD break their segments at the same times.
+    issues.extend(check_segment_boundary_alignment(ctx));
+
     // §8.4 — Live MUST have PDT
     for pl in videos.iter().chain(audios.iter()) {
         let live = !pl.has_endlist && pl.playlist_type.as_deref() != Some("VOD");
@@ -277,6 +280,105 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
     issues
 }
 
+/// Cumulative end time of every segment but the last: the points inside an asset where a
+/// player can move from one rendition to another. The final boundary is the asset
+/// duration, which §8.3 already compares, so it is left out here.
+fn internal_boundaries(pl: &MediaPlaylist) -> Vec<f64> {
+    let mut elapsed = 0.0;
+    pl.segments[..pl.segments.len().saturating_sub(1)]
+        .iter()
+        .map(|seg| {
+            elapsed += seg.duration;
+            elapsed
+        })
+        .collect()
+}
+
+/// How far apart two boundaries may be and still fall on the same picture. A playlist
+/// that declares no FRAME-RATE is held to 30 fps, and the extra millisecond absorbs the
+/// rounding in a chain of decimal EXTINF values.
+fn boundary_tolerance_s(pl: &MediaPlaylist) -> f64 {
+    let frame = pl
+        .frame_rate
+        .filter(|fps| *fps > 0.0)
+        .map_or(1.0 / 30.0, |fps| 1.0 / fps);
+    frame + 0.001
+}
+
+/// The first boundary of a rendition that does not line up with the reference.
+struct BoundaryDrift<'a> {
+    playlist: &'a str,
+    /// Segment whose end boundary drifted; the segments before it lined up.
+    segment_index: usize,
+    reference_s: f64,
+    found_s: f64,
+}
+
+impl BoundaryDrift<'_> {
+    fn drift_s(&self) -> f64 {
+        (self.found_s - self.reference_s).abs()
+    }
+}
+
+/// §8.22 — one finding for the stream. Every rendition of an asset SHOULD break its
+/// segments at the same times: a player that switches rendition mid-stream continues at
+/// the boundary it has already reached, and boundaries that do not line up leave it
+/// refetching media it has or restarting the decoder inside a segment.
+///
+/// The drift comes from one encoding decision, so a per-boundary finding would repeat it
+/// once per segment and a per-playlist finding once per rendition. Each rendition is
+/// compared against the reference up to the first boundary that misses, and the pair that
+/// drifted furthest is named for the whole stream.
+fn check_segment_boundary_alignment(ctx: &AuthoringContext<'_>) -> Option<Issue> {
+    let av = || ctx.video_playlists().chain(ctx.audio_playlists());
+    // A playlist of one segment has no internal boundary to compare against.
+    let reference = av().find(|pl| pl.segments.len() > 1)?;
+    let tolerance = boundary_tolerance_s(reference);
+    let reference_boundaries = internal_boundaries(reference);
+
+    let mut drifting: Vec<BoundaryDrift<'_>> = av()
+        .filter(|pl| pl.name != reference.name)
+        .filter_map(|pl| {
+            // A rendition of a different length is §8.3's finding; only the boundaries
+            // both playlists reach say anything about alignment.
+            reference_boundaries
+                .iter()
+                .copied()
+                .zip(internal_boundaries(pl))
+                .enumerate()
+                .find(|(_, (reference_s, found_s))| (reference_s - found_s).abs() > tolerance)
+                .map(|(segment_index, (reference_s, found_s))| BoundaryDrift {
+                    playlist: &pl.name,
+                    segment_index,
+                    reference_s,
+                    found_s,
+                })
+        })
+        .collect();
+    drifting.sort_by(|a, b| b.drift_s().total_cmp(&a.drift_s()));
+
+    let worst = drifting.first()?;
+    let more = match drifting.len() {
+        1 => String::new(),
+        n => format!(" (and {} more rendition(s))", n - 1),
+    };
+    Some(author_warn(
+        "8.22",
+        format!(
+            "segment boundaries of '{}'{more} do not line up with '{}': segment #{} ends at \
+             {:.3}s against {:.3}s, {:.3}s apart and more than one frame (~{tolerance:.3}s). \
+             Renditions of one asset SHOULD share their segment boundaries so a player can \
+             switch between them without refetching media or restarting the decoder mid-segment",
+            worst.playlist,
+            reference.name,
+            worst.segment_index,
+            worst.found_s,
+            worst.reference_s,
+            worst.drift_s(),
+        ),
+    ))
+}
+
 /// §8.18 — at most one finding per stream: one CDN or origin rule redirects every
 /// rendition, so listing each variant separately would say the same thing N times.
 fn check_playlist_redirects(ctx: &AuthoringContext<'_>) -> Option<Issue> {
@@ -409,7 +511,7 @@ mod tests {
     };
     use super::*;
     use crate::utils::validator::parser::{parse_master_playlist, parse_media_playlist};
-    use crate::utils::validator::types::{MasterPlaylist, Severity};
+    use crate::utils::validator::types::{MasterPlaylist, Segment, Severity};
 
     fn master() -> MasterPlaylist {
         parse_master_playlist(
@@ -566,6 +668,92 @@ https://example.com/v.m3u8
         // A playlist that was never fetched over HTTP carries no URLs to compare.
         let synthetic = MediaPlaylist::new("video/640x360".into(), "https://example.com/v360.m3u8".into());
         assert!(issues_for(&[served, synthetic], "§8.18").is_empty());
+    }
+
+    /// A VOD rendition whose segments run for `durations` seconds each.
+    fn rendition(name: &str, media_type: &str, durations: &[f64]) -> MediaPlaylist {
+        let mut pl = MediaPlaylist::new(name.into(), format!("https://example.com/{name}.m3u8"));
+        pl.media_type = media_type.into();
+        pl.target_duration = 6.0;
+        pl.has_endlist = true;
+        pl.playlist_type = Some("VOD".into());
+        pl.frame_rate = Some(30.0);
+        for (i, &duration) in durations.iter().enumerate() {
+            pl.segments.push(Segment {
+                uri: format!("{i}.m4s"),
+                duration,
+                title: None,
+                pdt: None,
+                discontinuity: false,
+                byterange: None,
+                is_ad: false,
+                map_uri: None,
+            });
+        }
+        pl
+    }
+
+    /// AAC frames do not divide a six-second segment exactly, so an audio rendition
+    /// tracking the video boundaries still lands a few milliseconds either side of them.
+    #[test]
+    fn author_8_22_accepts_boundaries_within_a_frame() {
+        let issues = issues_for(
+            &[
+                rendition("video/1280x720", "VIDEO", &[6.0, 6.0, 6.0, 6.0]),
+                rendition("audio/English (aud)", "AUDIO", &[5.994, 6.006, 5.994, 6.006]),
+            ],
+            "§8.22",
+        );
+        assert!(
+            issues.is_empty(),
+            "boundaries inside one frame are aligned, got: {:?}",
+            issues.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn author_8_22_warns_when_audio_boundaries_drift_from_video() {
+        let issues = issues_for(
+            &[
+                rendition("video/1280x720", "VIDEO", &[6.0, 6.0, 6.0, 6.0]),
+                rendition("audio/English (aud)", "AUDIO", &[5.0, 7.0, 6.0, 6.0]),
+            ],
+            "§8.22",
+        );
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Warn);
+        assert!(
+            issues[0].message.contains("audio/English (aud)")
+                && issues[0].message.contains("video/1280x720"),
+            "the finding should name both renditions, got: {}",
+            issues[0].message
+        );
+        assert!(
+            issues[0].message.contains("segment #0 ends at 5.000s against 6.000s"),
+            "the finding should say where the boundaries part, got: {}",
+            issues[0].message
+        );
+    }
+
+    /// One encoder produced every rendition, so misaligned boundaries are one authoring
+    /// fault however many renditions carry them.
+    #[test]
+    fn author_8_22_reports_the_worst_drifting_rendition_once() {
+        let issues = issues_for(
+            &[
+                rendition("video/1280x720", "VIDEO", &[6.0, 6.0, 6.0, 6.0]),
+                rendition("audio/English (aud)", "AUDIO", &[5.5, 6.5, 6.0, 6.0]),
+                rendition("audio/German (aud)", "AUDIO", &[4.0, 8.0, 6.0, 6.0]),
+            ],
+            "§8.22",
+        );
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(
+            issues[0].message.contains("audio/German (aud)")
+                && issues[0].message.contains("and 1 more rendition(s)"),
+            "expected the worst drift named and the rest counted, got: {}",
+            issues[0].message
+        );
     }
 
     /// Live playlist whose response reported `last_modified` and `date`.
