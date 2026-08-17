@@ -280,7 +280,8 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
 
     // §2.25 — xHE-AAC / ALAC / FLAC / APAC MUST be fMP4. An init that failed to parse has
     // no sample entry to name its codec, so the requirement is read from the CODECS of the
-    // playlist(s) declaring the init.
+    // playlist(s) declaring the init. The init is not necessarily an audio-only one: a
+    // muxed variant carries these codecs in the same init as its video.
     for entry in ctx.init_probes {
         if entry.probe.looks_like_fmp4_init() {
             continue;
@@ -292,7 +293,7 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         issues.push(author_error(
             "2.25",
             format!(
-                "audio init '{}' could not be parsed as fMP4 ('{}' declares {}, which MUST use fMP4)",
+                "init '{}' could not be parsed as fMP4 ('{}' declares {}, which MUST use fMP4)",
                 entry.uri,
                 entry.playlist_names.join("', '"),
                 declared.fmp4_only_audio.join(", ")
@@ -628,5 +629,71 @@ mod tests {
     fn author_2_25_ignores_an_unparseable_init_for_aac_lc() {
         let playlists = [audio_rendition("mp4a.40.2", "m4s", true)];
         assert!(rule_issues(&playlists, &[unparseable_audio_init()], "2.25").is_empty());
+    }
+
+    /// A video variant whose STREAM-INF CODECS names the audio codec alongside its own.
+    /// `audio_group` is the AUDIO attribute: set on a demuxed ladder, absent when the
+    /// variant carries its audio itself.
+    fn video_variant(codecs: &str, audio_group: Option<&str>) -> MediaPlaylist {
+        let mut pl =
+            MediaPlaylist::new("video/1280x720".into(), "https://example.com/v.m3u8".into());
+        pl.media_type = "VIDEO".into();
+        pl.codecs = Some(codecs.into());
+        pl.audio_group = audio_group.map(str::to_string);
+        pl.target_duration = 6.0;
+        pl.has_endlist = true;
+        pl.playlist_type = Some("VOD".into());
+        for i in 0..2 {
+            pl.segments.push(crate::utils::validator::types::Segment {
+                uri: format!("{i}.m4s"),
+                duration: 6.0,
+                title: None,
+                pdt: None,
+                discontinuity: false,
+                byterange: None,
+                is_ad: false,
+                map_uri: Some("v-init.mp4".to_string()),
+            });
+        }
+        pl
+    }
+
+    /// The video init of `video_variant`, with bytes nothing could be read from.
+    fn unparseable_video_init() -> InitProbeEntry {
+        InitProbeEntry {
+            uri: "https://example.com/v-init.mp4".into(),
+            byterange: None,
+            playlist_names: vec!["video/1280x720".into()],
+            media_types: vec!["VIDEO".into()],
+            probe: crate::utils::mp4_probe::InitSegmentProbe::default(),
+        }
+    }
+
+    /// A demuxed variant's CODECS names the codec of the audio group it points at, and
+    /// those samples are in that group's own init. Reading the token off the video init
+    /// would fail it under a rule about bytes it never carried.
+    #[test]
+    fn author_2_25_ignores_the_audio_codec_a_demuxed_variant_declares_for_its_group() {
+        let playlists = [video_variant("avc1.640029,mp4a.40.42", Some("aud"))];
+        let issues = rule_issues(&playlists, &[unparseable_video_init()], "2.25");
+        assert!(
+            issues.is_empty(),
+            "the xHE-AAC belongs to the audio group's init, not this one: {issues:?}"
+        );
+    }
+
+    /// With no AUDIO group the variant carries its own audio, so the xHE-AAC it declares
+    /// really is in the init that failed to parse.
+    #[test]
+    fn author_2_25_errors_when_a_muxed_variants_init_is_not_fmp4() {
+        let playlists = [video_variant("avc1.640029,mp4a.40.42", None)];
+        let issues = rule_issues(&playlists, &[unparseable_video_init()], "2.25");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(
+            issues[0].message.contains("mp4a.40.42") && !issues[0].message.contains("audio init"),
+            "a muxed init holds video too, so it is not an audio init, got: {}",
+            issues[0].message
+        );
     }
 }

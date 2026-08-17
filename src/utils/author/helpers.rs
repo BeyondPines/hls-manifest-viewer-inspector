@@ -183,19 +183,20 @@ pub struct DeclaredCodecs {
     pub fmp4_only_audio: Vec<String>,
 }
 
-impl DeclaredCodecs {
-    /// Whether any declared codec is one the spec carries only in fMP4.
-    pub fn require_fmp4(&self) -> bool {
-        !self.hevc_or_dv.is_empty() || !self.av1.is_empty() || !self.fmp4_only_audio.is_empty()
-    }
-}
-
 /// The fMP4-only codecs the playlists declaring `entry` say it carries.
 ///
 /// A parsed init names its codec in its sample entry, but an init that could not be read
 /// as fMP4 has no sample entry — and that is precisely the case the container rules
 /// (§1.5, §1.39, §2.25) exist for. So the codec has to come from the CODECS attribute of
 /// the playlist(s) that reference the init.
+///
+/// CODECS describes a whole presentation rather than one init, so a token only counts
+/// against the init when the playlist carrying it is the one that init belongs to. A
+/// demuxed variant lists the codec of the audio group it points at, whose samples live in
+/// that group's own init; and an audio rendition inherits its CODECS from the audio slot
+/// of a STREAM-INF, which holds a video token when the packager wrote the two the other
+/// way round. Attributing either to this init blames it for a container rule about bytes
+/// it was never meant to carry.
 pub fn declared_codecs_for_init(
     ctx: &AuthoringContext<'_>,
     entry: &InitProbeEntry,
@@ -215,11 +216,17 @@ pub fn declared_codecs_for_init(
         let Some(codecs) = pl.codecs.as_deref() else {
             continue;
         };
+        let audio_lives_elsewhere = pl.audio_group.is_some();
+        let video_lives_elsewhere = pl.media_type == "AUDIO";
         for tok in codec_tokens(codecs) {
             match video_codec_family(tok) {
-                Some("hevc" | "dv") => push_once(&mut declared.hevc_or_dv, tok),
-                Some("av1") => push_once(&mut declared.av1, tok),
-                _ if audio_requires_fmp4(tok) => push_once(&mut declared.fmp4_only_audio, tok),
+                Some("hevc" | "dv") if !video_lives_elsewhere => {
+                    push_once(&mut declared.hevc_or_dv, tok)
+                }
+                Some("av1") if !video_lives_elsewhere => push_once(&mut declared.av1, tok),
+                None if audio_requires_fmp4(tok) && !audio_lives_elsewhere => {
+                    push_once(&mut declared.fmp4_only_audio, tok)
+                }
                 _ => {}
             }
         }

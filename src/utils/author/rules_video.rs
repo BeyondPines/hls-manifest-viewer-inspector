@@ -438,8 +438,11 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         // the playlist(s) declaring it.
         let unparsed_container =
             (!probe.looks_like_fmp4_init()).then(|| declared_codecs_for_init(ctx, entry));
+        // What §1.2 further down stands aside for: a container rule that named this init.
+        let mut container_error_reported = false;
         if let Some(declared) = &unparsed_container {
             if !declared.hevc_or_dv.is_empty() {
+                container_error_reported = true;
                 issues.push(author_error(
                     "1.5",
                     format!(
@@ -451,6 +454,7 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
                 ));
             }
             if !declared.av1.is_empty() {
+                container_error_reported = true;
                 issues.push(author_error(
                     "1.39",
                     format!(
@@ -461,6 +465,9 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
                     ),
                 ));
             }
+            // §2.25 belongs to rules_audio, which reports this same init from this same
+            // bucket — non-empty only when the fMP4-only audio is this init's own.
+            container_error_reported |= !declared.fmp4_only_audio.is_empty();
         }
 
         // §1.3 / 1.4 / 1.6 profile+level from avcC/hvcC
@@ -573,16 +580,13 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             }
         }
 
-        // §1.2 — an init nothing could be read from. When the declaring playlist names a
-        // codec that has to be fMP4, the container rule above already reported the same
-        // init as an error; saying it again as a warning only doubles the noise.
-        let already_reported = unparsed_container
-            .as_ref()
-            .is_some_and(DeclaredCodecs::require_fmp4);
+        // §1.2 — an init nothing could be read from. When a container rule was reported
+        // against this init, saying it again as a warning only doubles the noise; when
+        // none was, §1.2 is the only rule that will mention the init at all.
         if probe.major_brand.is_none()
             && probe.video_sample_fourcc.is_none()
             && probe.audio_sample_fourcc.is_none()
-            && !already_reported
+            && !container_error_reported
         {
             issues.push(author_warn(
                 "1.2",
@@ -1590,6 +1594,44 @@ https://example.com/1080.m3u8
         let avc = container_playlist("avc1.640029", "m4s", true);
         let inits = vec![unparseable_init(&avc.name)];
         let issues = section_issues(TWO_RUNG_LADDER, &[avc], &inits, "1.2");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Warn);
+    }
+
+    /// A demuxed variant's CODECS also names its audio group's codec. That token belongs to
+    /// the group's own init, so no container rule reaches this one — and §1.2 has to stay
+    /// the finding that reports it, rather than standing aside for an error nobody raised.
+    #[test]
+    fn author_1_2_reports_a_demuxed_video_init_no_container_rule_claims() {
+        let mut pl = container_playlist("avc1.640029,mp4a.40.42", "m4s", true);
+        pl.audio_group = Some("aud".into());
+        let inits = vec![unparseable_init(&pl.name)];
+        let issues = section_issues(TWO_RUNG_LADDER, &[pl], &inits, "1.2");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Warn);
+    }
+
+    /// An audio rendition inherits its CODECS from the audio slot of a STREAM-INF, which
+    /// holds a video token when the packager wrote the two the other way round. §1.5 is
+    /// about the video init, and the audio one is not it.
+    #[test]
+    fn author_1_5_ignores_an_hevc_token_left_on_an_audio_renditions_codecs() {
+        let mut pl = container_playlist("hvc1.2.4.L123.B0", "m4s", true);
+        pl.name = "audio/English (aud)".into();
+        pl.media_type = "AUDIO".into();
+        let inits = vec![InitProbeEntry {
+            uri: "https://example.com/a-init.mp4".into(),
+            byterange: None,
+            playlist_names: vec![pl.name.clone()],
+            media_types: vec!["AUDIO".into()],
+            probe: InitSegmentProbe::default(),
+        }];
+        assert!(
+            section_issues(TWO_RUNG_LADDER, &[pl.clone()], &inits, "1.5").is_empty(),
+            "the HEVC is in the video init, which this rendition does not reference"
+        );
+        // §1.2 is left to report the init, so the run does not go silent on it.
+        let issues = section_issues(TWO_RUNG_LADDER, &[pl], &inits, "1.2");
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert_eq!(issues[0].severity, Severity::Warn);
     }
