@@ -7,7 +7,7 @@ use crate::utils::validator::types::{CheckGroup, Severity};
 #[component]
 pub fn Author() -> impl IntoView {
     let (url_input, set_url_input) = signal(String::new());
-    let (profile, set_profile) = signal("None".to_string());
+    let (profile, set_profile) = signal("General".to_string());
     let (deep_checks, set_deep_checks) = signal(false);
     let (report, set_report) = signal(None::<AuthorReport>);
     let (error_msg, set_error_msg) = signal(None::<String>);
@@ -73,7 +73,7 @@ pub fn Author() -> impl IntoView {
                                 prop:value=move || profile.get()
                                 on:change=move |ev| set_profile.set(event_target_value(&ev))
                             >
-                                <option value="None">"General (no amendments)"</option>
+                                <option value="General">"General (no amendments)"</option>
                                 <option value="iOS">"iOS"</option>
                                 <option value="tvOS">"tvOS"</option>
                                 <option value="macOS">"macOS"</option>
@@ -164,7 +164,7 @@ fn AuthorResults(report: AuthorReport) -> impl IntoView {
                 <StatCard value=report.total_errors.to_string() label="Errors" color="#ef4444" />
                 <StatCard value=report.total_warnings.to_string() label="Warnings" color="#f59e0b" />
                 <StatCard value=report.total_info.to_string() label="Info" color="#60a5fa" />
-                <StatCard value=report.profile.clone() label="Profile" color="var(--color-sky-700)" />
+                <StatCard value=report.profile.clone() label="Platform profile" color="var(--color-sky-700)" />
             </div>
 
             <div style="color: var(--color-sky-700); font-size: .82rem; margin-bottom: calc(var(--spacing) * 5); padding: calc(var(--spacing) * 3) calc(var(--spacing) * 4); background: var(--color-sky-50); border-radius: 8px; border: 1px solid var(--color-sky-200);">

@@ -18,7 +18,7 @@ pub enum AuthorProfile {
 impl AuthorProfile {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::None => "None",
+            Self::None => "General",
             Self::Ios => "iOS",
             Self::Tvos => "tvOS",
             Self::Macos => "macOS",
