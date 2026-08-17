@@ -235,16 +235,6 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         };
         let fourcc_l = fourcc.to_ascii_lowercase();
         let is_apac = fourcc_l.starts_with("apac");
-        let is_flac = fourcc_l == "flac" || fourcc_l == "alac";
-        let is_xhe = entry.playlist_names.iter().any(|name| {
-            ctx.playlists.iter().any(|pl| {
-                pl.name == *name
-                    && pl
-                        .codecs
-                        .as_deref()
-                        .is_some_and(|c| c.to_ascii_lowercase().contains("mp4a.40.42"))
-            })
-        });
 
         // §2.19 — ludt SHOULD for fMP4 audio except APAC (SHALL NOT for APAC)
         if is_apac {
@@ -262,7 +252,7 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
                     entry.uri
                 ),
             ));
-        } else if probe.looks_like_fmp4_init() && !probe.has_ludt {
+        } else if !probe.has_ludt {
             issues.push(author_warn(
                 "2.19",
                 format!("audio init '{}' missing ludt loudness box", entry.uri),
@@ -286,22 +276,28 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
                 ));
             }
         }
+    }
 
-        // §2.25 — xHE-AAC / ALAC / FLAC / APAC MUST be fMP4
-        if (is_apac || is_flac || is_xhe) && !probe.looks_like_fmp4_init() {
-            issues.push(author_error(
-                "2.25",
-                format!(
-                    "codec '{fourcc}' on init '{}' MUST use fMP4 container",
-                    entry.uri
-                ),
-            ));
+    // §2.25 — xHE-AAC / ALAC / FLAC / APAC MUST be fMP4. An init that failed to parse has
+    // no sample entry to name its codec, so the requirement is read from the CODECS of the
+    // playlist(s) declaring the init.
+    for entry in ctx.init_probes {
+        if entry.probe.looks_like_fmp4_init() {
+            continue;
         }
-
-        // §2.1 — audio SHOULD be elementary or fMP4 (info when we only see odd brands)
-        if probe.looks_like_fmp4_init() {
-            // satisfied
+        let declared = declared_codecs_for_init(ctx, entry);
+        if declared.fmp4_only_audio.is_empty() {
+            continue;
         }
+        issues.push(author_error(
+            "2.25",
+            format!(
+                "audio init '{}' could not be parsed as fMP4 ('{}' declares {}, which MUST use fMP4)",
+                entry.uri,
+                entry.playlist_names.join("', '"),
+                declared.fmp4_only_audio.join(", ")
+            ),
+        ));
     }
 
     // Playlist-level §2.25 when MAP missing for xHE-AAC/APAC/FLAC
@@ -591,5 +587,46 @@ mod tests {
     #[test]
     fn author_2_25_ignores_aac_lc_in_transport_stream() {
         assert!(rule_issues(&[audio_rendition("mp4a.40.2", "ts", false)], &[], "2.25").is_empty());
+    }
+
+    /// An init whose bytes yielded no `ftyp` and no sample entry, so the codec it was
+    /// meant to carry can only be read from the playlist declaring it.
+    fn unparseable_audio_init() -> InitProbeEntry {
+        InitProbeEntry {
+            uri: "https://example.com/a-init.mp4".into(),
+            byterange: None,
+            playlist_names: vec!["audio/English (aud)".into()],
+            media_types: vec!["AUDIO".into()],
+            probe: crate::utils::mp4_probe::InitSegmentProbe::default(),
+        }
+    }
+
+    #[test]
+    fn author_2_25_errors_when_an_fmp4_only_codecs_init_is_not_fmp4() {
+        for codecs in ["mp4a.40.42", "apac", "alac", "fLaC"] {
+            let playlists = [audio_rendition(codecs, "m4s", true)];
+            let issues = rule_issues(&playlists, &[unparseable_audio_init()], "2.25");
+            assert_eq!(issues.len(), 1, "{codecs}: {issues:?}");
+            assert_eq!(issues[0].severity, Severity::Error);
+            assert!(
+                issues[0].message.contains("fMP4") && issues[0].message.contains(codecs),
+                "the finding should name the declared codec, got: {}",
+                issues[0].message
+            );
+        }
+    }
+
+    #[test]
+    fn author_2_25_accepts_an_init_that_parses_as_fmp4() {
+        let playlists = [audio_rendition("apac", "m4s", true)];
+        assert!(rule_issues(&playlists, &[apac_init(false)], "2.25").is_empty());
+    }
+
+    /// AAC-LC needs no fMP4 container, so an init it could not be read from is §1.2's
+    /// business rather than §2.25's.
+    #[test]
+    fn author_2_25_ignores_an_unparseable_init_for_aac_lc() {
+        let playlists = [audio_rendition("mp4a.40.2", "m4s", true)];
+        assert!(rule_issues(&playlists, &[unparseable_audio_init()], "2.25").is_empty());
     }
 }

@@ -419,7 +419,6 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         let is_avc = fourcc_l.starts_with("avc");
         let is_hevc = fourcc_l.starts_with("hvc") || fourcc_l.starts_with("hev");
         let is_dv = fourcc_l.starts_with("dvh") || fourcc_l.starts_with("dvhe");
-        let is_av1 = fourcc_l.starts_with("av01");
 
         if prefers_parameter_sets_in_sample_entry(fourcc) {
             issues.push(author_warn(
@@ -434,17 +433,34 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         // §1.5 / §1.39 — the container itself, which these rules require to be fMP4. The
         // spec names no brand, so an init that parses as fMP4 satisfies them however its
         // packager spelled `ftyp`; the brands it declares are reported as probe notes.
-        if (is_hevc || is_dv) && !probe.looks_like_fmp4_init() {
-            issues.push(author_error(
-                "1.5",
-                format!("HEVC/DV init '{}' could not be parsed as fMP4", entry.uri),
-            ));
-        }
-        if is_av1 && !probe.looks_like_fmp4_init() {
-            issues.push(author_error(
-                "1.39",
-                format!("AV1 init '{}' could not be parsed as fMP4", entry.uri),
-            ));
+        // The failing case has no sample entry to read a codec from — that is what failing
+        // to parse means — so what the init was meant to carry is read from the CODECS of
+        // the playlist(s) declaring it.
+        let unparsed_container =
+            (!probe.looks_like_fmp4_init()).then(|| declared_codecs_for_init(ctx, entry));
+        if let Some(declared) = &unparsed_container {
+            if !declared.hevc_or_dv.is_empty() {
+                issues.push(author_error(
+                    "1.5",
+                    format!(
+                        "HEVC/DV init '{}' could not be parsed as fMP4 ('{}' declares {})",
+                        entry.uri,
+                        entry.playlist_names.join("', '"),
+                        declared.hevc_or_dv.join(", ")
+                    ),
+                ));
+            }
+            if !declared.av1.is_empty() {
+                issues.push(author_error(
+                    "1.39",
+                    format!(
+                        "AV1 init '{}' could not be parsed as fMP4 ('{}' declares {})",
+                        entry.uri,
+                        entry.playlist_names.join("', '"),
+                        declared.av1.join(", ")
+                    ),
+                ));
+            }
         }
 
         // §1.3 / 1.4 / 1.6 profile+level from avcC/hvcC
@@ -557,9 +573,16 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
             }
         }
 
+        // §1.2 — an init nothing could be read from. When the declaring playlist names a
+        // codec that has to be fMP4, the container rule above already reported the same
+        // init as an error; saying it again as a warning only doubles the noise.
+        let already_reported = unparsed_container
+            .as_ref()
+            .is_some_and(DeclaredCodecs::require_fmp4);
         if probe.major_brand.is_none()
             && probe.video_sample_fourcc.is_none()
             && probe.audio_sample_fourcc.is_none()
+            && !already_reported
         {
             issues.push(author_warn(
                 "1.2",
@@ -710,17 +733,30 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         }
     }
 
-    // Cross-check playlist CODECS families vs container (TS without MAP for HEVC/AV1)
+    // Cross-check playlist CODECS families vs container (TS without MAP). HEVC and Dolby
+    // Vision are §1.5's subject; AV1's container requirement is §1.39's, so a stream that
+    // breaks it is reported there rather than under a rule that never mentions AV1.
     for pl in ctx.video_playlists() {
-        let codecs = pl.codecs.as_deref().unwrap_or("");
-        let has_hevc_family = codec_tokens(codecs)
-            .iter()
-            .any(|t| matches!(video_codec_family(t), Some("hevc" | "dv" | "av1")));
-        if has_hevc_family && playlist_looks_like_ts(pl) && !playlist_has_map(pl) {
+        if !playlist_looks_like_ts(pl) || playlist_has_map(pl) {
+            continue;
+        }
+        let tokens = codec_tokens(pl.codecs.as_deref().unwrap_or(""));
+        let family_present =
+            |family: &str| tokens.iter().any(|t| video_codec_family(t) == Some(family));
+        if family_present("hevc") || family_present("dv") {
             issues.push(author_error(
                 "1.5",
                 format!(
-                    "'{}' declares HEVC/DV/AV1 but looks like MPEG-TS without EXT-X-MAP",
+                    "'{}' declares HEVC/DV but looks like MPEG-TS without EXT-X-MAP",
+                    pl.name
+                ),
+            ));
+        }
+        if family_present("av1") {
+            issues.push(author_error(
+                "1.39",
+                format!(
+                    "'{}' declares AV1 but looks like MPEG-TS without EXT-X-MAP",
                     pl.name
                 ),
             ));
@@ -1411,11 +1447,11 @@ https://example.com/1080.m3u8
         pl
     }
 
-    /// HEVC, Dolby Vision and AV1 are only carried in fMP4, so a playlist of transport
-    /// stream segments with no EXT-X-MAP contradicts the codec it declares.
+    /// HEVC and Dolby Vision are only carried in fMP4, so a playlist of transport stream
+    /// segments with no EXT-X-MAP contradicts the codec it declares.
     #[test]
     fn author_1_5_errors_when_an_hevc_family_playlist_looks_like_transport_stream() {
-        for codecs in ["hvc1.2.4.L123.B0", "dvh1.05.03", "av01.0.13M.10"] {
+        for codecs in ["hvc1.2.4.L123.B0", "dvh1.05.03"] {
             let pl = container_playlist(codecs, "ts", false);
             let issues = section_issues(TWO_RUNG_LADDER, &[pl], &[], "1.5");
             assert_eq!(issues.len(), 1, "{codecs}: {issues:?}");
@@ -1428,6 +1464,25 @@ https://example.com/1080.m3u8
         }
     }
 
+    /// AV1's container requirement is §1.39's, not §1.5's, so an AV1 rendition in a
+    /// transport stream has to be reported under the rule that states it.
+    #[test]
+    fn author_1_39_errors_when_an_av1_playlist_looks_like_transport_stream() {
+        let playlists = [container_playlist("av01.0.13M.10", "ts", false)];
+        let issues = section_issues(TWO_RUNG_LADDER, &playlists, &[], "1.39");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(
+            issues[0].message.contains("EXT-X-MAP") && issues[0].message.contains("AV1"),
+            "got: {}",
+            issues[0].message
+        );
+        assert!(
+            section_issues(TWO_RUNG_LADDER, &playlists, &[], "1.5").is_empty(),
+            "§1.5 says nothing about AV1"
+        );
+    }
+
     /// An EXT-X-MAP makes the segments fMP4 whatever their file extension says, and an
     /// H.264 rendition may be transport stream to begin with.
     #[test]
@@ -1437,6 +1492,106 @@ https://example.com/1080.m3u8
 
         let avc = container_playlist("avc1.640029", "ts", false);
         assert!(section_issues(TWO_RUNG_LADDER, &[avc], &[], "1.5").is_empty());
+    }
+
+    /// An init whose bytes yielded no `ftyp` and no sample entry: the case the container
+    /// rules are about, and the one where the codec can only come from the playlist.
+    fn unparseable_init(playlist: &str) -> InitProbeEntry {
+        InitProbeEntry {
+            uri: "https://example.com/init.mp4".into(),
+            byterange: None,
+            playlist_names: vec![playlist.into()],
+            media_types: vec!["VIDEO".into()],
+            probe: InitSegmentProbe::default(),
+        }
+    }
+
+    #[test]
+    fn author_1_5_errors_when_an_hevc_playlists_init_is_not_fmp4() {
+        for codecs in ["hvc1.2.4.L123.B0", "dvh1.05.03"] {
+            let pl = container_playlist(codecs, "m4s", true);
+            let inits = vec![unparseable_init(&pl.name)];
+            let issues = section_issues(TWO_RUNG_LADDER, &[pl], &inits, "1.5");
+            assert_eq!(issues.len(), 1, "{codecs}: {issues:?}");
+            assert_eq!(issues[0].severity, Severity::Error);
+            assert!(
+                issues[0].message.contains("could not be parsed as fMP4")
+                    && issues[0].message.contains(codecs),
+                "the finding should name the declared codec, got: {}",
+                issues[0].message
+            );
+        }
+    }
+
+    #[test]
+    fn author_1_39_cites_av1_rather_than_1_5_for_an_init_that_is_not_fmp4() {
+        let playlists = [container_playlist("av01.0.13M.10", "m4s", true)];
+        let inits = vec![unparseable_init(&playlists[0].name)];
+        let issues = section_issues(TWO_RUNG_LADDER, &playlists, &inits, "1.39");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(
+            issues[0].message.contains("could not be parsed as fMP4"),
+            "got: {}",
+            issues[0].message
+        );
+        assert!(
+            section_issues(TWO_RUNG_LADDER, &playlists, &inits, "1.5").is_empty(),
+            "§1.5 says nothing about AV1"
+        );
+    }
+
+    /// An init that parses as fMP4, carrying `fourcc` video samples.
+    fn fmp4_init(playlist: &str, fourcc: &str) -> InitProbeEntry {
+        InitProbeEntry {
+            uri: "https://example.com/init.mp4".into(),
+            byterange: None,
+            playlist_names: vec![playlist.into()],
+            media_types: vec!["VIDEO".into()],
+            probe: InitSegmentProbe {
+                major_brand: Some("iso6".into()),
+                compatible_brands: vec!["cmfc".into()],
+                video_sample_fourcc: Some(fourcc.into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn author_1_5_and_1_39_accept_an_init_that_parses_as_fmp4() {
+        for (codecs, fourcc) in [("hvc1.2.4.L123.B0", "hvc1"), ("av01.0.13M.10", "av01")] {
+            let playlists = [container_playlist(codecs, "m4s", true)];
+            let inits = vec![fmp4_init(&playlists[0].name, fourcc)];
+            assert!(
+                section_issues(TWO_RUNG_LADDER, &playlists, &inits, "1.5").is_empty(),
+                "{codecs}"
+            );
+            assert!(
+                section_issues(TWO_RUNG_LADDER, &playlists, &inits, "1.39").is_empty(),
+                "{codecs}"
+            );
+        }
+    }
+
+    /// §1.2 is the fallback for an init nothing could be read from. When the playlist's
+    /// CODECS pins the codec, the container rule reports the same init as an error and the
+    /// warning would only repeat it.
+    #[test]
+    fn author_1_2_gives_way_to_the_container_error_it_would_repeat() {
+        let hevc = container_playlist("hvc1.2.4.L123.B0", "m4s", true);
+        let inits = vec![unparseable_init(&hevc.name)];
+        assert!(
+            section_issues(TWO_RUNG_LADDER, &[hevc], &inits, "1.2").is_empty(),
+            "§1.5 already reported this init"
+        );
+
+        // H.264 may be transport stream, so no container rule fires and §1.2 still says
+        // that the init could not be read.
+        let avc = container_playlist("avc1.640029", "m4s", true);
+        let inits = vec![unparseable_init(&avc.name)];
+        let issues = section_issues(TWO_RUNG_LADDER, &[avc], &inits, "1.2");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Warn);
     }
 
     // ── §1.37 AV1 level, §1.38 APMP mono projection ──────────────────────────

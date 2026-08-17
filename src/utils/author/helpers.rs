@@ -1,5 +1,6 @@
 //! Shared Author helpers: issue builders and codec classification.
 
+use super::context::{AuthoringContext, InitProbeEntry};
 use crate::utils::validator::types::{Confidence, Issue, MediaRendition, Severity};
 
 pub fn author_issue(severity: Severity, section: &str, message: impl Into<String>) -> Issue {
@@ -159,6 +160,71 @@ pub fn is_ec3(token: &str) -> bool {
 
 pub fn is_apac(token: &str) -> bool {
     token.to_ascii_lowercase().starts_with("apac")
+}
+
+/// The audio codecs §2.25 only allows in fMP4: xHE-AAC, APAC, ALAC and FLAC.
+pub fn audio_requires_fmp4(token: &str) -> bool {
+    let t = token.to_ascii_lowercase();
+    t.starts_with("mp4a.40.42")
+        || t.starts_with("apac")
+        || t.starts_with("alac")
+        || t.starts_with("flac")
+}
+
+/// The codecs an init segment was meant to carry, grouped by the container rule that
+/// applies to each.
+#[derive(Debug, Clone, Default)]
+pub struct DeclaredCodecs {
+    /// §1.5 codecs: HEVC and Dolby Vision.
+    pub hevc_or_dv: Vec<String>,
+    /// §1.39 codec: AV1.
+    pub av1: Vec<String>,
+    /// §2.25 codecs: xHE-AAC, APAC, ALAC and FLAC.
+    pub fmp4_only_audio: Vec<String>,
+}
+
+impl DeclaredCodecs {
+    /// Whether any declared codec is one the spec carries only in fMP4.
+    pub fn require_fmp4(&self) -> bool {
+        !self.hevc_or_dv.is_empty() || !self.av1.is_empty() || !self.fmp4_only_audio.is_empty()
+    }
+}
+
+/// The fMP4-only codecs the playlists declaring `entry` say it carries.
+///
+/// A parsed init names its codec in its sample entry, but an init that could not be read
+/// as fMP4 has no sample entry — and that is precisely the case the container rules
+/// (§1.5, §1.39, §2.25) exist for. So the codec has to come from the CODECS attribute of
+/// the playlist(s) that reference the init.
+pub fn declared_codecs_for_init(
+    ctx: &AuthoringContext<'_>,
+    entry: &InitProbeEntry,
+) -> DeclaredCodecs {
+    fn push_once(list: &mut Vec<String>, token: &str) {
+        if !list.iter().any(|t| t == token) {
+            list.push(token.to_string());
+        }
+    }
+
+    let mut declared = DeclaredCodecs::default();
+    let declaring = ctx
+        .playlists
+        .iter()
+        .filter(|pl| entry.playlist_names.contains(&pl.name));
+    for pl in declaring {
+        let Some(codecs) = pl.codecs.as_deref() else {
+            continue;
+        };
+        for tok in codec_tokens(codecs) {
+            match video_codec_family(tok) {
+                Some("hevc" | "dv") => push_once(&mut declared.hevc_or_dv, tok),
+                Some("av1") => push_once(&mut declared.av1, tok),
+                _ if audio_requires_fmp4(tok) => push_once(&mut declared.fmp4_only_audio, tok),
+                _ => {}
+            }
+        }
+    }
+    declared
 }
 
 pub fn parse_resolution(res: &str) -> Option<(u32, u32)> {
