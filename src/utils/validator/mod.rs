@@ -1586,6 +1586,82 @@ mod tests {
         );
     }
 
+    /// A multivariant playlist that declares an I-frame Variant Stream, so the §4.4.6.3 check
+    /// is both reachable and applicable.
+    fn master_with_iframe_variant() -> MasterPlaylist {
+        parser::parse_master_playlist(
+            "https://cdn.example.com/master.m3u8",
+            "#EXTM3U\n#EXT-X-VERSION:9\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1000,CODECS=\"avc1.64001f\"\nv.m3u8\n\
+             #EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=100,CODECS=\"avc1.64001f\",URI=\"trick.m3u8\"\n",
+        )
+    }
+
+    /// A regular rendition and a trick-play rendition that both carry the Date Range 'ad-1'
+    /// with a different DURATION, and where the trick-play playlist never declares
+    /// EXT-X-I-FRAMES-ONLY. One fixture, one finding each from the two checks.
+    fn iframe_and_daterange_playlists() -> Vec<MediaPlaylist> {
+        let body = |duration: &str| format!(
+            "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-PROGRAM-DATE-TIME:2024-01-15T12:00:00Z\n\
+             #EXT-X-DATERANGE:ID=\"ad-1\",START-DATE=\"2024-01-15T12:00:00Z\",\
+             DURATION={duration}\n\
+             #EXTINF:4.0,\ns0.m4s\n#EXTINF:4.0,\ns1.m4s\n#EXT-X-ENDLIST\n"
+        );
+        let mut video = MediaPlaylist::new("v".into(), "https://cdn.example.com/v.m3u8".into());
+        parse_media_playlist(&video.url.clone(), &body("30.0"), &mut video);
+
+        let mut trick =
+            MediaPlaylist::new("trick".into(), "https://cdn.example.com/trick.m3u8".into());
+        parse_media_playlist(&trick.url.clone(), &body("15.0"), &mut trick);
+        trick.is_iframe = true;
+        assert!(!trick.iframes_only, "the fixture is the playlist that forgot the tag");
+
+        vec![video, trick]
+    }
+
+    #[test]
+    fn the_iframe_playlist_check_is_wired_into_a_run() {
+        // The check itself is unit-tested in `checks`; what this pins is that the run calls
+        // it at all, which nothing else would notice if the call site were dropped.
+        let master = master_with_iframe_variant();
+        let report = report_for(Some(&master), &iframe_and_daterange_playlists());
+        let iframe: Vec<&Issue> = report.issues.iter()
+            .filter(|i| i.check_id == CheckId::IFramePlaylists)
+            .collect();
+        assert_eq!(
+            iframe.len(),
+            1,
+            "§4.4.6.3 must be checked when a run has a multivariant playlist: {:#?}",
+            report.issues.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+        assert_eq!(iframe[0].severity, Severity::Error);
+
+        let inputs = RunInputs::from_run(Some(&master), &iframe_and_daterange_playlists(), false);
+        let groups = categorize_issues(&report.issues, &inputs);
+        assert_eq!(group(&groups, "I-Frame Playlists").status, "FAIL");
+    }
+
+    #[test]
+    fn the_date_range_consistency_check_is_wired_into_a_run() {
+        let master = master_with_iframe_variant();
+        let report = report_for(Some(&master), &iframe_and_daterange_playlists());
+        let dateranges: Vec<&Issue> = report.issues.iter()
+            .filter(|i| i.check_id == CheckId::DateRangeConsistency)
+            .collect();
+        assert_eq!(
+            dateranges.len(),
+            1,
+            "§6.2.4 Date Range consistency must be checked on every run: {:#?}",
+            report.issues.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+        assert_eq!(dateranges[0].severity, Severity::Error);
+
+        let inputs = RunInputs::from_run(Some(&master), &iframe_and_daterange_playlists(), false);
+        let groups = categorize_issues(&report.issues, &inputs);
+        assert_eq!(group(&groups, "Date Range Consistency").status, "FAIL");
+    }
+
     #[test]
     fn run_media_checks_folds_parse_issues_into_the_report() {
         let mut pl = MediaPlaylist::new("v".into(), "https://ex.com/v.m3u8".into());

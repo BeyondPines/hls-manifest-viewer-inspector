@@ -18,6 +18,10 @@ fn produced_by(id: CheckId, mut issues: Vec<Issue>) -> Vec<Issue> {
 struct SegmentFinding<T> {
     /// What makes this the same finding as the one before it, apart from the segment it
     /// names: the rendition, the limit that was broken, the pair being compared.
+    ///
+    /// Renditions are identified here by position in the playlist slice, not by display
+    /// name: two renditions can share a NAME, and folding by name would merge their runs
+    /// into one finding that named a single rendition.
     key: String,
     issue: Issue,
     /// Measurement kept so a folded run can describe its own extremes.
@@ -235,7 +239,7 @@ pub fn check_target_duration_compliance(playlists: &[MediaPlaylist]) -> Vec<Issu
     // Segment overruns are folded into runs, so a rendition whose entire window is too long
     // is one finding naming the range rather than one finding per segment.
     let mut overruns: Vec<SegmentFinding<(f64, u64)>> = Vec::new();
-    for pl in playlists {
+    for (pl_index, pl) in playlists.iter().enumerate() {
         if pl.target_duration <= 0.0 {
             issues.push(Issue {
                 severity: Severity::Error,
@@ -260,7 +264,7 @@ pub fn check_target_duration_compliance(playlists: &[MediaPlaylist]) -> Vec<Issu
             let rounded = seg.duration.round() as u64;
             if rounded > target_int {
                 overruns.push(SegmentFinding {
-                    key: format!("{}|{}", pl.name, target_int),
+                    key: format!("{}|{}", pl_index, target_int),
                     issue: Issue {
                         severity: Severity::Error,
                         segment_index: idx as i32,
@@ -787,6 +791,27 @@ pub fn check_version_compatibility(playlists: &[MediaPlaylist]) -> Vec<Issue> {
     produced_by(CheckId::VersionCompatibility, issues)
 }
 
+/// What in a playlist says that the server has taken segments out of its window, worded so a
+/// finding can quote it. `None` means the window has only ever grown.
+///
+/// §6.2.2 requires EXT-X-MEDIA-SEQUENCE to be incremented by one for every segment removed,
+/// so the Media Sequence Number is the server's own record of how many it has dropped.
+fn removal_evidence(pl: &MediaPlaylist) -> Option<String> {
+    if pl.media_sequence > 0 {
+        return Some(format!(
+            "EXT-X-MEDIA-SEQUENCE:{} records that {} segment(s) have already been removed",
+            pl.media_sequence, pl.media_sequence
+        ));
+    }
+    if pl.skipped_segments > 0 {
+        return Some(format!(
+            "a Playlist Delta Update left {} segment(s) out of the response",
+            pl.skipped_segments
+        ));
+    }
+    None
+}
+
 /// rfc8216bis §6.2.2 — a playlist with no ENDLIST MUST hold at least three Target Durations.
 ///
 /// The requirement is on the window's *duration*, not its segment count: a server "MUST NOT
@@ -797,12 +822,25 @@ pub fn check_version_compatibility(playlists: &[MediaPlaylist]) -> Vec<Issue> {
 ///
 /// Segments dropped by a Playlist Delta Update are counted back in at TARGETDURATION each,
 /// since EXT-X-SKIP replaced them rather than the server removing them from the window.
+///
+/// The prohibition is on *removing* a segment, so a short window only breaks it once
+/// something has been removed (see [`removal_evidence`]). A playlist still at
+/// MEDIA-SEQUENCE:0 has removed nothing and is simply near the start of its broadcast, and
+/// EXT-X-PLAYLIST-TYPE:EVENT promises that segments will only ever be appended — both were
+/// being failed for a rule neither can have broken.
 pub fn check_live_playlist_min_segments(playlists: &[MediaPlaylist]) -> Vec<Issue> {
     let mut issues = Vec::new();
     for pl in playlists {
         if pl.has_endlist || pl.target_duration <= 0.0 {
             continue;
         }
+        // EVENT promises that segments are only ever appended, so it cannot have removed one.
+        if pl.playlist_type.as_deref() == Some("EVENT") {
+            continue;
+        }
+        let Some(evidence) = removal_evidence(pl) else {
+            continue;
+        };
         let listed: f64 = pl.segments.iter().map(|s| s.duration).sum();
         let skipped = pl.skipped_segments as f64 * pl.target_duration;
         let window = listed + skipped;
@@ -817,11 +855,11 @@ pub fn check_live_playlist_min_segments(playlists: &[MediaPlaylist]) -> Vec<Issu
                 uri_b: None,
                 message: format!(
                     "rfc8216bis §6.2.2: Live playlist '{}' holds {:.3}s across {} segment(s), \
-                     less than three times its TARGETDURATION of {:.3}s (needs {:.3}s). \
-                     A server MUST NOT remove a Media Segment from a playlist without \
+                     less than three times its TARGETDURATION of {:.3}s (needs {:.3}s), and \
+                     {}. A server MUST NOT remove a Media Segment from a playlist without \
                      EXT-X-ENDLIST if that leaves a window shorter than three Target \
                      Durations; a shorter window can stall playback.",
-                    pl.name, window, pl.segments.len(), pl.target_duration, required
+                    pl.name, window, pl.segments.len(), pl.target_duration, required, evidence
                 ),
                 uri_note: None,
                 ..Default::default()
@@ -1068,7 +1106,7 @@ pub fn check_duration_drift(playlists: &[MediaPlaylist], tolerance_ms: f64) -> V
                 let diff = (seg_a.duration - seg_b.duration).abs();
                 if diff > tolerance_s {
                     findings.push(SegmentFinding {
-                        key: format!("{}|{}", pl_a.name, pl_b.name),
+                        key: format!("{}|{}", i, j),
                         issue: Issue {
                             severity: Severity::Warn,
                             segment_index: msn as i32,
@@ -1135,7 +1173,7 @@ pub fn check_pdt_alignment(playlists: &[MediaPlaylist], tolerance_ms: f64) -> Ve
                     let diff = (pdt_a - pdt_b).abs();
                     if diff > tolerance_s {
                         findings.push(SegmentFinding {
-                            key: format!("{}|{}", pl_a.name, pl_b.name),
+                            key: format!("{}|{}", i, j),
                             issue: Issue {
                                 severity: Severity::Warn,
                                 segment_index: msn as i32,
@@ -1705,6 +1743,11 @@ fn pdt_window(pl: &MediaPlaylist) -> Option<(f64, f64)> {
 /// requirement says; a rendition with none is not in the comparison. A Date Range whose
 /// START-DATE falls outside another playlist's own PDT window is not required of that playlist
 /// either, so a live window that has slid between two fetches is not reported as a difference.
+///
+/// Attribute differences come in two kinds and are reported as two findings. Carriers that
+/// give the same attribute different *values* contradict each other outright. A carrier that
+/// has simply not written an attribute another has may be part-way through the augmentation
+/// §4.4.5.1 allows, which is only ruled out once every carrier has EXT-X-ENDLIST.
 pub fn check_daterange_consistency(playlists: &[MediaPlaylist]) -> Vec<Issue> {
     let carriers: Vec<(&MediaPlaylist, DateRanges)> = playlists
         .iter()
@@ -1723,7 +1766,14 @@ pub fn check_daterange_consistency(playlists: &[MediaPlaylist]) -> Vec<Issue> {
     // Range, so a presentation that disagrees about a hundred Date Ranges produces a handful
     // of readable findings rather than a hundred rows.
     let mut missing_by_playlist: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    // Two carriers that give one attribute two different values contradict each other, and
+    // nothing about how the presentation is being served can reconcile them. A carrier that
+    // has not written an attribute another has is a weaker signal: §4.4.5.1 lets a server
+    // augment a Date Range with later tags carrying the same ID, so a live or event
+    // presentation part-way through that augmentation legitimately looks like this between
+    // two fetches. The two are reported separately because only the first is firm.
     let mut differing: Vec<String> = Vec::new();
+    let mut partial: Vec<String> = Vec::new();
 
     for id in all_ids {
         let present: Vec<(&MediaPlaylist, &BTreeMap<String, String>)> = carriers.iter()
@@ -1749,22 +1799,36 @@ pub fn check_daterange_consistency(playlists: &[MediaPlaylist]) -> Vec<Issue> {
             }
         }
 
-        let mut mismatched: Vec<&str> = Vec::new();
+        let mut conflicting: Vec<&str> = Vec::new();
+        let mut absent_somewhere: Vec<&str> = Vec::new();
         if present.len() >= 2 {
             let names: BTreeSet<&str> = present.iter()
                 .flat_map(|(_, attrs)| attrs.keys().map(String::as_str))
                 .collect();
             for name in names {
-                let values: HashSet<Option<&String>> = present.iter()
-                    .map(|(_, attrs)| attrs.get(name))
-                    .collect();
+                let mut values: HashSet<&str> = HashSet::new();
+                let mut absent = false;
+                for (_, attrs) in &present {
+                    match attrs.get(name) {
+                        Some(value) => {
+                            values.insert(value.as_str());
+                        }
+                        None => absent = true,
+                    }
+                }
                 if values.len() > 1 {
-                    mismatched.push(name);
+                    conflicting.push(name);
+                } else if absent {
+                    absent_somewhere.push(name);
                 }
             }
         }
-        if !mismatched.is_empty() {
-            differing.push(format!("'{}' differs in {}", id, mismatched.join(", ")));
+        if !conflicting.is_empty() {
+            differing.push(format!("'{}' differs in {}", id, conflicting.join(", ")));
+        }
+        if !absent_somewhere.is_empty() {
+            partial.push(format!("'{}' carries {} in some playlists only",
+                id, absent_somewhere.join(", ")));
         }
     }
 
@@ -1801,6 +1865,46 @@ pub fn check_daterange_consistency(playlists: &[MediaPlaylist]) -> Vec<Issue> {
             shown.iter().map(|d| d.as_str()).collect::<Vec<_>>().join("; "),
             ellipsis
         )));
+    }
+    if !partial.is_empty() {
+        let shown: Vec<&String> = partial.iter().take(5).collect();
+        let ellipsis = if partial.len() > shown.len() {
+            format!(", and {} more", partial.len() - shown.len())
+        } else {
+            String::new()
+        };
+        // Once every carrier has ENDLIST there is no further augmentation coming, so an
+        // attribute one of them never wrote is a difference that will never be closed.
+        let settled = carriers.iter().all(|(pl, _)| pl.has_endlist);
+        let (severity, confidence, why) = if settled {
+            (
+                Severity::Error,
+                Confidence::Measured,
+                "Every playlist that carries them has EXT-X-ENDLIST, so no later tag can \
+                 still add the missing attributes.",
+            )
+        } else {
+            (
+                Severity::Warn,
+                Confidence::Heuristic,
+                "At least one playlist that carries them has no EXT-X-ENDLIST, so this may \
+                 be a Date Range still being augmented rather than a disagreement.",
+            )
+        };
+        issues.push(Issue {
+            severity,
+            confidence,
+            message: format!(
+                "rfc8216bis §6.2.4: {} Date Range(s) are described by more attributes in some \
+                 playlists than in others: {}{}. Corresponding EXT-X-DATERANGE tags MUST \
+                 contain the same set of attribute/value pairs. {}",
+                partial.len(),
+                shown.iter().map(|d| d.as_str()).collect::<Vec<_>>().join("; "),
+                ellipsis,
+                why
+            ),
+            ..Default::default()
+        });
     }
 
     produced_by(CheckId::DateRangeConsistency, issues)
@@ -2181,6 +2285,14 @@ mod tests {
         pl
     }
 
+    /// A parsed media playlist whose display name and URL are set independently, for the
+    /// folding rules that must not take two renditions sharing a NAME for one rendition.
+    fn named_playlist(name: &str, url: &str, content: &str) -> MediaPlaylist {
+        let mut pl = MediaPlaylist::new(name.to_string(), url.to_string());
+        super::super::parser::parse_media_playlist(url, content, &mut pl);
+        pl
+    }
+
     fn parse_master(content: &str) -> MasterPlaylist {
         super::super::parser::parse_master_playlist("https://cdn.example.com/master.m3u8", content)
     }
@@ -2361,7 +2473,10 @@ mod tests {
 
     #[test]
     fn a_live_window_shorter_than_three_target_durations_errors() {
+        // MEDIA-SEQUENCE:8 is the server's own record that it has removed eight segments,
+        // which is what §6.2.2 forbids doing down to a window this short.
         let pl = parse_playlist("v", "#EXTM3U\n#EXT-X-TARGETDURATION:6\n\
+             #EXT-X-MEDIA-SEQUENCE:8\n\
              #EXTINF:6.0,\ns0.m4s\n#EXTINF:6.0,\ns1.m4s\n");
         let issues = check_live_playlist_min_segments(&[pl]);
         let errors = errors(&issues);
@@ -2384,11 +2499,62 @@ mod tests {
     #[test]
     fn three_very_short_segments_do_not_satisfy_the_live_window() {
         let pl = parse_playlist("v", "#EXTM3U\n#EXT-X-TARGETDURATION:6\n\
+             #EXT-X-MEDIA-SEQUENCE:12\n\
              #EXTINF:1.0,\ns0.m4s\n#EXTINF:1.0,\ns1.m4s\n#EXTINF:1.0,\ns2.m4s\n");
         assert_eq!(
             errors(&check_live_playlist_min_segments(&[pl])).len(),
             1,
             "counting segments passed this playlist; 3s of media is not 18s"
+        );
+    }
+
+    #[test]
+    fn a_live_window_that_has_removed_nothing_yet_is_not_a_violation() {
+        // §6.2.2 forbids *removing* a segment down to a window shorter than three Target
+        // Durations. MEDIA-SEQUENCE:0 says nothing has been removed, so this is a broadcast
+        // that has only just started, not a server breaking the rule.
+        let pl = parse_playlist("v", "#EXTM3U\n#EXT-X-TARGETDURATION:6\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n\
+             #EXTINF:6.0,\ns0.m4s\n#EXTINF:6.0,\ns1.m4s\n");
+        assert!(
+            check_live_playlist_min_segments(&[pl]).is_empty(),
+            "a window that has only ever grown cannot have been shortened by a removal"
+        );
+
+        // The same playlist with no EXT-X-MEDIA-SEQUENCE tag at all, which §6.2.2 requires
+        // of any server that does remove segments.
+        let untagged = parse_playlist("v", "#EXTM3U\n#EXT-X-TARGETDURATION:6\n\
+             #EXTINF:6.0,\ns0.m4s\n#EXTINF:6.0,\ns1.m4s\n");
+        assert!(check_live_playlist_min_segments(&[untagged]).is_empty());
+    }
+
+    #[test]
+    fn an_event_playlist_with_a_short_window_is_not_a_violation() {
+        // EXT-X-PLAYLIST-TYPE:EVENT promises segments are only ever appended, so however
+        // short the window is, it was not produced by a removal.
+        let pl = parse_playlist("v", "#EXTM3U\n#EXT-X-TARGETDURATION:6\n\
+             #EXT-X-PLAYLIST-TYPE:EVENT\n#EXT-X-MEDIA-SEQUENCE:8\n\
+             #EXTINF:6.0,\ns0.m4s\n");
+        assert_eq!(pl.playlist_type.as_deref(), Some("EVENT"));
+        assert!(
+            check_live_playlist_min_segments(&[pl]).is_empty(),
+            "an EVENT playlist cannot have removed the segments it is being failed for"
+        );
+    }
+
+    #[test]
+    fn a_delta_update_that_skipped_segments_is_evidence_the_window_slid() {
+        // No EXT-X-MEDIA-SEQUENCE increment, but the response left segments out, so the
+        // window this playlist stands for is not the one it lists.
+        let pl = parse_playlist("v", "#EXTM3U\n#EXT-X-TARGETDURATION:6\n\
+             #EXT-X-SKIP:SKIPPED-SEGMENTS=1\n#EXTINF:1.0,\ns0.m4s\n");
+        let issues = check_live_playlist_min_segments(&[pl]);
+        let errors = errors(&issues);
+        assert_eq!(errors.len(), 1, "7s of window against 18s required");
+        assert!(
+            errors[0].message.contains("Delta Update"),
+            "the finding must say what evidence of removal it read: {:?}",
+            errors[0].message
         );
     }
 
@@ -3214,6 +3380,94 @@ mod tests {
         assert!(issues[0].message.contains("MSN 0–2"), "{}", issues[0].message);
     }
 
+    #[test]
+    fn a_run_of_misaligned_pdts_is_one_finding_naming_the_range() {
+        let hi = parse_playlist("v-hi", "#EXTM3U\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-15T12:00:00Z\n\
+             #EXTINF:4.0,\ns0.m4s\n#EXTINF:4.0,\ns1.m4s\n#EXTINF:4.0,\ns2.m4s\n");
+        let lo = parse_playlist("v-lo", "#EXTM3U\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-15T12:00:02Z\n\
+             #EXTINF:4.0,\ns0.m4s\n#EXTINF:4.0,\ns1.m4s\n#EXTINF:4.0,\ns2.m4s\n");
+        let issues = check_pdt_alignment(&[hi, lo], 100.0);
+        assert_eq!(issues.len(), 1, "three misaligned segments in a row: {issues:?}");
+        assert_eq!((issues[0].seg_first, issues[0].seg_last, issues[0].count), (0, 2, 3));
+        assert_eq!(issues[0].check_id, CheckId::PdtAlignment);
+        assert!(issues[0].message.contains("MSN 0–2"), "{}", issues[0].message);
+        assert!(
+            issues[0].uri_a.is_none() && issues[0].uri_b.is_none(),
+            "a range of segments cannot be linked to one pair of segment URIs"
+        );
+    }
+
+    #[test]
+    fn a_gap_between_misaligned_pdts_breaks_the_run() {
+        // 'v-lo' re-anchors its second segment onto the same wall clock as 'v-hi' before
+        // drifting again, so the segments either side of it are two findings, not one run.
+        let hi = parse_playlist("v-hi", "#EXTM3U\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PROGRAM-DATE-TIME:2024-01-15T12:00:00Z\n\
+             #EXTINF:4.0,\ns0.m4s\n#EXTINF:4.0,\ns1.m4s\n#EXTINF:4.0,\ns2.m4s\n\
+             #EXTINF:4.0,\ns3.m4s\n");
+        let lo = parse_playlist("v-lo", "#EXTM3U\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n\
+             #EXT-X-PROGRAM-DATE-TIME:2024-01-15T12:00:02Z\n#EXTINF:4.0,\ns0.m4s\n\
+             #EXT-X-PROGRAM-DATE-TIME:2024-01-15T12:00:04Z\n#EXTINF:4.0,\ns1.m4s\n\
+             #EXT-X-PROGRAM-DATE-TIME:2024-01-15T12:00:10Z\n#EXTINF:4.0,\ns2.m4s\n\
+             #EXTINF:4.0,\ns3.m4s\n");
+        let issues = check_pdt_alignment(&[hi, lo], 100.0);
+        assert_eq!(issues.len(), 2, "an aligned segment breaks the run: {issues:?}");
+        assert_eq!(issues[0].count, 1);
+        assert_eq!(issues[0].segment_index, 0);
+        assert_eq!((issues[1].seg_first, issues[1].seg_last, issues[1].count), (2, 3, 2));
+    }
+
+    #[test]
+    fn two_renditions_that_share_a_name_are_folded_apart() {
+        // EXT-X-MEDIA NAME is not unique, and folding by it merged one rendition's run into
+        // the next rendition's, reporting both under a single name.
+        let overlong_then_fine = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n\
+             #EXTINF:9.0,\ns0.m4s\n#EXTINF:9.0,\ns1.m4s\n#EXTINF:4.0,\ns2.m4s\n";
+        let fine_then_overlong = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n\
+             #EXTINF:4.0,\ns0.m4s\n#EXTINF:4.0,\ns1.m4s\n#EXTINF:9.0,\ns2.m4s\n";
+        let playlists = vec![
+            named_playlist("v", "https://cdn.example.com/a/v.m3u8", overlong_then_fine),
+            named_playlist("v", "https://cdn.example.com/b/v.m3u8", fine_then_overlong),
+        ];
+        let issues = check_target_duration_compliance(&playlists);
+        let errors = errors(&issues);
+        assert_eq!(
+            errors.len(),
+            2,
+            "the second playlist's segment 2 continues the first playlist's run only if the \
+             two are taken for the same rendition: {issues:?}"
+        );
+        assert_eq!((errors[0].seg_first, errors[0].seg_last, errors[0].count), (0, 1, 2));
+        assert_eq!((errors[1].segment_index, errors[1].count), (2, 1));
+    }
+
+    #[test]
+    fn two_rendition_pairs_that_share_a_name_are_folded_apart() {
+        // The same hazard for the checks that compare a pair of renditions: two pairs that
+        // spell out the same two names were folded into one finding covering both.
+        let hi = named_playlist("v-hi", "https://cdn.example.com/hi.m3u8",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXT-X-MEDIA-SEQUENCE:0\n\
+             #EXTINF:5.0,\ns0.m4s\n#EXTINF:5.0,\ns1.m4s\n#EXTINF:5.0,\ns2.m4s\n");
+        let lo_a = named_playlist("v-lo", "https://cdn.example.com/a/lo.m3u8",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXT-X-MEDIA-SEQUENCE:0\n\
+             #EXTINF:4.0,\ns0.m4s\n#EXTINF:4.0,\ns1.m4s\n#EXTINF:5.0,\ns2.m4s\n");
+        let lo_b = named_playlist("v-lo", "https://cdn.example.com/b/lo.m3u8",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXT-X-MEDIA-SEQUENCE:0\n\
+             #EXTINF:5.0,\ns0.m4s\n#EXTINF:5.0,\ns1.m4s\n#EXTINF:4.0,\ns2.m4s\n");
+        let issues = check_duration_drift(&[hi, lo_a, lo_b], 100.0);
+        assert_eq!(
+            issues.len(),
+            3,
+            "three pairs drift, and two of them name the same two renditions: {issues:?}"
+        );
+        assert_eq!((issues[0].seg_first, issues[0].seg_last, issues[0].count), (0, 1, 2));
+        assert_eq!((issues[1].segment_index, issues[1].count), (2, 1));
+        assert_eq!((issues[2].seg_first, issues[2].seg_last, issues[2].count), (0, 2, 3));
+    }
+
     // ── check_iframe_playlists ────────────────────────────────────────────────
 
     fn iframe_playlist(name: &str, iframes_only: bool) -> MediaPlaylist {
@@ -3253,6 +3507,21 @@ mod tests {
 
     /// A playlist whose window starts at `start` and carries the given DATERANGE lines.
     fn playlist_with_dateranges(name: &str, start: &str, ranges: &[&str]) -> MediaPlaylist {
+        daterange_playlist(name, start, ranges, false)
+    }
+
+    /// The same, with EXT-X-ENDLIST, so the presentation can no longer add attributes to a
+    /// Date Range it has already written.
+    fn ended_playlist_with_dateranges(name: &str, start: &str, ranges: &[&str]) -> MediaPlaylist {
+        daterange_playlist(name, start, ranges, true)
+    }
+
+    fn daterange_playlist(
+        name: &str,
+        start: &str,
+        ranges: &[&str],
+        ended: bool,
+    ) -> MediaPlaylist {
         let mut content = format!(
             "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-PROGRAM-DATE-TIME:{start}\n"
         );
@@ -3261,7 +3530,12 @@ mod tests {
             content.push('\n');
         }
         content.push_str("#EXTINF:4.0,\ns0.m4s\n#EXTINF:4.0,\ns1.m4s\n");
-        parse_playlist(name, &content)
+        if ended {
+            content.push_str("#EXT-X-ENDLIST\n");
+        }
+        let pl = parse_playlist(name, &content);
+        assert_eq!(pl.has_endlist, ended);
+        pl
     }
 
     const AD_1: &str = "#EXT-X-DATERANGE:ID=\"ad-1\",START-DATE=\"2024-01-15T12:00:00Z\",\
@@ -3303,12 +3577,15 @@ mod tests {
 
     #[test]
     fn corresponding_date_ranges_that_disagree_about_an_attribute_error() {
+        // Two values for one attribute contradict each other whether or not the presentation
+        // is still running, so this stays an Error on live playlists.
         let shifted = "#EXT-X-DATERANGE:ID=\"ad-1\",START-DATE=\"2024-01-15T12:00:00Z\",\
                        DURATION=15.0";
         let playlists = vec![
             playlist_with_dateranges("v-hi", "2024-01-15T12:00:00Z", &[AD_1]),
             playlist_with_dateranges("v-lo", "2024-01-15T12:00:00Z", &[shifted]),
         ];
+        assert!(playlists.iter().all(|pl| !pl.has_endlist));
         let issues = check_daterange_consistency(&playlists);
         let errors = errors(&issues);
         assert_eq!(errors.len(), 1, "{issues:?}");
@@ -3316,6 +3593,63 @@ mod tests {
             errors[0].message.contains("'ad-1' differs in DURATION"),
             "the finding must name the attribute that differs: {}", errors[0].message
         );
+    }
+
+    #[test]
+    fn an_attribute_only_some_live_playlists_carry_yet_is_a_warning() {
+        // §4.4.5.1 lets a server augment a Date Range with a later tag carrying the same ID.
+        // While the presentation is still running, one rendition having written DURATION and
+        // another not having got there yet is that augmentation in progress, not a
+        // disagreement — reporting it as an Error failed conforming live streams.
+        let without_duration = "#EXT-X-DATERANGE:ID=\"ad-1\",START-DATE=\"2024-01-15T12:00:00Z\"";
+        let playlists = vec![
+            playlist_with_dateranges("v-hi", "2024-01-15T12:00:00Z", &[AD_1]),
+            playlist_with_dateranges("v-lo", "2024-01-15T12:00:00Z", &[without_duration]),
+        ];
+        let issues = check_daterange_consistency(&playlists);
+        assert!(errors(&issues).is_empty(), "a live window may still be augmented: {issues:?}");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Warn);
+        assert_eq!(issues[0].confidence, Confidence::Heuristic);
+        assert!(
+            issues[0].message.contains("'ad-1' carries DURATION in some playlists only"),
+            "the finding must name the attribute and the Date Range: {}", issues[0].message
+        );
+    }
+
+    #[test]
+    fn an_attribute_only_some_completed_playlists_carry_errors() {
+        // Every carrier has ENDLIST, so no later tag is coming and the sets of
+        // attribute/value pairs will never match.
+        let without_duration = "#EXT-X-DATERANGE:ID=\"ad-1\",START-DATE=\"2024-01-15T12:00:00Z\"";
+        let playlists = vec![
+            ended_playlist_with_dateranges("v-hi", "2024-01-15T12:00:00Z", &[AD_1]),
+            ended_playlist_with_dateranges("v-lo", "2024-01-15T12:00:00Z", &[without_duration]),
+        ];
+        let issues = check_daterange_consistency(&playlists);
+        let errors = errors(&issues);
+        assert_eq!(errors.len(), 1, "{issues:?}");
+        assert_eq!(errors[0].confidence, Confidence::Measured);
+        assert!(
+            errors[0].message.contains("DURATION")
+                && errors[0].message.contains("EXT-X-ENDLIST"),
+            "the finding must say why augmentation can be ruled out: {}", errors[0].message
+        );
+    }
+
+    #[test]
+    fn one_live_carrier_is_enough_to_soften_a_missing_attribute() {
+        // Not every rendition of a live presentation is fetched at the same instant, so the
+        // gate is on any carrier still being able to grow, not on all of them.
+        let without_duration = "#EXT-X-DATERANGE:ID=\"ad-1\",START-DATE=\"2024-01-15T12:00:00Z\"";
+        let playlists = vec![
+            ended_playlist_with_dateranges("v-hi", "2024-01-15T12:00:00Z", &[AD_1]),
+            playlist_with_dateranges("v-lo", "2024-01-15T12:00:00Z", &[without_duration]),
+        ];
+        let issues = check_daterange_consistency(&playlists);
+        assert!(errors(&issues).is_empty(), "{issues:?}");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, Severity::Warn);
     }
 
     #[test]
