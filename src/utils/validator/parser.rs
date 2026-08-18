@@ -61,12 +61,24 @@ pub fn resolve_url(base_url: &str, relative: &str) -> String {
 }
 
 /// Extract the value of a named query parameter from a URL string.
+///
+/// §4.4.2.3 treats a parameter with no associated value as a parse failure, so an empty value
+/// is reported as absent. Where more than one parameter matches, any of the values may be
+/// used, and this takes the first.
 fn extract_query_param(url: &str, param: &str) -> Option<String> {
     let query = url.split_once('?')?.1;
+    let query = query.split_once('#').map_or(query, |(before, _)| before);
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
-        if k == param { Some(v.to_string()) } else { None }
+        if k == param && !v.is_empty() { Some(v.to_string()) } else { None }
     })
+}
+
+/// §4.4.2.3 requires a QUERYPARAM value to be percent-decoded before substitution.
+fn percent_decode(value: &str) -> String {
+    percent_encoding::percent_decode_str(value)
+        .decode_utf8_lossy()
+        .to_string()
 }
 
 /// Parse a master playlist and extract variant stream info.
@@ -158,10 +170,13 @@ pub fn parse_master_playlist(url: &str, content: &str) -> MasterPlaylist {
             if let (Some(name), Some(value)) = (attrs.get("NAME"), attrs.get("VALUE")) {
                 // Inline definition — store directly
                 master.definitions.insert(name.clone(), value.clone());
-            } else if let (Some(param), Some(name)) = (attrs.get("QUERYPARAM"), attrs.get("NAME")) {
-                // QUERYPARAM — value comes from the named query parameter of the playlist URL
-                if let Some(value) = extract_query_param(url, param) {
-                    master.definitions.insert(name.clone(), value);
+            } else if let Some(name) = attrs.get("QUERYPARAM") {
+                // §4.4.2.3: QUERYPARAM carries the Variable Name itself, and the value comes
+                // from the query parameter of that name in this playlist's URI. There is no
+                // accompanying NAME attribute — a tag carries exactly one of the three — so
+                // requiring one here meant no QUERYPARAM variable was ever defined.
+                if let Some(value) = extract_query_param(url, name) {
+                    master.definitions.insert(name.clone(), percent_decode(&value));
                 }
             }
         }
@@ -228,20 +243,37 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
         } else if let Some(val) = line.strip_prefix("#EXTINF:") {
             let comma_pos = val.find(',').unwrap_or(val.len());
             let raw_duration = val[..comma_pos].trim();
-            current_duration = raw_duration.parse::<f64>().ok();
+            // §4.2: a decimal-floating-point number is unsigned, so a negative duration is
+            // not a duration at all and the segment it introduces cannot be placed on a
+            // timeline. It is rejected here rather than carried through as a negative length
+            // that would then subtract from every cumulative and drift measurement.
+            let parsed = raw_duration.parse::<f64>().ok().filter(|d| d.is_finite());
+            current_duration = parsed.filter(|d| *d >= 0.0);
             extinf_unreadable = current_duration.is_none();
             if extinf_unreadable {
+                let reason = if parsed.is_some() {
+                    format!(
+                        "'{}', which is negative. §4.2 defines an EXTINF duration as a \
+                         decimal-floating-point or decimal-integer number, both of which are \
+                         unsigned",
+                        raw_duration
+                    )
+                } else {
+                    format!(
+                        "'{}', which is not a decimal-floating-point or decimal-integer number",
+                        raw_duration
+                    )
+                };
                 parse_issues.push(Issue {
                     severity: Severity::Error,
                     check_id: CheckId::SegmentStructure,
                     segment_index: pl.segments.len() as i32,
                     rendition_a: Some(pl_label.clone()),
                     message: format!(
-                        "rfc8216bis §4.4.4.1: EXTINF on line {} of '{}' has duration \
-                         '{}', which is not a decimal-floating-point or decimal-integer \
-                         number. The segment it introduces was skipped and is not \
-                         covered by any other check.",
-                        line_no + 1, pl_label, raw_duration
+                        "rfc8216bis §4.4.4.1: EXTINF on line {} of '{}' has duration {}. \
+                         The segment it introduces was skipped and is not covered by any \
+                         other check.",
+                        line_no + 1, pl_label, reason
                     ),
                     ..Default::default()
                 });
@@ -253,6 +285,9 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
                 }
             }
         } else if let Some(dt_str) = line.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
+            // Counted separately from Segment::pdt, which is extrapolated forward from the
+            // last tag and so is present on segments that carry no tag of their own.
+            pl.program_date_time_tags += 1;
             current_pdt = parse_iso8601_to_epoch(dt_str);
             if current_pdt.is_some() {
                 // New PDT anchor — reset cumulative so extrapolation starts fresh from this tag
@@ -323,9 +358,61 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
             pl.rendition_reports.push(super::types::RenditionReport { uri, last_msn, last_part });
         } else if let Some(rest) = line.strip_prefix("#EXT-X-DEFINE:") {
             let attrs = parse_attributes(rest);
-            // Only handle NAME+VALUE inline definitions; IMPORT and QUERYPARAM cannot be resolved here
             if let (Some(name), Some(value)) = (attrs.get("NAME"), attrs.get("VALUE")) {
                 pl.definitions.insert(name.clone(), value.clone());
+            } else if let Some(name) = attrs.get("QUERYPARAM") {
+                // §4.4.2.3: the value is that of the query parameter of the same name in the
+                // URI of *this* playlist, which is known whether or not a Multivariant
+                // Playlist was read, so a media-playlist URL resolves these too. Where the
+                // request was redirected the parameter may only be on the response URI, which
+                // is where §4.4.2.3 says a client MUST then look for it.
+                let from_uri = extract_query_param(url, name).or_else(|| {
+                    Some(pl.http_meta.final_url.as_str())
+                        .filter(|final_url| !final_url.is_empty() && *final_url != url)
+                        .and_then(|final_url| extract_query_param(final_url, name))
+                });
+                match from_uri {
+                    Some(raw) => {
+                        pl.definitions.insert(name.clone(), percent_decode(&raw));
+                    }
+                    None => {
+                        parse_issues.push(Issue {
+                            severity: Severity::Error,
+                            check_id: CheckId::VariableDefinitions,
+                            rendition_a: Some(pl_label.clone()),
+                            uri_a: Some(url.to_string()),
+                            message: format!(
+                                "rfc8216bis §4.4.2.3: EXT-X-DEFINE on line {} of '{}' declares \
+                                 QUERYPARAM=\"{}\" but the playlist URI has no '{}' query \
+                                 parameter with a value. A parser MUST fail to parse the \
+                                 Playlist, so every {{${}}} reference in it is unresolved.",
+                                line_no + 1, pl_label, name, name, name
+                            ),
+                            ..Default::default()
+                        });
+                    }
+                }
+            } else if let Some(name) = attrs.get("IMPORT")
+                && !pl.definitions.contains_key(name)
+            {
+                // Imports are seeded from the Multivariant Playlist before the playlist is
+                // read (see `apply_master_definitions`), so one still unresolved here either
+                // names nothing the parent declared or was reached without a parent at all.
+                parse_issues.push(Issue {
+                    severity: Severity::Error,
+                    check_id: CheckId::VariableDefinitions,
+                    rendition_a: Some(pl_label.clone()),
+                    uri_a: Some(url.to_string()),
+                    message: format!(
+                        "rfc8216bis §4.4.2.3: EXT-X-DEFINE on line {} of '{}' imports \
+                         variable '{}', which no Multivariant Playlist read for this run \
+                         declares. Where the IMPORT names no declared variable, or the Media \
+                         Playlist was not loaded from a Multivariant Playlist, a parser MUST \
+                         fail to parse the Playlist.",
+                        line_no + 1, pl_label, name
+                    ),
+                    ..Default::default()
+                });
             }
         } else if let Some(rest) = line.strip_prefix("#EXT-X-SKIP:") {
             let attrs = parse_attributes(rest);
@@ -737,6 +824,161 @@ mod tests {
         );
         assert_eq!(pl.segments.len(), 1);
         assert!(pl.parse_issues.is_empty(), "{:?}", pl.parse_issues);
+    }
+
+    #[test]
+    fn parse_media_rejects_a_negative_extinf_duration() {
+        let mut pl = MediaPlaylist::new("v1".to_string(), String::new());
+        parse_media_playlist(
+            "https://ex.com/hls/prog.m3u8",
+            "#EXTM3U\n\
+             #EXT-X-TARGETDURATION:4\n\
+             #EXTINF:-4.0,\nseg0.m4s\n\
+             #EXTINF:4.0,\nseg1.m4s\n",
+            &mut pl,
+        );
+        assert_eq!(
+            pl.segments.len(),
+            1,
+            "a negative duration cannot place a segment on a timeline: {:?}",
+            pl.segments
+        );
+        assert_eq!(pl.parse_issues.len(), 1, "{:?}", pl.parse_issues);
+        let issue = &pl.parse_issues[0];
+        assert_eq!(issue.severity, Severity::Error);
+        assert!(issue.message.contains("negative"), "{}", issue.message);
+        assert!(issue.message.contains("§4.2"), "{}", issue.message);
+    }
+
+    #[test]
+    fn parse_media_counts_program_date_time_tags_not_extrapolated_pdts() {
+        let mut pl = MediaPlaylist::new("v1".to_string(), String::new());
+        parse_media_playlist(
+            "https://ex.com/hls/prog.m3u8",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-PROGRAM-DATE-TIME:2024-01-15T12:00:00Z\n\
+             #EXTINF:4.0,\nseg0.m4s\n#EXTINF:4.0,\nseg1.m4s\n#EXTINF:4.0,\nseg2.m4s\n",
+            &mut pl,
+        );
+        assert_eq!(pl.program_date_time_tags, 1, "one tag was written");
+        assert!(
+            pl.segments.iter().all(|s| s.pdt.is_some()),
+            "every segment still carries an extrapolated PDT, which is why the count is needed"
+        );
+    }
+
+    // ── EXT-X-DEFINE ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_media_resolves_a_queryparam_definition_from_its_own_uri() {
+        let mut pl = MediaPlaylist::new("v1".to_string(), String::new());
+        let url = "https://ex.com/hls/prog.m3u8?token=ab%20cd&other=1";
+        parse_media_playlist(
+            url,
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-DEFINE:QUERYPARAM=\"token\"\n\
+             #EXTINF:4.0,\nseg0.m4s\n",
+            &mut pl,
+        );
+        assert_eq!(
+            pl.definitions.get("token").map(String::as_str),
+            Some("ab cd"),
+            "the value is the percent-decoded query parameter: {:?}",
+            pl.definitions
+        );
+        assert!(pl.parse_issues.is_empty(), "{:?}", pl.parse_issues);
+    }
+
+    #[test]
+    fn parse_media_reports_a_queryparam_the_uri_does_not_carry() {
+        let mut pl = MediaPlaylist::new("v1".to_string(), String::new());
+        parse_media_playlist(
+            "https://ex.com/hls/prog.m3u8",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-DEFINE:QUERYPARAM=\"token\"\n\
+             #EXTINF:4.0,\nseg0.m4s\n",
+            &mut pl,
+        );
+        let issue = pl.parse_issues.iter()
+            .find(|i| i.check_id == CheckId::VariableDefinitions)
+            .unwrap_or_else(|| panic!("expected a §4.4.2.3 finding: {:?}", pl.parse_issues));
+        assert_eq!(issue.severity, Severity::Error);
+        assert!(issue.message.contains("QUERYPARAM"), "{}", issue.message);
+    }
+
+    #[test]
+    fn parse_media_finds_a_queryparam_on_the_redirect_response_uri() {
+        // §4.4.2.3: "If the URI is redirected, the client MUST look for the query parameter in
+        // the 30x response URI." Tokenising redirects are how most signed streams work.
+        let mut pl = MediaPlaylist::new("v1".to_string(), String::new());
+        pl.http_meta.final_url = "https://cdn.ex.com/hls/prog.m3u8?token=abc".to_string();
+        parse_media_playlist(
+            "https://ex.com/hls/prog.m3u8",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-DEFINE:QUERYPARAM=\"token\"\n\
+             #EXTINF:4.0,\nseg0.m4s\n",
+            &mut pl,
+        );
+        assert_eq!(pl.definitions.get("token").map(String::as_str), Some("abc"));
+        assert!(pl.parse_issues.is_empty(), "{:?}", pl.parse_issues);
+    }
+
+    #[test]
+    fn a_query_parameter_with_no_value_does_not_define_a_variable() {
+        let mut pl = MediaPlaylist::new("v1".to_string(), String::new());
+        parse_media_playlist(
+            "https://ex.com/hls/prog.m3u8?token=",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-DEFINE:QUERYPARAM=\"token\"\n\
+             #EXTINF:4.0,\nseg0.m4s\n",
+            &mut pl,
+        );
+        assert!(
+            pl.parse_issues.iter().any(|i| i.check_id == CheckId::VariableDefinitions),
+            "a matching parameter with no associated value is a parse failure: {:?}",
+            pl.parse_issues
+        );
+    }
+
+    #[test]
+    fn parse_media_reports_an_import_with_no_multivariant_playlist_to_import_from() {
+        let mut pl = MediaPlaylist::new("v1".to_string(), String::new());
+        parse_media_playlist(
+            "https://ex.com/hls/prog.m3u8",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-DEFINE:IMPORT=\"token\"\n\
+             #EXTINF:4.0,\nseg0.m4s\n",
+            &mut pl,
+        );
+        let issue = pl.parse_issues.iter()
+            .find(|i| i.check_id == CheckId::VariableDefinitions)
+            .unwrap_or_else(|| panic!("expected a §4.4.2.3 finding: {:?}", pl.parse_issues));
+        assert_eq!(issue.severity, Severity::Error);
+        assert!(issue.message.contains("IMPORT") || issue.message.contains("imports"),
+            "{}", issue.message);
+    }
+
+    #[test]
+    fn parse_media_accepts_an_import_the_multivariant_playlist_declares() {
+        // The value arrives in `definitions` before the media playlist is parsed, which is how
+        // the run resolves IMPORT against the multivariant playlist it came from.
+        let mut pl = MediaPlaylist::new("v1".to_string(), String::new());
+        pl.definitions.insert("token".to_string(), "abc".to_string());
+        parse_media_playlist(
+            "https://ex.com/hls/prog.m3u8",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-DEFINE:IMPORT=\"token\"\n\
+             #EXTINF:4.0,\nseg0.m4s\n",
+            &mut pl,
+        );
+        assert!(
+            !pl.parse_issues.iter().any(|i| i.check_id == CheckId::VariableDefinitions),
+            "{:?}", pl.parse_issues
+        );
+    }
+
+    #[test]
+    fn parse_master_resolves_a_queryparam_definition_from_its_own_uri() {
+        let master = parse_master_playlist(
+            "https://ex.com/a/master.m3u8?sid=xyz%2F1",
+            "#EXTM3U\n#EXT-X-DEFINE:QUERYPARAM=\"sid\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1000\nv1/prog.m3u8\n",
+        );
+        assert_eq!(master.definitions.get("sid").map(String::as_str), Some("xyz/1"));
     }
 
     // ── parse_master_playlist rendition group attributes ──────────────────────

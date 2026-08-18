@@ -86,9 +86,17 @@ fn report_definitions(report: &ValidationReport) -> std::collections::HashMap<St
     }
 }
 
-/// True for duration-drift issues that should link to the compared renditions in the viewer.
-fn is_drift_issue_message(message: &str) -> bool {
-    message.starts_with("EXTINF drift") || message.starts_with("Cumulative EXTINF drift")
+/// True for the findings that compare two renditions against each other, which are the ones
+/// worth opening side by side in the viewer.
+///
+/// This asks the finding which check produced it. Matching on the opening words of the
+/// message meant the links disappeared the moment a message was reworded — as they had,
+/// silently, once the drift findings gained their section citation.
+fn shows_rendition_links(issue: &Issue) -> bool {
+    matches!(
+        issue.check_id,
+        CheckId::DurationDrift | CheckId::CumulativeDrift | CheckId::PdtAlignment
+    )
 }
 
 /// Build an absolute manifest-viewer URL for `playlist_url`, applying HLS variable substitution
@@ -250,7 +258,6 @@ fn ValidationResults(report: ValidationReport) -> impl IntoView {
     let ad_breaks = report.ad_breaks.clone();
     let elapsed = report.elapsed_ms;
     let tolerance = report.tolerance_ms;
-    let has_interstitials_data = report.has_interstitials_data;
     let has_scte35_data = report.has_scte35_data;
 
     let playlist_window_s = report.playlist_window_s;
@@ -322,7 +329,6 @@ fn ValidationResults(report: ValidationReport) -> impl IntoView {
             <SectionTitle label="🔍 Check Results" />
             <CheckResultsTable
                 groups=check_groups
-                has_interstitials_data=has_interstitials_data
                 renditions=renditions.clone()
                 definitions=definitions
             />
@@ -1101,7 +1107,6 @@ fn DeltaSection(
 #[component]
 fn CheckResultsTable(
     groups: Vec<CheckGroup>,
-    has_interstitials_data: bool,
     renditions: Vec<Rendition>,
     definitions: std::collections::HashMap<String, String>,
 ) -> impl IntoView {
@@ -1129,18 +1134,13 @@ fn CheckResultsTable(
                     let has_issues = !g.issues.is_empty();
                     let issue_count = g.issues.len();
 
-                    // N/A for HLS Interstitials when no interstitial data
-                    let is_interstitials_check = g.name == "HLS Interstitials";
-                    let show_na = is_interstitials_check && !has_interstitials_data;
-
-                    let (pill_color, pill_bg, pill_border, pill_label) = if show_na {
-                        ("#64748b", "rgba(148,163,184,.08)", "#cbd5e1", "— N/A")
-                    } else {
-                        match g.status.as_str() {
-                            "FAIL" => ("#ef4444", "rgba(239,68,68,.15)", "rgba(239,68,68,.3)", "✗ FAIL"),
-                            "WARN" => ("#f59e0b", "rgba(245,158,11,.15)", "rgba(245,158,11,.3)", "⚠ WARN"),
-                            _ => ("#22c55e", "rgba(34,197,94,.15)", "rgba(34,197,94,.3)", "✓ PASS"),
-                        }
+                    // The report itself says which checks the stream gave nothing to read;
+                    // the table no longer recognises those rows by name.
+                    let (pill_color, pill_bg, pill_border, pill_label) = match g.status.as_str() {
+                        validator::NOT_APPLICABLE => ("#64748b", "rgba(148,163,184,.08)", "#cbd5e1", "— N/A"),
+                        "FAIL" => ("#ef4444", "rgba(239,68,68,.15)", "rgba(239,68,68,.3)", "✗ FAIL"),
+                        "WARN" => ("#f59e0b", "rgba(245,158,11,.15)", "rgba(245,158,11,.3)", "⚠ WARN"),
+                        _ => ("#22c55e", "rgba(34,197,94,.15)", "rgba(34,197,94,.3)", "✓ PASS"),
                     };
                     let (expanded, set_expanded) = signal(false);
                     let rend_url_map = rend_url_map.clone();
@@ -1209,9 +1209,7 @@ fn CheckResultsTable(
                                                 } else {
                                                     "Global".to_string()
                                                 };
-                                                // Check if this is a drift issue that should show viewer links
-                                                let is_drift = is_drift_issue_message(&iss.message);
-                                                let viewer_links: Vec<(String, String)> = if is_drift {
+                                                let viewer_links: Vec<(String, String)> = if shows_rendition_links(&iss) {
                                                     let mut links = Vec::new();
                                                     if let Some(ref ra) = iss.rendition_a
                                                         && let Some(url) = rend_url_map.get(ra) {
@@ -1226,6 +1224,12 @@ fn CheckResultsTable(
                                                     Vec::new()
                                                 };
 
+                                                // How sure the check is of its evidence is a
+                                                // different question from how serious the
+                                                // finding is, so a finding that was sampled or
+                                                // inferred rather than measured says so next
+                                                // to its severity, as Author's table does.
+                                                let confidence_note = iss.confidence.note();
                                                 view! {
                                                     <div style=format!(
                                                         "border-left: 3px solid {}; padding: 10px 12px; \
@@ -1233,12 +1237,25 @@ fn CheckResultsTable(
                                                          background: rgba(255,255,255,.04);",
                                                         sev_color
                                                     )>
-                                                        <div style=format!(
-                                                            "font-size: .7rem; font-weight: 800; text-transform: uppercase; \
-                                                             letter-spacing: .06em; margin-bottom: 4px; color: {};",
-                                                            sev_color
-                                                        )>
-                                                            {format!("{} {}", sev_icon, iss.severity)}
+                                                        <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px;">
+                                                            <span style=format!(
+                                                                "font-size: .7rem; font-weight: 800; text-transform: uppercase; \
+                                                                 letter-spacing: .06em; color: {};",
+                                                                sev_color
+                                                            )>
+                                                                {format!("{} {}", sev_icon, iss.severity)}
+                                                            </span>
+                                                            {confidence_note.map(|note| view! {
+                                                                <span
+                                                                    title="This finding was not read straight from the stream — see the message for what was measured."
+                                                                    style="font-size: .65rem; font-weight: 700; text-transform: uppercase; \
+                                                                           letter-spacing: .06em; color: var(--color-sky-700); \
+                                                                           background: rgba(56,189,248,.12); border: 1px solid rgba(56,189,248,.3); \
+                                                                           border-radius: 4px; padding: 1px 6px; white-space: nowrap;"
+                                                                >
+                                                                    {note}
+                                                                </span>
+                                                            })}
                                                         </div>
                                                         <div style="font-size: .85rem; line-height: 1.6; color: var(--color-sky-950);">
                                                             {iss.message.clone()}
@@ -1374,16 +1391,21 @@ mod tests {
     // ── manifest_viewer_href ──────────────────────────────────────────────────
 
     #[test]
-    fn is_drift_issue_message_matches_check_output() {
-        assert!(is_drift_issue_message(
-            "EXTINF drift at MSN 42: 'hi' has 6.006s vs 'lo' has 6.000s (diff=0.006s)"
-        ));
-        assert!(is_drift_issue_message(
-            "Cumulative EXTINF drift across renditions: 0.120s (tolerance=0.100s)"
-        ));
+    fn rendition_links_follow_the_check_not_the_wording() {
+        // The finding is recognised by the check that produced it, so rewording a message —
+        // adding its section citation, or summarising a run of segments — cannot silently
+        // take the viewer links away.
+        for id in [CheckId::DurationDrift, CheckId::CumulativeDrift, CheckId::PdtAlignment] {
+            let issue = Issue::error("reworded beyond recognition".into()).for_check(id);
+            assert!(shows_rendition_links(&issue), "{id:?} compares two renditions");
+        }
+        let unrelated = Issue::error(
+            "rfc8216bis §4.4.3.1: EXTINF duration must be ≤ TARGETDURATION".into(),
+        )
+        .for_check(CheckId::TargetDurationCompliance);
         assert!(
-            !is_drift_issue_message("EXTINF duration must be ≤ TARGETDURATION"),
-            "unrelated EXTINF messages must not get drift viewer links"
+            !shows_rendition_links(&unrelated),
+            "a finding about one playlist has no second rendition to open"
         );
     }
 

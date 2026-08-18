@@ -39,6 +39,44 @@ fn http_meta_from_fetch(request_url: &str, resp: &crate::utils::network::FetchTe
     }
 }
 
+/// The audio codec named by a CODECS attribute, if one of its values names one.
+///
+/// §4.4.6.2 gives CODECS as a comma-separated list of formats present in the Variant Stream
+/// and says nothing about their order, so the audio format is found by looking at what each
+/// value names. Taking the second value assumed video-then-audio, which turned
+/// `CODECS="mp4a.40.2,avc1.64001f"` into an audio group labelled with an AVC codec and left
+/// audio-only Variant Streams — which have one value — with no audio codec at all.
+pub fn audio_codec_of(codecs: &str) -> Option<String> {
+    /// Registered sample entry prefixes, from the "HLS Authoring" codec strings in common use.
+    /// Matching is by prefix and case-insensitive, which covers both `flac` and `fLaC` and the
+    /// several DTS and MPEG-H variants without listing each one.
+    const AUDIO: [&str; 13] = [
+        "mp4a", "ac-3", "ec-3", "ac-4", "alac", "flac", "opus", "vorbis", "dts", "mha", "mhm",
+        "iamf", "apac",
+    ];
+    const VIDEO: [&str; 13] = [
+        "avc1", "avc3", "hvc1", "hev1", "dvh1", "dvhe", "dav1", "vp08", "vp8", "vp09", "vp9",
+        "av01", "mp4v",
+    ];
+    const TEXT: [&str; 4] = ["wvtt", "stpp", "c608", "c708"];
+
+    fn looks_like(token: &str, prefixes: &[&str]) -> bool {
+        let token = token.to_ascii_lowercase();
+        prefixes.iter().any(|p| token.starts_with(p))
+    }
+
+    let tokens: Vec<&str> = codecs.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    tokens.iter()
+        .find(|t| looks_like(t, &AUDIO))
+        // An unrecognised format may still be audio — new codecs are registered all the time —
+        // so anything that is not video or a text track is taken as the audio value.
+        .or_else(|| tokens.iter().find(|t| !looks_like(t, &VIDEO) && !looks_like(t, &TEXT)))
+        .map(|t| t.to_string())
+}
+
 /// Master and media playlists fetched for one stream. Shared by the Validate
 /// and Author sections so both parse the stream the same way.
 pub struct CollectedStream {
@@ -105,13 +143,12 @@ pub async fn collect_stream(url: &str) -> Result<CollectedStream, FetchError> {
         req_video_layout: v.req_video_layout.clone(),
     }).collect();
 
-    // Build audio group → codec lookup from STREAM-INF CODECS strings
-    // (each STREAM-INF CODECS is "videocodec,audiocodec"; take the audio portion)
+    // Build audio group → codec lookup from the CODECS attribute of the STREAM-INF tags that
+    // name the group.
     let audio_group_codec: std::collections::HashMap<String, String> = master.variants.iter()
         .filter_map(|v| {
             let grp = v.audio_group.as_ref()?;
-            let codecs = v.codecs.as_ref()?;
-            let audio_codec = codecs.split(',').nth(1).map(|c| c.trim().to_string())?;
+            let audio_codec = audio_codec_of(v.codecs.as_ref()?)?;
             Some((grp.clone(), audio_codec))
         })
         .collect();
@@ -269,21 +306,19 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
 
     run_fetched_stream_checks(stream.master.as_ref(), &playlists, &mut report);
 
-    // Fetch delta updates for playlists with CAN-SKIP-UNTIL
+    // Every rendition's Delta Update is requested in one round rather than one at a time.
     let (delta_issues, delta_reports) = check_playlist_delta_updates(&playlists).await;
+    let delta_probed = !delta_reports.is_empty();
     report.issues.extend(delta_issues);
     report.delta_report = delta_reports;
 
-    // MSN monotonicity check: re-fetch live playlists and compare MSNs
-    let msn_issues = check_media_sequence_monotonicity(&playlists).await;
-    report.issues.extend(msn_issues);
-
     report.renditions = build_renditions(&playlists);
+    let inputs = RunInputs::from_run(stream.master.as_ref(), &playlists, delta_probed);
     report.playlists = playlists;
     report.master = stream.master;
 
     report.finalize();
-    report.check_groups = categorize_issues(&report.issues);
+    report.check_groups = categorize_issues(&report.issues, &inputs);
     report.elapsed_ms = (now_ms() - start) as u64;
     Ok(report)
 }
@@ -305,6 +340,12 @@ fn run_fetched_stream_checks(
         report.issues.extend(checks::check_bandwidth_required(master));
         report.issues.extend(checks::check_media_group_membership(master));
         report.issues.extend(checks::check_rendition_group_references(master));
+    }
+
+    // Needs the multivariant playlist to know which playlists are I-frame Variant Streams,
+    // and the playlists themselves to see whether they say so.
+    if master.is_some() {
+        report.issues.extend(checks::check_iframe_playlists(playlists));
     }
 
     run_media_checks(playlists, report);
@@ -394,6 +435,7 @@ fn run_media_checks(playlists: &[MediaPlaylist], report: &mut ValidationReport) 
     report.issues.extend(checks::check_duration_drift(playlists, tolerance_ms));
     report.issues.extend(checks::check_pdt_alignment(playlists, tolerance_ms));
     report.issues.extend(checks::check_cumulative_drift(playlists, tolerance_ms));
+    report.issues.extend(checks::check_daterange_consistency(playlists));
     report.issues.extend(checks::check_ll_hls_compliance(playlists));
     report.issues.extend(checks::check_media_sequence_continuity(playlists));
 
@@ -462,57 +504,72 @@ struct CheckDef {
     name: &'static str,
     section: &'static str,
     reference: &'static str,
+    /// Whether the run held what this check reads. A check with nothing to read is reported
+    /// N/A: it did not pass, it did not run, and a green tick would credit the stream with a
+    /// rule it was never measured against.
+    applies: fn(&RunInputs) -> bool,
 }
+
+/// Reads something in every run, so it is only ever PASS, WARN or FAIL.
+const ALWAYS: fn(&RunInputs) -> bool = |_| true;
 
 /// The report table, in display order. Every [`CheckId`] appears exactly once, which
 /// `check_defs_cover_every_check_id` enforces.
 const CHECK_DEFS: &[CheckDef] = &[
     // §4.4.1 Basic Tags
-    CheckDef { id: CheckId::ExtM3uHeader, name: "EXTM3U Header", section: "Basic Tags", reference: "rfc8216bis §4.4.1.1" },
+    CheckDef { id: CheckId::ExtM3uHeader, name: "EXTM3U Header", section: "Basic Tags", reference: "rfc8216bis §4.4.1.1", applies: ALWAYS },
     // §4.4.1.2 / §4.4.2 / §4.4.3 Singleton Tag Presence
-    CheckDef { id: CheckId::SingletonTags, name: "Singleton Tags", section: "Structural", reference: "rfc8216bis §4.4.1.2/§4.4.2/§4.4.3" },
+    CheckDef { id: CheckId::SingletonTags, name: "Singleton Tags", section: "Structural", reference: "rfc8216bis §4.4.1.2/§4.4.2/§4.4.3", applies: ALWAYS },
     // §4.4.3.1
-    CheckDef { id: CheckId::TargetDurationCompliance, name: "Target Duration Compliance", section: "Structural", reference: "rfc8216bis §4.4.3.1" },
+    CheckDef { id: CheckId::TargetDurationCompliance, name: "Target Duration Compliance", section: "Structural", reference: "rfc8216bis §4.4.3.1", applies: ALWAYS },
     // §4.4.3.2
-    CheckDef { id: CheckId::MediaSequenceTags, name: "Media Sequence Tags", section: "Structural", reference: "rfc8216bis §4.4.3.2" },
+    CheckDef { id: CheckId::MediaSequenceTags, name: "Media Sequence Tags", section: "Structural", reference: "rfc8216bis §4.4.3.2", applies: ALWAYS },
     // §4.4.3.3 / §6.2.4
-    CheckDef { id: CheckId::DiscontinuitySequence, name: "Discontinuity Sequence", section: "Alignment", reference: "rfc8216bis §4.4.3.3/§6.2.4" },
+    CheckDef { id: CheckId::DiscontinuitySequence, name: "Discontinuity Sequence", section: "Alignment", reference: "rfc8216bis §4.4.3.3/§6.2.4", applies: |r| r.playlists > 1 },
     // §4.4.3.5
-    CheckDef { id: CheckId::PlaylistTypeEndlist, name: "Playlist Type / ENDLIST", section: "Structural", reference: "rfc8216bis §4.4.3.5" },
+    CheckDef { id: CheckId::PlaylistTypeEndlist, name: "Playlist Type / ENDLIST", section: "Structural", reference: "rfc8216bis §4.4.3.5", applies: ALWAYS },
     // §4.4.4.1
-    CheckDef { id: CheckId::SegmentStructure, name: "Segment Structure", section: "Structural", reference: "rfc8216bis §4.4.4.1" },
+    CheckDef { id: CheckId::SegmentStructure, name: "Segment Structure", section: "Structural", reference: "rfc8216bis §4.4.4.1", applies: ALWAYS },
     // §4.4.4.4
-    CheckDef { id: CheckId::EncryptionConsistency, name: "Encryption Consistency", section: "Security", reference: "rfc8216bis §4.4.4.4" },
+    CheckDef { id: CheckId::EncryptionConsistency, name: "Encryption Consistency", section: "Security", reference: "rfc8216bis §4.4.4.4", applies: |r| r.has_encryption },
     // §4.4.5.2 / §6.2.5.1
-    CheckDef { id: CheckId::DeltaUpdates, name: "Playlist Delta Updates", section: "LL-HLS", reference: "rfc8216bis §4.4.5.2/§6.2.5.1" },
+    CheckDef { id: CheckId::DeltaUpdates, name: "Playlist Delta Updates", section: "LL-HLS", reference: "rfc8216bis §4.4.5.2/§6.2.5.1", applies: |r| r.delta_probed },
     // §4.4.6.2
-    CheckDef { id: CheckId::BandwidthRequired, name: "BANDWIDTH Required", section: "Multivariant", reference: "rfc8216bis §4.4.6.2" },
-    CheckDef { id: CheckId::StreamInfConsistency, name: "STREAM-INF Consistency", section: "Multivariant", reference: "rfc8216bis §4.4.6.2/§6.2.4" },
-    CheckDef { id: CheckId::RenditionGroupReferences, name: "Rendition Group References", section: "Multivariant", reference: "rfc8216bis §4.4.6.2" },
+    CheckDef { id: CheckId::BandwidthRequired, name: "BANDWIDTH Required", section: "Multivariant", reference: "rfc8216bis §4.4.6.2", applies: |r| r.has_master },
+    CheckDef { id: CheckId::StreamInfConsistency, name: "STREAM-INF Consistency", section: "Multivariant", reference: "rfc8216bis §4.4.6.2/§6.2.4", applies: |r| r.has_master },
+    CheckDef { id: CheckId::RenditionGroupReferences, name: "Rendition Group References", section: "Multivariant", reference: "rfc8216bis §4.4.6.2", applies: |r| r.has_master },
     // §4.4.6.1.1
-    CheckDef { id: CheckId::MediaGroupMembership, name: "Media Group Membership", section: "Multivariant", reference: "rfc8216bis §4.4.6.1.1" },
+    CheckDef { id: CheckId::MediaGroupMembership, name: "Media Group Membership", section: "Multivariant", reference: "rfc8216bis §4.4.6.1.1", applies: |r| r.has_master },
+    // §4.4.6.3
+    CheckDef { id: CheckId::IFramePlaylists, name: "I-Frame Playlists", section: "Multivariant", reference: "rfc8216bis §4.4.6.3", applies: |r| r.has_iframe_variants },
     // §6.2.2
-    CheckDef { id: CheckId::LivePlaylistWindow, name: "Live Playlist Window", section: "Live", reference: "rfc8216bis §6.2.2" },
+    CheckDef { id: CheckId::LivePlaylistWindow, name: "Live Playlist Window", section: "Live", reference: "rfc8216bis §6.2.2", applies: ALWAYS },
     // §6.2.4
-    CheckDef { id: CheckId::PdtCoverage, name: "PDT Coverage", section: "Timing", reference: "rfc8216bis §6.2.4" },
-    CheckDef { id: CheckId::PdtAlignment, name: "PDT Alignment", section: "Alignment", reference: "rfc8216bis §6.2.4" },
-    CheckDef { id: CheckId::TargetDurationConsistency, name: "Target Duration Consistency", section: "Alignment", reference: "rfc8216bis §6.2.4" },
-    CheckDef { id: CheckId::CumulativeDrift, name: "Cumulative Drift", section: "Alignment", reference: "rfc8216bis §6.2.4" },
+    CheckDef { id: CheckId::PdtCoverage, name: "PDT Coverage", section: "Timing", reference: "rfc8216bis §6.2.4/§4.4.5.1", applies: |r| r.has_pdt_tags || r.has_dateranges },
+    CheckDef { id: CheckId::PdtAlignment, name: "PDT Alignment", section: "Alignment", reference: "rfc8216bis §6.2.4", applies: |r| r.has_pdt_tags && r.video_playlists > 1 },
+    CheckDef { id: CheckId::TargetDurationConsistency, name: "Target Duration Consistency", section: "Alignment", reference: "rfc8216bis §6.2.4", applies: |r| r.playlists > 1 },
+    CheckDef { id: CheckId::CumulativeDrift, name: "Cumulative Drift", section: "Alignment", reference: "rfc8216bis §6.2.4", applies: |r| r.video_playlists > 1 },
+    CheckDef { id: CheckId::DateRangeConsistency, name: "Date Range Consistency", section: "Alignment", reference: "rfc8216bis §6.2.4", applies: |r| r.has_dateranges && r.playlists > 1 },
     // §4.4.4.1 drift cross-rendition
-    CheckDef { id: CheckId::DurationDrift, name: "EXTINF Duration Drift", section: "Alignment", reference: "rfc8216bis §4.4.4.1" },
-    CheckDef { id: CheckId::SegmentCount, name: "Segment Count", section: "Alignment", reference: "rfc8216bis §4.4.4.1" },
+    CheckDef { id: CheckId::DurationDrift, name: "EXTINF Duration Drift", section: "Alignment", reference: "rfc8216bis §4.4.4.1", applies: |r| r.video_playlists > 1 },
+    CheckDef { id: CheckId::SegmentCount, name: "Segment Count", section: "Alignment", reference: "rfc8216bis §4.4.4.1", applies: |r| r.vod_video_playlists > 1 },
+    // §4.4.2.3
+    CheckDef { id: CheckId::VariableDefinitions, name: "Variable Definitions", section: "Structural", reference: "rfc8216bis §4.4.2.3", applies: |r| r.has_defines },
     // §8
-    CheckDef { id: CheckId::VersionCompatibility, name: "Version Compatibility", section: "Version", reference: "rfc8216bis §8" },
+    CheckDef { id: CheckId::VersionCompatibility, name: "Version Compatibility", section: "Version", reference: "rfc8216bis §8", applies: ALWAYS },
     // LL-HLS §4.4.3–4.4.5, §6.2.5.2
-    CheckDef { id: CheckId::LlHls, name: "LL-HLS Compliance", section: "LL-HLS", reference: "rfc8216bis §4.4.3–4.4.5" },
+    CheckDef { id: CheckId::LlHls, name: "LL-HLS Compliance", section: "LL-HLS", reference: "rfc8216bis §4.4.3–4.4.5", applies: |r| r.has_low_latency_tags },
     // Appendix D
-    CheckDef { id: CheckId::Interstitials, name: "HLS Interstitials", section: "Interstitials", reference: "rfc8216bis Appendix D" },
+    CheckDef { id: CheckId::Interstitials, name: "HLS Interstitials", section: "Interstitials", reference: "rfc8216bis Appendix D", applies: |r| r.has_interstitials },
     // Delivery
-    CheckDef { id: CheckId::PlaylistFetch, name: "Playlist Retrieval", section: "Delivery", reference: "rfc8216bis §6.2" },
+    CheckDef { id: CheckId::PlaylistFetch, name: "Playlist Retrieval", section: "Delivery", reference: "rfc8216bis §6.2", applies: ALWAYS },
 ];
 
 /// Group of last resort, so a finding whose check has no row in the table is still shown.
 const UNGROUPED_NAME: &str = "Other Findings";
+
+/// [`CheckGroup::status`] for a check the run held nothing for.
+pub const NOT_APPLICABLE: &str = "N/A";
 
 /// Group issues by the check that produced them.
 ///
@@ -521,7 +578,11 @@ const UNGROUPED_NAME: &str = "Other Findings";
 /// consistency row could see it — and a finding matching no keyword at all never reached the
 /// UI. Each finding now names its own check and this is a lookup, with anything unclaimed
 /// collected into [`UNGROUPED_NAME`] rather than dropped.
-fn categorize_issues(issues: &[Issue]) -> Vec<CheckGroup> {
+/// `inputs` decides which rows are reported N/A: a check whose subject the run never held
+/// cannot have passed. A check that did have something to read but produced no finding is
+/// still PASS, even where `inputs` says the subject was absent, because a finding is proof
+/// that the check ran.
+fn categorize_issues(issues: &[Issue], inputs: &RunInputs) -> Vec<CheckGroup> {
     fn status_of(issues: &[Issue]) -> String {
         if issues.iter().any(|i| i.severity == Severity::Error) {
             "FAIL".to_string()
@@ -537,11 +598,16 @@ fn categorize_issues(issues: &[Issue]) -> Vec<CheckGroup> {
             .filter(|i| i.check_id == def.id)
             .cloned()
             .collect();
+        let status = if matched.is_empty() && !(def.applies)(inputs) {
+            NOT_APPLICABLE.to_string()
+        } else {
+            status_of(&matched)
+        };
         CheckGroup {
             name: def.name.to_string(),
             section: def.section.to_string(),
             reference: def.reference.to_string(),
-            status: status_of(&matched),
+            status,
             issues: matched,
         }
     }).collect();
@@ -823,60 +889,26 @@ fn classify_scte35_id(id: &str) -> String {
 
 
 
-/// rfc8216bis §4.4.3.2 — MSN monotonicity: re-fetch live playlists and verify the
-/// EXT-X-MEDIA-SEQUENCE value does not decrease between fetches.
-async fn check_media_sequence_monotonicity(playlists: &[MediaPlaylist]) -> Vec<Issue> {
-    let mut issues = Vec::new();
-    let mut seen_urls = std::collections::HashSet::new();
-    for pl in playlists {
-        if pl.has_endlist { continue; }           // VOD / EVENT-ended — immutable
-        if !seen_urls.insert(pl.url.clone()) { continue; }
+// rfc8216bis §6.2.2 requires that a Media Playlist's Media Sequence Number never decrease.
+// The check that used to live here re-fetched every live playlist and compared the reloaded
+// EXT-X-MEDIA-SEQUENCE with the first one. It is deliberately gone, and no replacement is
+// attempted, because neither of its outcomes said anything true about the stream:
+//
+//   * Its pass was vacuous. The reload happens milliseconds after the first fetch, over the
+//     same HTTP cache, so the expected answer is byte-identical to the response already in
+//     hand. Nothing was measured, yet the report showed a green tick against a MUST.
+//   * Its failure was unsound. A presentation served from more than one CDN edge can answer
+//     two requests from two generations of the playlist, and the older one carries the lower
+//     Media Sequence Number. That is a stale edge, not a server decreasing its MSN, and
+//     reporting it as an Error against a MUST is a false accusation on a conforming stream.
+//
+// Making it sound needs a second observation the tool cannot honestly obtain: a re-fetch that
+// provably bypasses every cache between here and the origin, taken far enough apart in time
+// to expect the playlist to have advanced. A cache-busting query parameter is not that — it
+// changes the resource identity, so signed-URL streams answer 403 and CDNs are free to serve
+// a different generation — and `fetch` cache modes only reach the browser's own cache.
+// Monotonicity is therefore left to a tool that can watch a stream over time.
 
-        match fetch_text(pl.url.clone()).await {
-            Ok(resp) => {
-                let new_msn: Option<u64> = resp.response_text.lines()
-                    .find(|l| l.trim().starts_with("#EXT-X-MEDIA-SEQUENCE:"))
-                    .and_then(|l| l.split_once(':').and_then(|(_, v)| v.trim().parse().ok()));
-                if let Some(new_msn) = new_msn
-                    && new_msn < pl.media_sequence {
-                        issues.push(Issue {
-                            severity: Severity::Error,
-                            check_id: CheckId::MediaSequenceTags,
-                            segment_index: -1,
-                            rendition_a: Some(pl.name.clone()),
-                            rendition_b: None,
-                            uri_a: Some(pl.url.clone()),
-                            uri_b: None,
-                            message: format!(
-                                "rfc8216bis §4.4.3.2 — MSN monotonicity: EXT-X-MEDIA-SEQUENCE \
-                                 regressed for '{}': first fetch MSN={}, reload MSN={} \
-                                 (regressed by {}). A server MUST NOT decrease the Media \
-                                 Sequence Number — clients will discard cached segments.",
-                                pl.name, pl.media_sequence, new_msn,
-                                pl.media_sequence - new_msn
-                            ),
-                            uri_note: Some(format!(
-                                "First fetch MSN={} → reload MSN={} (delta={} regression).",
-                                pl.media_sequence, new_msn, pl.media_sequence - new_msn
-                            )),
-                            ..Default::default()
-                        });
-                    }
-            }
-            Err(e) => {
-                issues.push(
-                    Issue::warn(format!(
-                        "rfc8216bis §4.4.3.2 — MSN monotonicity: Could not re-fetch '{}' \
-                         for monotonicity check: {}",
-                        pl.name, e
-                    ))
-                    .for_check(CheckId::PlaylistFetch),
-                );
-            }
-        }
-    }
-    issues
-}
 
 /// The CAN-SKIP-UNTIL boundary to probe for `pl`, or `None` when a Playlist Delta Update
 /// does not apply to it.
@@ -961,18 +993,26 @@ async fn check_playlist_delta_updates(playlists: &[MediaPlaylist]) -> (Vec<Issue
     let mut issues = Vec::new();
     let mut reports = Vec::new();
 
-    for pl in playlists {
-        let Some(can_skip) = delta_update_can_skip_until(pl) else { continue };
+    // Every rendition's Delta Update is requested at once. Awaiting them one at a time made
+    // the report wait for one round-trip per rendition, and on a live presentation each of
+    // those may block for up to the server's hold-back.
+    let probes: Vec<(&MediaPlaylist, f64, String)> = playlists.iter()
+        .filter_map(|pl| {
+            let can_skip = delta_update_can_skip_until(pl)?;
+            let sep = if pl.url.contains('?') { "&" } else { "?" };
+            Some((pl, can_skip, format!("{}{}_HLS_skip=YES", pl.url, sep)))
+        })
+        .collect();
+    let responses = futures::future::join_all(
+        probes.iter().map(|(_, _, delta_url)| fetch_text(delta_url.clone())),
+    ).await;
+
+    for ((pl, can_skip, delta_url), response) in probes.into_iter().zip(responses) {
         let sc = pl.server_control.as_ref().expect("CAN-SKIP-UNTIL comes from SERVER-CONTROL");
-
-        // Build delta URL by appending _HLS_skip=YES
-        let sep = if pl.url.contains('?') { "&" } else { "?" };
-        let delta_url = format!("{}{}_HLS_skip=YES", pl.url, sep);
-
         let hold_back = sc.hold_back.unwrap_or(0.0);
         let can_block_reload = sc.can_block_reload;
 
-        match fetch_text(delta_url.clone()).await {
+        match response {
             Ok(delta_response) => {
                 let delta_content = &delta_response.response_text;
                 // Parse the delta playlist
@@ -1282,7 +1322,7 @@ mod tests {
         ]);
         assert_eq!(issues.len(), 1, "expected one discontinuity finding: {issues:?}");
 
-        let groups = categorize_issues(&issues);
+        let groups = categorize_issues(&issues, &RunInputs::everything());
         assert_eq!(group(&groups, "Discontinuity Sequence").issues.len(), 1);
         assert_eq!(group(&groups, "Discontinuity Sequence").status, "FAIL");
         assert!(
@@ -1301,7 +1341,7 @@ mod tests {
             Issue::error("rfc8216bis §6.2.4: TARGETDURATION values differ".into())
                 .for_check(CheckId::TargetDurationConsistency),
         ];
-        let groups = categorize_issues(&issues);
+        let groups = categorize_issues(&issues, &RunInputs::everything());
         assert_eq!(group(&groups, "Target Duration Compliance").issues.len(), 1);
         assert_eq!(group(&groups, "Target Duration Consistency").issues.len(), 1);
     }
@@ -1328,7 +1368,7 @@ mod tests {
             "expected a HOLD-BACK finding: {issues:?}"
         );
 
-        let groups = categorize_issues(&issues);
+        let groups = categorize_issues(&issues, &RunInputs::everything());
         assert_eq!(group(&groups, "LL-HLS Compliance").issues.len(), issues.len());
         assert!(group(&groups, "Target Duration Compliance").issues.is_empty());
     }
@@ -1339,15 +1379,107 @@ mod tests {
             Issue::warn("rfc8216bis §6.2: Could not fetch media playlist 'x': 404".into())
                 .for_check(CheckId::PlaylistFetch),
         ];
-        let groups = categorize_issues(&issues);
+        let groups = categorize_issues(&issues, &RunInputs::everything());
         assert_eq!(group(&groups, "Playlist Retrieval").issues.len(), 1);
         assert_eq!(group(&groups, "Playlist Retrieval").status, "WARN");
     }
 
     #[test]
+    fn checks_the_run_held_nothing_for_are_reported_not_applicable() {
+        // A media-playlist URL with nothing but segments: the multivariant, low-latency,
+        // Delta Update and interstitial rows were all reported PASS, which credited the
+        // stream with rules it was never measured against.
+        let inputs = RunInputs::from_run(None, &[media_only_playlist()], false);
+        let groups = categorize_issues(&[], &inputs);
+        for name in [
+            "BANDWIDTH Required",
+            "STREAM-INF Consistency",
+            "Media Group Membership",
+            "I-Frame Playlists",
+            "LL-HLS Compliance",
+            "Playlist Delta Updates",
+            "Encryption Consistency",
+            "Segment Count",
+        ] {
+            assert_eq!(
+                group(&groups, name).status,
+                NOT_APPLICABLE,
+                "'{name}' had nothing to read in a media-only run"
+            );
+        }
+        assert_eq!(
+            group(&groups, "EXTM3U Header").status,
+            "PASS",
+            "a check that reads every playlist did run"
+        );
+    }
+
+    #[test]
+    fn a_check_that_had_something_to_read_still_passes() {
+        let master = parser::parse_master_playlist(
+            "https://cdn.example.com/master.m3u8",
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000,CODECS=\"avc1.64001f\"\nv.m3u8\n",
+        );
+        let inputs = RunInputs::from_run(Some(&master), &[media_only_playlist()], false);
+        let groups = categorize_issues(&[], &inputs);
+        assert_eq!(group(&groups, "BANDWIDTH Required").status, "PASS");
+        assert_eq!(
+            group(&groups, "I-Frame Playlists").status,
+            NOT_APPLICABLE,
+            "this presentation declares no I-frame Variant Stream"
+        );
+    }
+
+    #[test]
+    fn a_finding_makes_its_check_applicable_whatever_the_inputs_say() {
+        // Proof beats inference: the check plainly ran, so it cannot be reported N/A.
+        let issues = vec![
+            Issue::error("rfc8216bis §4.4.6.2: BANDWIDTH missing".into())
+                .for_check(CheckId::BandwidthRequired),
+        ];
+        let groups = categorize_issues(&issues, &RunInputs::default());
+        assert_eq!(group(&groups, "BANDWIDTH Required").status, "FAIL");
+    }
+
+    // ── audio_codec_of ────────────────────────────────────────────────────────
+
+    #[test]
+    fn audio_codec_is_found_whichever_order_codecs_are_listed_in() {
+        assert_eq!(
+            audio_codec_of("avc1.64001f,mp4a.40.2").as_deref(),
+            Some("mp4a.40.2")
+        );
+        assert_eq!(
+            audio_codec_of("mp4a.40.2,avc1.64001f").as_deref(),
+            Some("mp4a.40.2"),
+            "taking the second value labelled this audio group with a video codec"
+        );
+        assert_eq!(audio_codec_of("hvc1.2.4.L123.B0, ec-3").as_deref(), Some("ec-3"));
+        assert_eq!(
+            audio_codec_of("mp4a.40.2").as_deref(),
+            Some("mp4a.40.2"),
+            "an audio-only Variant Stream lists one codec"
+        );
+    }
+
+    #[test]
+    fn a_codecs_attribute_with_no_audio_value_yields_none() {
+        assert_eq!(audio_codec_of("avc1.64001f").as_deref(), None);
+        assert_eq!(audio_codec_of("hvc1.2.4.L123.B0,wvtt").as_deref(), None);
+        assert_eq!(audio_codec_of("").as_deref(), None);
+    }
+
+    #[test]
+    fn an_unrecognised_codec_beside_a_video_one_is_taken_as_the_audio() {
+        // Formats are registered faster than this list is updated, so a value that is plainly
+        // not video and not a text track is still reported rather than dropped.
+        assert_eq!(audio_codec_of("avc1.64001f,xyz1.2").as_deref(), Some("xyz1.2"));
+    }
+
+    #[test]
     fn a_finding_that_names_no_check_is_still_reported() {
         let issues = vec![Issue::error("something nothing claims".into())];
-        let groups = categorize_issues(&issues);
+        let groups = categorize_issues(&issues, &RunInputs::everything());
         let other = group(&groups, UNGROUPED_NAME);
         assert_eq!(other.issues.len(), 1, "an unclaimed finding must not be dropped");
         assert_eq!(other.status, "FAIL");
@@ -1358,7 +1490,7 @@ mod tests {
         let issues: Vec<Issue> = CheckId::ALL.iter()
             .map(|id| Issue::warn(format!("finding from {id:?}")).for_check(*id))
             .collect();
-        let groups = categorize_issues(&issues);
+        let groups = categorize_issues(&issues, &RunInputs::everything());
         let grouped: usize = groups.iter().map(|g| g.issues.len()).sum();
         assert_eq!(grouped, issues.len(), "every finding must appear in exactly one group");
         assert!(
@@ -1482,7 +1614,7 @@ mod tests {
         assert_eq!(folded[0].severity, Severity::Error);
 
         // And it survives into the grouped view the UI renders.
-        let groups = categorize_issues(&report.issues);
+        let groups = categorize_issues(&report.issues, &RunInputs::everything());
         assert_eq!(group(&groups, "Segment Structure").issues.len(), 1);
     }
 

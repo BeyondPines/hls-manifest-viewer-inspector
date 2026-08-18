@@ -108,6 +108,12 @@ pub enum CheckId {
     Interstitials,
     SegmentStructure,
     PlaylistFetch,
+    /// §4.4.6.3 — an I-frame Variant Stream and the playlist it points at.
+    IFramePlaylists,
+    /// §6.2.4 — the Date Ranges of one rendition against the others that carry them.
+    DateRangeConsistency,
+    /// §4.4.2.3 — EXT-X-DEFINE declarations and whether their values can be resolved.
+    VariableDefinitions,
 }
 
 impl CheckId {
@@ -137,6 +143,9 @@ impl CheckId {
         CheckId::Interstitials,
         CheckId::SegmentStructure,
         CheckId::PlaylistFetch,
+        CheckId::IFramePlaylists,
+        CheckId::DateRangeConsistency,
+        CheckId::VariableDefinitions,
     ];
 }
 
@@ -155,8 +164,10 @@ pub struct Issue {
     pub uri_b: Option<String>,
     pub message: String,
     pub uri_note: Option<String>,
-    // Consolidation fields
+    /// How many findings this one stands for. A run of segments that all break the same rule
+    /// is reported once, and the report renders the range rather than one row per segment.
     pub count: usize,
+    /// First and last segment index of the run, valid when `count` is greater than one.
     pub seg_first: i32,
     pub seg_last: i32,
 }
@@ -240,6 +251,12 @@ pub struct MediaPlaylist {
     pub version: u32,
     pub encryption_methods: HashSet<String>,
     pub skipped_segments: u64,
+    /// How many EXT-X-PROGRAM-DATE-TIME tags the playlist actually carries.
+    ///
+    /// [`Segment::pdt`] is extrapolated forward from the last tag, so every segment of a
+    /// playlist that carries one tag has a PDT; only this count says whether the playlist
+    /// declares the tag at all, which is what §6.2.4 and §4.4.5.1 ask about.
+    pub program_date_time_tags: usize,
     // LL-HLS fields
     pub server_control: Option<ServerControl>,
     pub part_target: Option<f64>,
@@ -329,6 +346,7 @@ impl MediaPlaylist {
             encryption_methods: HashSet::new(),
             definitions: HashMap::new(),
             skipped_segments: 0,
+            program_date_time_tags: 0,
             server_control: None,
             part_target: None,
             preload_hint_uri: None,
@@ -529,8 +547,97 @@ pub struct CheckGroup {
     pub name: String,
     pub section: String,
     pub reference: String,
-    pub status: String,  // "PASS", "FAIL", "WARN"
+    /// "PASS", "FAIL", "WARN", "INFO", or "N/A".
+    ///
+    /// "N/A" says the run held nothing for this check to read — no Multivariant Playlist, no
+    /// Low-Latency tags, no Delta Update. Such a check did not pass, it did not run, and
+    /// showing it as PASS credits the stream with a rule it was never measured against.
+    pub status: String,
     pub issues: Vec<Issue>,
+}
+
+/// What one validation run had to work with, so a check with nothing to read can be told
+/// apart from a check that read the stream and found nothing wrong.
+///
+/// Each row of the report table declares which of these it needs; the alternative was to
+/// recognise the untested checks by name in the UI, which silently stops working as soon as
+/// a check is renamed or a second one becomes conditional.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunInputs {
+    /// The stream was reached through a Multivariant Playlist.
+    pub has_master: bool,
+    /// The Multivariant Playlist declares an I-frame Variant Stream.
+    pub has_iframe_variants: bool,
+    /// Media Playlists that were fetched and parsed.
+    pub playlists: usize,
+    /// VIDEO Media Playlists that are not I-frame only: what the drift checks compare.
+    pub video_playlists: usize,
+    /// Those of them that have ENDLIST, which is all the segment-count check compares.
+    pub vod_video_playlists: usize,
+    /// A playlist carries an interstitial EXT-X-DATERANGE.
+    pub has_interstitials: bool,
+    /// A playlist carries EXT-X-PART, EXT-X-PART-INF or EXT-X-SERVER-CONTROL.
+    pub has_low_latency_tags: bool,
+    /// A Playlist Delta Update was requested from at least one rendition.
+    pub delta_probed: bool,
+    /// A playlist declares EXT-X-KEY.
+    pub has_encryption: bool,
+    /// A playlist carries EXT-X-DATERANGE tags.
+    pub has_dateranges: bool,
+    /// A playlist carries EXT-X-PROGRAM-DATE-TIME tags.
+    pub has_pdt_tags: bool,
+    /// A playlist declares a variable with EXT-X-DEFINE.
+    pub has_defines: bool,
+}
+
+impl RunInputs {
+    /// Everything available, for tests that only care about how findings are grouped.
+    pub fn everything() -> Self {
+        Self {
+            has_master: true,
+            has_iframe_variants: true,
+            playlists: 2,
+            video_playlists: 2,
+            vod_video_playlists: 2,
+            has_interstitials: true,
+            has_low_latency_tags: true,
+            delta_probed: true,
+            has_encryption: true,
+            has_dateranges: true,
+            has_pdt_tags: true,
+            has_defines: true,
+        }
+    }
+
+    /// Read off the playlists a run fetched.
+    pub fn from_run(
+        master: Option<&MasterPlaylist>,
+        playlists: &[MediaPlaylist],
+        delta_probed: bool,
+    ) -> Self {
+        let video: Vec<&MediaPlaylist> = playlists.iter()
+            .filter(|pl| pl.media_type == "VIDEO" && !pl.is_iframe)
+            .collect();
+        Self {
+            has_master: master.is_some(),
+            has_iframe_variants: master.is_some_and(|m| m.variants.iter().any(|v| v.is_iframe)),
+            playlists: playlists.len(),
+            video_playlists: video.len(),
+            vod_video_playlists: video.iter().filter(|pl| pl.has_endlist).count(),
+            has_interstitials: playlists.iter()
+                .any(|pl| pl.raw_content.contains("com.apple.hls.interstitial")),
+            has_low_latency_tags: playlists.iter().any(|pl| {
+                !pl.parts.is_empty() || pl.part_target.is_some() || pl.server_control.is_some()
+            }),
+            delta_probed,
+            has_encryption: playlists.iter().any(|pl| !pl.encryption_methods.is_empty()),
+            has_dateranges: playlists.iter()
+                .any(|pl| pl.raw_content.contains("#EXT-X-DATERANGE:")),
+            has_pdt_tags: playlists.iter().any(|pl| pl.program_date_time_tags > 0),
+            has_defines: master.is_some_and(|m| m.raw_content.contains("#EXT-X-DEFINE:"))
+                || playlists.iter().any(|pl| pl.raw_content.contains("#EXT-X-DEFINE:")),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
