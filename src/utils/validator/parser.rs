@@ -108,6 +108,7 @@ pub fn parse_master_playlist(url: &str, content: &str) -> MasterPlaylist {
                 frame_rate: attrs.get("FRAME-RATE").and_then(|v| v.parse().ok()),
                 audio_group: attrs.get("AUDIO").cloned(),
                 subtitle_group: attrs.get("SUBTITLES").cloned(),
+                video_group: attrs.get("VIDEO").cloned(),
                 closed_captions: attrs.get("CLOSED-CAPTIONS").cloned(),
                 video_range: attrs.get("VIDEO-RANGE").cloned(),
                 is_iframe: false,
@@ -128,6 +129,7 @@ pub fn parse_master_playlist(url: &str, content: &str) -> MasterPlaylist {
                     frame_rate: attrs.get("FRAME-RATE").and_then(|v| v.parse().ok()),
                     audio_group: None,
                     subtitle_group: None,
+                    video_group: None,
                     closed_captions: None,
                     video_range: attrs.get("VIDEO-RANGE").cloned(),
                     is_iframe: true,
@@ -180,6 +182,11 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
     pl.url = url.to_string();
     pl.raw_content = content.to_string();
     let lines: Vec<&str> = content.lines().collect();
+    let pl_label = if pl.name.is_empty() { url.to_string() } else { pl.name.clone() };
+    // A segment URI whose EXTINF is missing or unreadable cannot become a Segment. Rather
+    // than drop the line, note why so the report can show it (rfc8216bis §4.4.4.1).
+    let mut parse_issues: Vec<Issue> = Vec::new();
+    let mut extinf_unreadable = false;
     let mut current_duration: Option<f64> = None;
     let mut current_title: Option<String> = None;
     let mut current_pdt: Option<f64> = None;
@@ -189,7 +196,7 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
     let mut cumulative_duration: f64 = 0.0;
     let mut last_pdt: Option<f64> = None;
 
-    for line in &lines {
+    for (line_no, line) in lines.iter().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -220,7 +227,25 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
             pl.iframes_only = true;
         } else if let Some(val) = line.strip_prefix("#EXTINF:") {
             let comma_pos = val.find(',').unwrap_or(val.len());
-            current_duration = val[..comma_pos].trim().parse::<f64>().ok();
+            let raw_duration = val[..comma_pos].trim();
+            current_duration = raw_duration.parse::<f64>().ok();
+            extinf_unreadable = current_duration.is_none();
+            if extinf_unreadable {
+                parse_issues.push(Issue {
+                    severity: Severity::Error,
+                    check_id: CheckId::SegmentStructure,
+                    segment_index: pl.segments.len() as i32,
+                    rendition_a: Some(pl_label.clone()),
+                    message: format!(
+                        "rfc8216bis §4.4.4.1: EXTINF on line {} of '{}' has duration \
+                         '{}', which is not a decimal-floating-point or decimal-integer \
+                         number. The segment it introduces was skipped and is not \
+                         covered by any other check.",
+                        line_no + 1, pl_label, raw_duration
+                    ),
+                    ..Default::default()
+                });
+            }
             if comma_pos < val.len() {
                 let title = val[comma_pos + 1..].trim();
                 if !title.is_empty() {
@@ -336,9 +361,29 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
                 current_duration = None;
                 current_discontinuity = false;
                 current_pdt = None;
+            } else if extinf_unreadable {
+                // The unreadable EXTINF was already reported; this is the URI it introduced.
+                extinf_unreadable = false;
+            } else {
+                parse_issues.push(Issue {
+                    severity: Severity::Error,
+                    check_id: CheckId::SegmentStructure,
+                    segment_index: pl.segments.len() as i32,
+                    rendition_a: Some(pl_label.clone()),
+                    uri_a: Some(super::absolute_fetch_uri(url, line, &pl.definitions)),
+                    message: format!(
+                        "rfc8216bis §4.4.4.1: Media Segment URI on line {} of '{}' has no \
+                         preceding EXTINF tag. Every Media Segment MUST be introduced by an \
+                         EXTINF tag; this URI was skipped and is not covered by any other check.",
+                        line_no + 1, pl_label
+                    ),
+                    ..Default::default()
+                });
             }
         }
     }
+
+    pl.parse_issues = parse_issues;
 }
 
 /// Parse ISO 8601 datetime string to epoch seconds (basic implementation)
@@ -622,6 +667,87 @@ mod tests {
             &mut pl,
         );
         assert_eq!(pl.segments[0].uri, "https://ex.com/hls/seg0.m4s");
+    }
+
+    // ── parse_media_playlist segment structure ────────────────────────────────
+
+    #[test]
+    fn parse_media_reports_a_segment_uri_with_no_extinf() {
+        let mut pl = MediaPlaylist::new("v1".to_string(), String::new());
+        parse_media_playlist(
+            "https://ex.com/hls/prog.m3u8",
+            "#EXTM3U\n\
+             #EXT-X-TARGETDURATION:4\n\
+             #EXTINF:4.0,\nseg0.m4s\n\
+             seg1.m4s\n\
+             #EXTINF:4.0,\nseg2.m4s\n",
+            &mut pl,
+        );
+        assert_eq!(
+            pl.segments.len(),
+            2,
+            "a URI with no EXTINF cannot become a segment"
+        );
+        assert_eq!(pl.parse_issues.len(), 1, "{:?}", pl.parse_issues);
+        let issue = &pl.parse_issues[0];
+        assert_eq!(issue.severity, Severity::Error);
+        assert_eq!(issue.check_id, CheckId::SegmentStructure);
+        assert!(issue.message.contains("line 5"), "{}", issue.message);
+        assert_eq!(issue.uri_a.as_deref(), Some("https://ex.com/hls/seg1.m4s"));
+    }
+
+    #[test]
+    fn parse_media_reports_an_unreadable_extinf_duration_once() {
+        let mut pl = MediaPlaylist::new("v1".to_string(), String::new());
+        parse_media_playlist(
+            "https://ex.com/hls/prog.m3u8",
+            "#EXTM3U\n\
+             #EXT-X-TARGETDURATION:4\n\
+             #EXTINF:not-a-number,\nseg0.m4s\n\
+             #EXTINF:4.0,\nseg1.m4s\n",
+            &mut pl,
+        );
+        assert_eq!(pl.segments.len(), 1);
+        assert_eq!(
+            pl.parse_issues.len(),
+            1,
+            "the URI that follows must not be reported a second time: {:?}",
+            pl.parse_issues
+        );
+        let issue = &pl.parse_issues[0];
+        assert_eq!(issue.severity, Severity::Error);
+        assert_eq!(issue.check_id, CheckId::SegmentStructure);
+        assert!(issue.message.contains("not-a-number"), "{}", issue.message);
+    }
+
+    #[test]
+    fn parse_media_of_a_well_formed_playlist_raises_nothing() {
+        let mut pl = MediaPlaylist::new("v1".to_string(), String::new());
+        parse_media_playlist(
+            "https://ex.com/hls/prog.m3u8",
+            "#EXTM3U\n\
+             #EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXTINF:4.0,\n\
+             #EXT-X-BYTERANGE:1000@0\n\
+             #EXT-X-PROGRAM-DATE-TIME:2024-01-15T12:00:00Z\n\
+             seg0.m4s\n\
+             #EXT-X-ENDLIST\n",
+            &mut pl,
+        );
+        assert_eq!(pl.segments.len(), 1);
+        assert!(pl.parse_issues.is_empty(), "{:?}", pl.parse_issues);
+    }
+
+    // ── parse_master_playlist rendition group attributes ──────────────────────
+
+    #[test]
+    fn parse_master_reads_the_video_group_of_a_stream_inf() {
+        let master = parse_master_playlist(
+            "https://ex.com/a/master.m3u8",
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000,VIDEO=\"alt-angles\"\nv1/prog.m3u8\n",
+        );
+        assert_eq!(master.variants[0].video_group.as_deref(), Some("alt-angles"));
     }
 
     // ── parse_iso8601_to_epoch ────────────────────────────────────────────────

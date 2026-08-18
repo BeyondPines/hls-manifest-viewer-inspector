@@ -71,9 +71,80 @@ impl std::fmt::Display for Confidence {
     }
 }
 
+/// Which check produced a finding.
+///
+/// Findings used to be routed to their check group in the UI by searching their message
+/// for keywords, so a rule that happened to name `TARGETDURATION` was filed under whichever
+/// keyword matched first and rules matching nothing at all were dropped. The producing check
+/// names itself here instead, and the grouping is a lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum CheckId {
+    /// No check claimed this finding. Reserved for [`Issue`] defaults and for the Author
+    /// section, which groups its own findings by citation; the Validate UI collects these
+    /// into a catch-all group rather than dropping them.
+    #[default]
+    Unassigned,
+    ExtM3uHeader,
+    SingletonTags,
+    TargetDurationCompliance,
+    MediaSequenceTags,
+    DiscontinuitySequence,
+    PlaylistTypeEndlist,
+    EncryptionConsistency,
+    DeltaUpdates,
+    BandwidthRequired,
+    StreamInfConsistency,
+    MediaGroupMembership,
+    RenditionGroupReferences,
+    LivePlaylistWindow,
+    PdtCoverage,
+    PdtAlignment,
+    TargetDurationConsistency,
+    CumulativeDrift,
+    DurationDrift,
+    SegmentCount,
+    VersionCompatibility,
+    LlHls,
+    Interstitials,
+    SegmentStructure,
+    PlaylistFetch,
+}
+
+impl CheckId {
+    /// Every check that can name itself, so the group table can be verified to cover them.
+    pub const ALL: &'static [CheckId] = &[
+        CheckId::ExtM3uHeader,
+        CheckId::SingletonTags,
+        CheckId::TargetDurationCompliance,
+        CheckId::MediaSequenceTags,
+        CheckId::DiscontinuitySequence,
+        CheckId::PlaylistTypeEndlist,
+        CheckId::EncryptionConsistency,
+        CheckId::DeltaUpdates,
+        CheckId::BandwidthRequired,
+        CheckId::StreamInfConsistency,
+        CheckId::MediaGroupMembership,
+        CheckId::RenditionGroupReferences,
+        CheckId::LivePlaylistWindow,
+        CheckId::PdtCoverage,
+        CheckId::PdtAlignment,
+        CheckId::TargetDurationConsistency,
+        CheckId::CumulativeDrift,
+        CheckId::DurationDrift,
+        CheckId::SegmentCount,
+        CheckId::VersionCompatibility,
+        CheckId::LlHls,
+        CheckId::Interstitials,
+        CheckId::SegmentStructure,
+        CheckId::PlaylistFetch,
+    ];
+}
+
 #[derive(Debug, Clone)]
 pub struct Issue {
     pub severity: Severity,
+    /// Which check produced this finding, used to group it in the report.
+    pub check_id: CheckId,
     /// How the evidence for this finding was obtained. Findings default to
     /// [`Confidence::Measured`], which is what every RFC 8216bis check reads.
     pub confidence: Confidence,
@@ -94,6 +165,7 @@ impl Default for Issue {
     fn default() -> Self {
         Self {
             severity: Severity::Warn,
+            check_id: CheckId::Unassigned,
             confidence: Confidence::Measured,
             segment_index: -1,
             rendition_a: None,
@@ -111,72 +183,26 @@ impl Default for Issue {
 
 impl Issue {
     pub fn error(message: String) -> Self {
-        Self {
-            severity: Severity::Error,
-            confidence: Confidence::Measured,
-            segment_index: -1,
-            rendition_a: None,
-            rendition_b: None,
-            uri_a: None,
-            uri_b: None,
-            message,
-            uri_note: None,
-            count: 1,
-            seg_first: -1,
-            seg_last: -1,
-        }
+        Self { severity: Severity::Error, message, ..Default::default() }
     }
 
     pub fn warn(message: String) -> Self {
-        Self {
-            severity: Severity::Warn,
-            confidence: Confidence::Measured,
-            segment_index: -1,
-            rendition_a: None,
-            rendition_b: None,
-            uri_a: None,
-            uri_b: None,
-            message,
-            uri_note: None,
-            count: 1,
-            seg_first: -1,
-            seg_last: -1,
-        }
+        Self { severity: Severity::Warn, message, ..Default::default() }
     }
 
     pub fn info(message: String) -> Self {
-        Self {
-            severity: Severity::Info,
-            confidence: Confidence::Measured,
-            segment_index: -1,
-            rendition_a: None,
-            rendition_b: None,
-            uri_a: None,
-            uri_b: None,
-            message,
-            uri_note: None,
-            count: 1,
-            seg_first: -1,
-            seg_last: -1,
-        }
+        Self { severity: Severity::Info, message, ..Default::default() }
     }
 
     /// Create an issue with common fields, defaulting consolidation fields
     pub fn new(severity: Severity, segment_index: i32, message: String) -> Self {
-        Self {
-            severity,
-            confidence: Confidence::Measured,
-            segment_index,
-            rendition_a: None,
-            rendition_b: None,
-            uri_a: None,
-            uri_b: None,
-            message,
-            uri_note: None,
-            count: 1,
-            seg_first: -1,
-            seg_last: -1,
-        }
+        Self { severity, segment_index, message, ..Default::default() }
+    }
+
+    /// Name the check that produced this finding, so the report can group it.
+    pub fn for_check(mut self, check_id: CheckId) -> Self {
+        self.check_id = check_id;
+        self
     }
 
     /// Record how the evidence for this finding was obtained, keeping the severity the
@@ -252,6 +278,10 @@ pub struct MediaPlaylist {
     pub http_meta: PlaylistHttpMeta,
     /// Distinct EXT-X-MAP tags in playlist order (for init probing).
     pub init_maps: Vec<InitMap>,
+    /// Findings raised while parsing this playlist, e.g. a segment URI whose EXTINF is
+    /// missing or unparseable. The parser cannot represent such a segment, so it records
+    /// why here instead of dropping the line without a trace.
+    pub parse_issues: Vec<Issue>,
 }
 
 /// One EXT-X-MAP tag: the URI and BYTERANGE that were written together.
@@ -326,6 +356,7 @@ impl MediaPlaylist {
             pathway_id: None,
             http_meta: PlaylistHttpMeta::default(),
             init_maps: Vec::new(),
+            parse_issues: Vec::new(),
         }
     }
 }
@@ -357,6 +388,8 @@ pub struct MasterRendition {
     pub frame_rate: Option<f64>,
     pub audio_group: Option<String>,
     pub subtitle_group: Option<String>,
+    /// VIDEO attribute of EXT-X-STREAM-INF: the GROUP-ID of an alternative video group.
+    pub video_group: Option<String>,
     pub closed_captions: Option<String>,
     pub video_range: Option<String>,
     pub is_iframe: bool,

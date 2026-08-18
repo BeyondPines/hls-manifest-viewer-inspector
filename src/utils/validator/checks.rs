@@ -1,6 +1,19 @@
 use std::collections::{HashMap, HashSet};
 use super::types::*;
 
+/// Record `id` as the producer of every finding that has not already named its own check.
+///
+/// Findings are grouped in the report by the check that raised them, so a check that
+/// returns without naming itself would land in the catch-all group.
+fn produced_by(id: CheckId, mut issues: Vec<Issue>) -> Vec<Issue> {
+    for issue in &mut issues {
+        if issue.check_id == CheckId::Unassigned {
+            issue.check_id = id;
+        }
+    }
+    issues
+}
+
 /// RFC 8216bis §4.4.1.1 — EXTM3U must be first line
 pub fn check_extm3u_header(playlists: &[MediaPlaylist]) -> Vec<Issue> {
     let mut issues = Vec::new();
@@ -24,7 +37,128 @@ pub fn check_extm3u_header(playlists: &[MediaPlaylist]) -> Vec<Issue> {
             });
         }
     }
+    produced_by(CheckId::ExtM3uHeader, issues)
+}
+
+/// RFC 8216bis §4.4.1.1, §4.4.1.2, §4.4.2 — structural checks on the Multivariant Playlist.
+///
+/// The multivariant playlist used to be read only for its variant attributes, so a
+/// multivariant playlist that was missing #EXTM3U, repeated a singleton tag or used
+/// variable substitution below its declared version passed without comment.
+pub fn check_master_structure(master: &MasterPlaylist) -> Vec<Issue> {
+    let mut issues = Vec::new();
+    let label = if master.url.is_empty() { "multivariant playlist" } else { master.url.as_str() };
+
+    let first_line = master.raw_content.lines().next().unwrap_or("");
+    if first_line.trim() != "#EXTM3U" {
+        issues.push(Issue {
+            severity: Severity::Error,
+            check_id: CheckId::ExtM3uHeader,
+            message: format!(
+                "RFC 8216bis §4.4.1.1: Multivariant Playlist '{}' does not start with \
+                 #EXTM3U. First line: '{}'",
+                label, first_line
+            ),
+            uri_a: Some(master.url.clone()),
+            ..Default::default()
+        });
+    }
+
+    // §4.4.1.2 EXT-X-VERSION, §4.4.2.1 EXT-X-INDEPENDENT-SEGMENTS, §4.4.2.2 EXT-X-START.
+    for tag in ["#EXT-X-VERSION:", "#EXT-X-INDEPENDENT-SEGMENTS", "#EXT-X-START:"] {
+        let count = master.raw_content.lines().filter(|l| l.trim().starts_with(tag)).count();
+        if count > 1 {
+            issues.push(Issue {
+                severity: Severity::Error,
+                check_id: CheckId::SingletonTags,
+                message: format!(
+                    "RFC 8216bis §4.4.1.2/§4.4.2: Singleton tag '{}' appears {} times in \
+                     Multivariant Playlist '{}'. It MUST appear at most once.",
+                    tag.trim_end_matches(':'), count, label
+                ),
+                uri_a: Some(master.url.clone()),
+                ..Default::default()
+            });
+        }
+    }
+
+    // §8: variable substitution requires VERSION >= 8.
+    if master.version < 8 && master.raw_content.contains("#EXT-X-DEFINE:") {
+        issues.push(Issue {
+            severity: Severity::Error,
+            check_id: CheckId::VersionCompatibility,
+            message: format!(
+                "RFC 8216bis §8: Multivariant Playlist '{}' uses EXT-X-DEFINE \
+                 (variable substitution) which requires VERSION >= 8. Declared version: {}.",
+                label, master.version
+            ),
+            uri_a: Some(master.url.clone()),
+            ..Default::default()
+        });
+    }
+
     issues
+}
+
+/// RFC 8216bis §4.4.6.2 — every AUDIO, SUBTITLES, CLOSED-CAPTIONS and VIDEO attribute on
+/// EXT-X-STREAM-INF MUST match the GROUP-ID of an EXT-X-MEDIA tag of that TYPE.
+pub fn check_rendition_group_references(master: &MasterPlaylist) -> Vec<Issue> {
+    let mut issues = Vec::new();
+
+    let group_ids = |media_type: &str| -> HashSet<&str> {
+        master.media_renditions.iter()
+            .filter(|r| r.media_type == media_type)
+            .map(|r| r.group_id.as_str())
+            .collect()
+    };
+    let audio_groups = group_ids("AUDIO");
+    let subtitle_groups = group_ids("SUBTITLES");
+    let caption_groups = group_ids("CLOSED-CAPTIONS");
+    let video_groups = group_ids("VIDEO");
+
+    for v in &master.variants {
+        let refs: [(&str, Option<&str>, &HashSet<&str>); 4] = [
+            ("AUDIO", v.audio_group.as_deref(), &audio_groups),
+            ("SUBTITLES", v.subtitle_group.as_deref(), &subtitle_groups),
+            // CLOSED-CAPTIONS=NONE is an enumerated string, not a group reference.
+            (
+                "CLOSED-CAPTIONS",
+                v.closed_captions.as_deref().filter(|c| *c != "NONE"),
+                &caption_groups,
+            ),
+            ("VIDEO", v.video_group.as_deref(), &video_groups),
+        ];
+        for (attr, referenced, defined) in refs {
+            let Some(group) = referenced else { continue };
+            if defined.contains(group) {
+                continue;
+            }
+            let known = {
+                let mut names: Vec<&str> = defined.iter().copied().collect();
+                names.sort_unstable();
+                if names.is_empty() { "(none)".to_string() } else { names.join(", ") }
+            };
+            issues.push(Issue {
+                severity: Severity::Error,
+                segment_index: -1,
+                rendition_a: None,
+                rendition_b: None,
+                uri_a: Some(v.uri.clone()),
+                uri_b: None,
+                message: format!(
+                    "rfc8216bis §4.4.6.2: EXT-X-STREAM-INF for URI '{}' has {}=\"{}\" but no \
+                     EXT-X-MEDIA tag with TYPE={} declares that GROUP-ID. The attribute value \
+                     MUST match the GROUP-ID of a Rendition Group of that type \
+                     (declared {} groups: {}).",
+                    v.uri, attr, group, attr, attr, known
+                ),
+                uri_note: None,
+                ..Default::default()
+            });
+        }
+    }
+
+    produced_by(CheckId::RenditionGroupReferences, issues)
 }
 
 /// RFC 8216bis §4.4.3.1 — TARGETDURATION presence, per-segment compliance, and accuracy.
@@ -96,7 +230,7 @@ pub fn check_target_duration_compliance(playlists: &[MediaPlaylist]) -> Vec<Issu
             }
         }
     }
-    issues
+    produced_by(CheckId::TargetDurationCompliance, issues)
 }
 
 /// RFC 8216bis §6.2.4 — PDT coverage: if any segment has PDT, all should
@@ -127,7 +261,7 @@ pub fn check_pdt_coverage(playlists: &[MediaPlaylist]) -> Vec<Issue> {
             });
         }
     }
-    issues
+    produced_by(CheckId::PdtCoverage, issues)
 }
 
 /// RFC 8216bis §4.4.1.2, §4.4.2, §4.4.3 — Singleton tags must not appear more than once.
@@ -159,8 +293,8 @@ pub fn check_media_sequence_duplicate_tags(playlists: &[MediaPlaylist]) -> Vec<I
                     uri_a: None,
                     uri_b: None,
                     message: format!(
-                        "RFC 8216bis §4.4.3.2: Singleton tag '{}' appears {} times in '{}'. \
-                         It MUST appear at most once.",
+                        "RFC 8216bis §4.4.1.2/§4.4.3: Singleton tag '{}' appears {} times in \
+                         '{}'. It MUST appear at most once.",
                         tag.trim_end_matches(':'), count, pl.name
                     ),
                     uri_note: None,
@@ -169,126 +303,133 @@ pub fn check_media_sequence_duplicate_tags(playlists: &[MediaPlaylist]) -> Vec<I
             }
         }
     }
-    issues
+    produced_by(CheckId::SingletonTags, issues)
 }
 
-/// RFC 8216bis §4.4.6.2 — CODECS consistency for same URI
-pub fn check_codecs_attribute(master: &MasterPlaylist) -> Vec<Issue> {
+/// RFC 8216bis §4.4.6.2, §6.2.4 — consistency of EXT-X-STREAM-INF tags that share a URI.
+///
+/// A Variant Stream is the combination of a URI and the Rendition Groups it pairs with, so
+/// two STREAM-INF tags that share a URI but name different AUDIO, SUBTITLES or
+/// CLOSED-CAPTIONS groups are different Variant Streams and their CODECS and BANDWIDTH are
+/// expected to differ. Only entries that agree on all of those attributes are compared for
+/// CODECS and BANDWIDTH, and a mismatch there is reported as a warning: the spec's
+/// requirement is on what the attributes describe, and a player reads them per entry.
+///
+/// The video codec is different. §6.2.4 requires every Variant Stream of a presentation to
+/// carry the same video encoding, so the same media URI described with two different video
+/// codecs is a contradiction no choice of audio can explain, and that stays an error.
+pub fn check_stream_inf_consistency(master: &MasterPlaylist) -> Vec<Issue> {
     let mut issues = Vec::new();
-    // Group variants by URI
-    let mut uri_groups: HashMap<String, Vec<&MasterRendition>> = HashMap::new();
-    for v in &master.variants {
-        uri_groups.entry(v.uri.clone()).or_default().push(v);
+
+    // URI plus everything that makes two STREAM-INF entries the same Variant Stream.
+    type VariantKey<'a> =
+        (&'a str, Option<&'a str>, Option<&'a str>, Option<&'a str>, Option<&'a str>);
+    fn variant_key(v: &MasterRendition) -> VariantKey<'_> {
+        (
+            v.uri.as_str(),
+            v.audio_group.as_deref(),
+            v.subtitle_group.as_deref(),
+            v.closed_captions.as_deref(),
+            v.video_group.as_deref(),
+        )
     }
-    for (uri, variants) in &uri_groups {
+    // First comma-separated token of a CODECS string: the video codec.
+    fn video_codec(codecs: &str) -> &str {
+        codecs.split(',').next().unwrap_or(codecs).trim()
+    }
+
+    let mut by_variant: HashMap<VariantKey<'_>, Vec<&MasterRendition>> = HashMap::new();
+    let mut by_uri: HashMap<&str, Vec<&MasterRendition>> = HashMap::new();
+    for v in &master.variants {
+        by_variant.entry(variant_key(v)).or_default().push(v);
+        by_uri.entry(v.uri.as_str()).or_default().push(v);
+    }
+
+    for ((uri, audio, subtitles, captions, video), variants) in &by_variant {
         if variants.len() < 2 {
             continue;
         }
+        let groups = format!(
+            "AUDIO={}, SUBTITLES={}, CLOSED-CAPTIONS={}, VIDEO={}",
+            audio.unwrap_or("(none)"),
+            subtitles.unwrap_or("(none)"),
+            captions.unwrap_or("(none)"),
+            video.unwrap_or("(none)")
+        );
 
-        // When the same video URI is referenced with different AUDIO groups the
-        // CODECS string legitimately includes the paired audio codec and will
-        // therefore differ across entries.  Only flag a CODECS mismatch when
-        // the entries share the same AUDIO group (or both have none), meaning
-        // the difference cannot be explained by alternative audio renditions.
-        let audio_groups_differ = {
-            let audio_set: HashSet<Option<&str>> = variants.iter()
-                .map(|v| v.audio_group.as_deref())
+        let codecs_set: HashSet<Option<&str>> = variants.iter().map(|v| v.codecs.as_deref()).collect();
+        if codecs_set.len() > 1 {
+            let details: Vec<String> = variants.iter()
+                .map(|v| format!("CODECS={}", v.codecs.as_deref().unwrap_or("(none)")))
                 .collect();
-            audio_set.len() > 1
-        };
-
-        if !audio_groups_differ {
-            // Same audio group → CODECS must be identical
-            let codecs_set: HashSet<Option<&str>> = variants.iter()
-                .map(|v| v.codecs.as_deref())
-                .collect();
-            if codecs_set.len() > 1 {
-                let details: Vec<String> = variants.iter()
-                    .map(|v| format!("CODECS={}", v.codecs.as_deref().unwrap_or("(none)")))
-                    .collect();
-                issues.push(Issue {
-                    severity: Severity::Error,
-                    segment_index: -1,
-                    rendition_a: None,
-                    rendition_b: None,
-                    uri_a: Some(uri.clone()),
-                    uri_b: None,
-                    message: format!(
-                        "RFC 8216bis §4.4.5.2: Multiple EXT-X-STREAM-INF tags share URI '{}' \
-                         and the same AUDIO group but have different CODECS values: {}. \
-                         They MUST match.",
-                        uri, details.join(", ")
-                    ),
-                    uri_note: None,
-                    ..Default::default()
-                });
-            }
-        } else {
-            // Different audio groups → only flag if the VIDEO codec portion differs.
-            // The video codec is the first comma-separated token in the CODECS string.
-            let video_codec_set: HashSet<&str> = variants.iter()
-                .filter_map(|v| v.codecs.as_deref())
-                .map(|c| c.split(',').next().unwrap_or(c).trim())
-                .collect();
-            if video_codec_set.len() > 1 {
-                let details: Vec<String> = variants.iter()
-                    .map(|v| format!(
-                        "AUDIO={} CODECS={}",
-                        v.audio_group.as_deref().unwrap_or("(none)"),
-                        v.codecs.as_deref().unwrap_or("(none)")
-                    ))
-                    .collect();
-                issues.push(Issue {
-                    severity: Severity::Error,
-                    segment_index: -1,
-                    rendition_a: None,
-                    rendition_b: None,
-                    uri_a: Some(uri.clone()),
-                    uri_b: None,
-                    message: format!(
-                        "RFC 8216bis §4.4.5.2: Multiple EXT-X-STREAM-INF tags share URI '{}' \
-                         with different AUDIO groups but also have mismatched video codecs: {}.",
-                        uri, details.join(", ")
-                    ),
-                    uri_note: None,
-                    ..Default::default()
-                });
-            }
+            issues.push(Issue {
+                severity: Severity::Warn,
+                uri_a: Some((*uri).to_string()),
+                message: format!(
+                    "rfc8216bis §4.4.6.2: Multiple EXT-X-STREAM-INF tags share URI '{}' and the \
+                     same Rendition Groups ({}) but declare different CODECS values: {}. \
+                     One of them misdescribes what the URI contains.",
+                    uri, groups, details.join(", ")
+                ),
+                ..Default::default()
+            });
         }
 
-        // BANDWIDTH consistency: all entries for the same URI+audio_group must agree.
-        // Group by audio_group first, then check bandwidth within each group.
-        let mut by_audio: HashMap<Option<&str>, Vec<&MasterRendition>> = HashMap::new();
-        for v in variants {
-            by_audio.entry(v.audio_group.as_deref()).or_default().push(v);
-        }
-        for (audio_grp, grp_variants) in &by_audio {
-            let bw_set: HashSet<Option<u64>> = grp_variants.iter().map(|v| v.bandwidth).collect();
-            if bw_set.len() > 1 {
-                let details: Vec<String> = grp_variants.iter()
-                    .map(|v| format!("BANDWIDTH={}", v.bandwidth.map_or("(none)".to_string(), |b| b.to_string())))
-                    .collect();
-                issues.push(Issue {
-                    severity: Severity::Error,
-                    segment_index: -1,
-                    rendition_a: None,
-                    rendition_b: None,
-                    uri_a: Some(uri.clone()),
-                    uri_b: None,
-                    message: format!(
-                        "RFC 8216bis §4.4.5.2: Multiple EXT-X-STREAM-INF tags share URI '{}' \
-                         (AUDIO={}) but have different BANDWIDTH values: {}. They MUST match.",
-                        uri,
-                        audio_grp.unwrap_or("(none)"),
-                        details.join(", ")
-                    ),
-                    uri_note: None,
-                    ..Default::default()
-                });
-            }
+        let bw_set: HashSet<Option<u64>> = variants.iter().map(|v| v.bandwidth).collect();
+        if bw_set.len() > 1 {
+            let details: Vec<String> = variants.iter()
+                .map(|v| format!(
+                    "BANDWIDTH={}",
+                    v.bandwidth.map_or("(none)".to_string(), |b| b.to_string())
+                ))
+                .collect();
+            issues.push(Issue {
+                severity: Severity::Warn,
+                uri_a: Some((*uri).to_string()),
+                message: format!(
+                    "rfc8216bis §4.4.6.2: Multiple EXT-X-STREAM-INF tags share URI '{}' and the \
+                     same Rendition Groups ({}) but declare different BANDWIDTH values: {}. \
+                     BANDWIDTH is the peak bit rate of the same media in each case.",
+                    uri, groups, details.join(", ")
+                ),
+                ..Default::default()
+            });
         }
     }
-    issues
+
+    // Across all entries for a URI, the video codec cannot depend on the audio group.
+    for (uri, variants) in &by_uri {
+        if variants.len() < 2 {
+            continue;
+        }
+        let video_codecs: HashSet<&str> = variants.iter()
+            .filter_map(|v| v.codecs.as_deref())
+            .map(video_codec)
+            .collect();
+        if video_codecs.len() > 1 {
+            let details: Vec<String> = variants.iter()
+                .map(|v| format!(
+                    "AUDIO={} CODECS={}",
+                    v.audio_group.as_deref().unwrap_or("(none)"),
+                    v.codecs.as_deref().unwrap_or("(none)")
+                ))
+                .collect();
+            issues.push(Issue {
+                severity: Severity::Error,
+                uri_a: Some((*uri).to_string()),
+                message: format!(
+                    "rfc8216bis §6.2.4: Multiple EXT-X-STREAM-INF tags share URI '{}' but \
+                     declare different video codecs: {}. The same media cannot be encoded two \
+                     ways, and every Variant Stream of a presentation MUST use the same video \
+                     encoding.",
+                    uri, details.join(", ")
+                ),
+                ..Default::default()
+            });
+        }
+    }
+
+    produced_by(CheckId::StreamInfConsistency, issues)
 }
 
 /// RFC 8216bis §4.4.6.2 — BANDWIDTH is a REQUIRED attribute on EXT-X-STREAM-INF.
@@ -313,7 +454,7 @@ pub fn check_bandwidth_required(master: &MasterPlaylist) -> Vec<Issue> {
             });
         }
     }
-    issues
+    produced_by(CheckId::BandwidthRequired, issues)
 }
 
 /// RFC 8216bis §4.4.6.1.1 — When a Playlist contains multiple Groups of the same TYPE,
@@ -368,7 +509,7 @@ pub fn check_media_group_membership(master: &MasterPlaylist) -> Vec<Issue> {
             });
         }
     }
-    issues
+    produced_by(CheckId::MediaGroupMembership, issues)
 }
 
 /// RFC 8216bis §8 — Version compatibility
@@ -436,23 +577,33 @@ pub fn check_version_compatibility(playlists: &[MediaPlaylist]) -> Vec<Issue> {
                 ..Default::default()
             });
         }
-        // EXT-X-MAP requires v5+ (unless I-frames-only, which requires v4+)
-        if v < 5 && content.contains("#EXT-X-MAP:") && !content.contains("#EXT-X-I-FRAMES-ONLY") {
-            issues.push(Issue {
-                severity: Severity::Error,
-                segment_index: -1,
-                rendition_a: Some(pl.name.clone()),
-                rendition_b: None,
-                uri_a: None,
-                uri_b: None,
-                message: format!(
-                    "RFC 8216bis §8: '{}' uses EXT-X-MAP without I-FRAMES-ONLY \
-                     which requires VERSION >= 5. Declared version: {}.",
-                    pl.name, v
-                ),
-                uri_note: None,
-                ..Default::default()
-            });
+        // §8: EXT-X-MAP needs v6 on its own, and v5 in an I-frames-only playlist.
+        if content.contains("#EXT-X-MAP:") {
+            let iframes_only = content.contains("#EXT-X-I-FRAMES-ONLY");
+            let required = if iframes_only { 5 } else { 6 };
+            if v < required {
+                issues.push(Issue {
+                    severity: Severity::Error,
+                    segment_index: -1,
+                    rendition_a: Some(pl.name.clone()),
+                    rendition_b: None,
+                    uri_a: None,
+                    uri_b: None,
+                    message: format!(
+                        "RFC 8216bis §8: '{}' uses EXT-X-MAP {} which requires \
+                         VERSION >= {}. Declared version: {}.",
+                        pl.name,
+                        if iframes_only {
+                            "in a playlist with EXT-X-I-FRAMES-ONLY"
+                        } else {
+                            "without EXT-X-I-FRAMES-ONLY"
+                        },
+                        required, v
+                    ),
+                    uri_note: None,
+                    ..Default::default()
+                });
+            }
         }
         // EXT-X-SKIP requires v9+
         if v < 9 && content.contains("#EXT-X-SKIP:") {
@@ -473,7 +624,7 @@ pub fn check_version_compatibility(playlists: &[MediaPlaylist]) -> Vec<Issue> {
             });
         }
     }
-    issues
+    produced_by(CheckId::VersionCompatibility, issues)
 }
 
 /// RFC 8216 §6.2.2 — Live playlists must have >= 3 segments
@@ -502,36 +653,45 @@ pub fn check_live_playlist_min_segments(playlists: &[MediaPlaylist]) -> Vec<Issu
             });
         }
     }
-    issues
+    produced_by(CheckId::LivePlaylistWindow, issues)
 }
 
 
-/// RFC 8216 §6.2.4 — TARGETDURATION consistency across renditions
+/// RFC 8216bis §6.2.4 — every Media Playlist of a presentation MUST have the same
+/// TARGETDURATION, so that a client switching renditions keeps the same reload interval.
+///
+/// The spec's own exception is for trick-play: an I-frame playlist with
+/// EXT-X-PLAYLIST-TYPE:VOD may use a different target duration, so those renditions are
+/// excluded from the comparison rather than counted against it.
 pub fn check_targetduration_consistency(playlists: &[MediaPlaylist]) -> Vec<Issue> {
     let mut issues = Vec::new();
     if playlists.len() < 2 {
         return issues;
     }
-    let td_values: HashMap<&str, f64> = playlists.iter()
-        .filter(|pl| pl.target_duration > 0.0)
+    let is_vod_iframe_playlist = |pl: &MediaPlaylist| {
+        (pl.iframes_only || pl.is_iframe) && pl.playlist_type.as_deref() == Some("VOD")
+    };
+    let td_values: Vec<(&str, f64)> = playlists.iter()
+        .filter(|pl| pl.target_duration > 0.0 && !is_vod_iframe_playlist(pl))
         .map(|pl| (pl.name.as_str(), pl.target_duration))
         .collect();
-    if td_values.is_empty() {
+    if td_values.len() < 2 {
         return issues;
     }
-    let unique_tds: HashSet<u64> = td_values.values().map(|&v| v as u64).collect();
+    let unique_tds: HashSet<u64> = td_values.iter().map(|(_, v)| *v as u64).collect();
     if unique_tds.len() > 1 {
         let td_summary: Vec<String> = td_values.iter()
             .map(|(name, td)| format!("{}={:.0}s", name, td))
             .collect();
-        issues.push(Issue::warn(format!(
-            "RFC 8216 §6.2.4: EXT-X-TARGETDURATION values differ across renditions \
-             ({} distinct values). All Media Playlists SHOULD share the same \
-             TARGETDURATION. Details: {}",
+        issues.push(Issue::error(format!(
+            "rfc8216bis §6.2.4: EXT-X-TARGETDURATION values differ across renditions \
+             ({} distinct values). Every Media Playlist of a presentation MUST declare the \
+             same TARGETDURATION, apart from I-frame playlists with PLAYLIST-TYPE:VOD, which \
+             are excluded here. Details: {}",
             unique_tds.len(), td_summary.join(", ")
         )));
     }
-    issues
+    produced_by(CheckId::TargetDurationConsistency, issues)
 }
 
 /// RFC 8216bis §4.4.3.5 — PLAYLIST-TYPE / ENDLIST consistency.
@@ -565,10 +725,13 @@ pub fn check_playlist_type_endlist(playlists: &[MediaPlaylist]) -> Vec<Issue> {
             _ => {}
         }
     }
-    issues
+    produced_by(CheckId::PlaylistTypeEndlist, issues)
 }
 
-/// RFC 8216bis §4.4.4.4 — Encryption consistency across renditions
+/// RFC 8216bis §4.4.4.4 — Encryption consistency across renditions.
+///
+/// Only playlists that declare an EXT-X-KEY are compared, so a rendition with no EXT-X-KEY at
+/// all is absent from the comparison rather than being counted as METHOD=NONE.
 pub fn check_encryption_consistency(playlists: &[MediaPlaylist]) -> Vec<Issue> {
     let mut issues = Vec::new();
     let method_map: HashMap<&str, &HashSet<String>> = playlists.iter()
@@ -601,17 +764,26 @@ pub fn check_encryption_consistency(playlists: &[MediaPlaylist]) -> Vec<Issue> {
             }
         }
     }
+    // Renditions that differ in encryption method are worth reporting, but this is a
+    // warning: the spec's requirement is that each Media Segment can be decrypted from its
+    // own playlist, and a presentation that encrypts video while leaving, say, a subtitle
+    // or I-frame rendition clear is deployed deliberately and plays.
     if all_methods.len() > 1 {
-        issues.push(Issue::error(format!(
-            "RFC 8216bis §6.2.4: Renditions use inconsistent encryption methods: {:?}. \
-             All renditions SHOULD use the same encryption method.",
-            all_methods
+        let mut sorted: Vec<&str> = all_methods.iter().copied().collect();
+        sorted.sort_unstable();
+        issues.push(Issue::warn(format!(
+            "rfc8216bis §4.4.4.4: Renditions declare different EXT-X-KEY METHOD values: {}. \
+             Check this is intended — a client that can decrypt one rendition may not be able \
+             to switch to another.",
+            sorted.join(", ")
         )));
     }
-    issues
+    produced_by(CheckId::EncryptionConsistency, issues)
 }
 
-/// Discontinuity sequence consistency across renditions
+/// RFC 8216bis §6.2.4 — EXT-X-DISCONTINUITY-SEQUENCE MUST match across the renditions of a
+/// presentation, because a client synchronises renditions by discontinuity sequence number
+/// before it can align their timelines.
 pub fn check_discontinuity_sequence(playlists: &[MediaPlaylist]) -> Vec<Issue> {
     let mut issues = Vec::new();
     if playlists.len() < 2 {
@@ -622,13 +794,14 @@ pub fn check_discontinuity_sequence(playlists: &[MediaPlaylist]) -> Vec<Issue> {
         let details: Vec<String> = playlists.iter()
             .map(|pl| format!("{}={}", pl.name, pl.discontinuity_sequence))
             .collect();
-        issues.push(Issue::warn(format!(
-            "EXT-X-DISCONTINUITY-SEQUENCE values differ across renditions: {}. \
-             They SHOULD be consistent for synchronized playback.",
+        issues.push(Issue::error(format!(
+            "rfc8216bis §6.2.4: EXT-X-DISCONTINUITY-SEQUENCE values differ across renditions: \
+             {}. Renditions of the same presentation MUST carry matching discontinuity \
+             sequence numbers so clients can align their timelines.",
             details.join(", ")
         )));
     }
-    issues
+    produced_by(CheckId::DiscontinuitySequence, issues)
 }
 
 /// Segment count comparison across renditions (non-live)
@@ -657,7 +830,7 @@ pub fn check_segment_count(playlists: &[MediaPlaylist]) -> Vec<Issue> {
             details.join(", ")
         )));
     }
-    issues
+    produced_by(CheckId::SegmentCount, issues)
 }
 
 /// EXTINF duration drift between renditions (MSN-aligned)
@@ -703,7 +876,7 @@ pub fn check_duration_drift(playlists: &[MediaPlaylist], tolerance_ms: f64) -> V
             }
         }
     }
-    issues
+    produced_by(CheckId::DurationDrift, issues)
 }
 
 /// PDT alignment across renditions (MSN-aligned)
@@ -749,7 +922,7 @@ pub fn check_pdt_alignment(playlists: &[MediaPlaylist], tolerance_ms: f64) -> Ve
             }
         }
     }
-    issues
+    produced_by(CheckId::PdtAlignment, issues)
 }
 
 /// Cumulative EXTINF drift across renditions
@@ -811,7 +984,7 @@ pub fn check_cumulative_drift(playlists: &[MediaPlaylist], tolerance_ms: f64) ->
             details.join(", ")
         )));
     }
-    issues
+    produced_by(CheckId::CumulativeDrift, issues)
 }
 
 /// MSN-aligned segment pairing helper
@@ -868,10 +1041,12 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
             });
         }
 
-        // 2. CAN-BLOCK-RELOAD=YES required when parts exist
-        if has_parts {
-            let can_block = pl.server_control.as_ref().is_some_and(|sc| sc.can_block_reload);
-            if !can_block {
+        // 2. PART-HOLD-BACK is REQUIRED once EXT-X-PART-INF is present (§4.4.3.8): it is
+        //    what tells a client how far from the live edge it may start playing parts.
+        if has_part_inf {
+            let has_part_hold_back = pl.server_control.as_ref()
+                .is_some_and(|sc| sc.part_hold_back.is_some());
+            if !has_part_hold_back {
                 issues.push(Issue {
                     severity: Severity::Error,
                     segment_index: -1,
@@ -880,8 +1055,9 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
                     uri_a: None,
                     uri_b: None,
                     message: format!(
-                        "LL-HLS §4.4.3.8: '{}' has EXT-X-PART tags but EXT-X-SERVER-CONTROL \
-                         CAN-BLOCK-RELOAD=YES is absent. This is REQUIRED for low-latency delivery.",
+                        "rfc8216bis §4.4.3.8: '{}' declares EXT-X-PART-INF but \
+                         EXT-X-SERVER-CONTROL has no PART-HOLD-BACK. The attribute is REQUIRED \
+                         when the playlist contains EXT-X-PART-INF.",
                         pl.name
                     ),
                     uri_note: None,
@@ -913,42 +1089,7 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
             }
         }
 
-        // 4. First EXT-X-PART of every parent segment MUST carry INDEPENDENT=YES
-        {
-            let mut pending_independent: Vec<bool> = Vec::new();
-            let mut seg_idx: usize = 0;
-            for line in pl.raw_content.lines() {
-                let l = line.trim();
-                if let Some(rest) = l.strip_prefix("#EXT-X-PART:") {
-                    let attrs = super::parser::parse_attributes(rest);
-                    let indep = attrs.get("INDEPENDENT").is_some_and(|v| v == "YES");
-                    pending_independent.push(indep);
-                } else if l.starts_with("#EXTINF:") {
-                    if let Some(&first_indep) = pending_independent.first()
-                        && !first_indep {
-                            issues.push(Issue {
-                                severity: Severity::Error,
-                                segment_index: seg_idx as i32,
-                                rendition_a: Some(pl.name.clone()),
-                                rendition_b: None,
-                                uri_a: None,
-                                uri_b: None,
-                                message: format!(
-                                    "LL-HLS §4.4.4.9: First EXT-X-PART before segment {} in '{}' \
-                                     must carry INDEPENDENT=YES.",
-                                    seg_idx, pl.name
-                                ),
-                                uri_note: None,
-                                ..Default::default()
-                            });
-                        }
-                    pending_independent.clear();
-                    seg_idx += 1;
-                }
-            }
-        }
-
-        // 5. EXT-X-PRELOAD-HINT with TYPE=PART should be present at playlist tail
+        // 4. EXT-X-PRELOAD-HINT with TYPE=PART should be present at playlist tail
         if has_parts {
             let has_part_hint = pl.preload_hint_uri.is_some()
                 && pl.preload_hint_type.as_deref() == Some("PART");
@@ -1134,84 +1275,52 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
         }
     }
 
-    issues
+    produced_by(CheckId::LlHls, issues)
 }
 
-/// Extract an MSN embedded in a segment URI filename.
+/// rfc8216bis §4.4.3.2 — EXT-X-MEDIA-SEQUENCE presence and position.
 ///
-/// Supports two common CDN patterns:
-///   1. Purely numeric filename:  …/151674692.m4v
-///   2. Hyphenated CDN pattern:   …/20260715T225158-151674692-03-ts.m4v
-///      (MSN is the second hyphen-delimited field when it is ≥ 6 digits)
-fn extract_msn_from_uri(uri: &str) -> Option<u64> {
-    let filename = uri.rsplit('/').next().unwrap_or("").split('.').next().unwrap_or("");
-    if !filename.is_empty() && filename.chars().all(|c| c.is_ascii_digit()) {
-        return filename.parse().ok();
-    }
-    let parts: Vec<&str> = filename.split('-').collect();
-    if parts.len() >= 2
-        && parts[1].chars().all(|c| c.is_ascii_digit())
-        && parts[1].len() >= 6
-    {
-        return parts[1].parse().ok();
-    }
-    None
-}
-
-/// rfc8216bis §4.4.3.2 — EXT-X-MEDIA-SEQUENCE presence, ordering, and URI-MSN consistency
+/// Nothing here reads a number out of a segment URI. §4.4.3.2 defines the Media Sequence
+/// Number of the first segment as the value of this tag and nothing else; segment file names
+/// are free-form, so an MSN inferred from one says nothing about conformance.
 pub fn check_media_sequence_continuity(playlists: &[MediaPlaylist]) -> Vec<Issue> {
     let mut issues = Vec::new();
     for pl in playlists {
-        let segs = &pl.segments;
-        if segs.is_empty() { continue; }
+        if pl.segments.is_empty() { continue; }
 
-        let tag_absent = pl.media_sequence == 0
-            && !pl.raw_content.contains("#EXT-X-MEDIA-SEQUENCE:");
-
-        if tag_absent {
-            if !pl.has_endlist && segs.len() > 1 {
-                issues.push(Issue::warn(format!(
-                    "rfc8216bis §4.4.3.2: Live playlist '{}' does not declare \
-                     EXT-X-MEDIA-SEQUENCE. For live playlists the tag SHOULD be present \
-                     so clients can track the sliding window.",
-                    pl.name
-                )));
-            }
-            if let Some(uri_msn) = extract_msn_from_uri(&segs[0].uri)
-                && uri_msn != 0 {
-                    issues.push(Issue {
-                        severity: Severity::Error,
-                        segment_index: 0,
-                        rendition_a: Some(pl.name.clone()),
-                        rendition_b: None,
-                        uri_a: Some(segs[0].uri.clone()),
-                        uri_b: None,
-                        message: format!(
-                            "rfc8216bis §4.4.3.2: EXT-X-MEDIA-SEQUENCE absent from '{}' \
-                             but first segment URI implies MSN={}. Add EXT-X-MEDIA-SEQUENCE \
-                             to declare the correct base MSN.",
-                            pl.name, uri_msn
-                        ),
-                        uri_note: None,
-                        ..Default::default()
-                    });
-                }
+        let tag_absent = !pl.raw_content.contains("#EXT-X-MEDIA-SEQUENCE:");
+        if tag_absent && !pl.has_endlist && pl.segments.len() > 1 {
+            issues.push(Issue::warn(format!(
+                "rfc8216bis §4.4.3.2: Live playlist '{}' does not declare \
+                 EXT-X-MEDIA-SEQUENCE. For live playlists the tag SHOULD be present \
+                 so clients can track the sliding window.",
+                pl.name
+            )));
         }
 
-        // EXT-X-MEDIA-SEQUENCE MUST appear before the first Media Segment URI
+        // EXT-X-MEDIA-SEQUENCE MUST appear before the first Media Segment URI.
+        //
+        // The first segment URI is the first URI line after the first EXTINF, which may be
+        // several lines later: BYTERANGE, KEY, MAP and PROGRAM-DATE-TIME tags are all
+        // allowed between an EXTINF and the URI it introduces.
         {
             let mut tag_line: Option<usize> = None;
             let mut first_seg_line: Option<usize> = None;
-            let mut after_extinf = false;
+            let mut seen_extinf = false;
             for (i, line) in pl.raw_content.lines().enumerate() {
                 let l = line.trim();
                 if l.starts_with("#EXT-X-MEDIA-SEQUENCE:") && tag_line.is_none() {
                     tag_line = Some(i);
                 }
-                if after_extinf && !l.starts_with('#') && !l.is_empty() && first_seg_line.is_none() {
+                if l.starts_with("#EXTINF:") {
+                    seen_extinf = true;
+                } else if seen_extinf
+                    && first_seg_line.is_none()
+                    && !l.starts_with('#')
+                    && !l.is_empty()
+                {
                     first_seg_line = Some(i);
                 }
-                after_extinf = l.starts_with("#EXTINF:");
             }
             if let (Some(tl), Some(sl)) = (tag_line, first_seg_line)
                 && tl > sl {
@@ -1233,34 +1342,8 @@ pub fn check_media_sequence_continuity(playlists: &[MediaPlaylist]) -> Vec<Issue
                     });
                 }
         }
-
-        // URI-embedded MSN consistency
-        let base_msn = pl.media_sequence + pl.skipped_segments;
-        for (idx, seg) in segs.iter().enumerate() {
-            let expected = base_msn + idx as u64;
-            if let Some(actual) = extract_msn_from_uri(&seg.uri)
-                && actual != expected {
-                    issues.push(Issue {
-                        severity: Severity::Warn,
-                        segment_index: idx as i32,
-                        rendition_a: Some(pl.name.clone()),
-                        rendition_b: None,
-                        uri_a: Some(seg.uri.clone()),
-                        uri_b: None,
-                        message: format!(
-                            "rfc8216bis §4.4.3.2: Segment MSN mismatch in '{}' at index {}: \
-                             URI implies MSN={} but expected MSN={} \
-                             (base={}, skipped={}, index={}).",
-                            pl.name, idx, actual, expected,
-                            pl.media_sequence, pl.skipped_segments, idx
-                        ),
-                        uri_note: None,
-                        ..Default::default()
-                    });
-                }
-        }
     }
-    issues
+    produced_by(CheckId::MediaSequenceTags, issues)
 }
 
 /// HLS Interstitials validation (Appendix D)
@@ -1565,7 +1648,7 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
         }
     }
 
-    (issues, interstitials)
+    (produced_by(CheckId::Interstitials, issues), interstitials)
 }
 
 #[cfg(test)]
@@ -1595,6 +1678,23 @@ mod tests {
 
     fn make_segment_with_pdt(uri: &str, duration: f64, pdt: f64) -> Segment {
         Segment { pdt: Some(pdt), ..make_segment(uri, duration) }
+    }
+
+    /// Read a media playlist the way the validator does, so tests exercise the parser's own
+    /// view of segments, PDTs and tag order rather than a hand-built one.
+    fn parse_playlist(name: &str, content: &str) -> MediaPlaylist {
+        let url = format!("https://cdn.example.com/{name}.m3u8");
+        let mut pl = MediaPlaylist::new(name.to_string(), url.clone());
+        super::super::parser::parse_media_playlist(&url, content, &mut pl);
+        pl
+    }
+
+    fn parse_master(content: &str) -> MasterPlaylist {
+        super::super::parser::parse_master_playlist("https://cdn.example.com/master.m3u8", content)
+    }
+
+    fn errors(issues: &[Issue]) -> Vec<&Issue> {
+        issues.iter().filter(|i| i.severity == Severity::Error).collect()
     }
 
     // ── check_extm3u_header ───────────────────────────────────────────────────
@@ -1763,25 +1863,536 @@ mod tests {
         assert!(issues.is_empty());
     }
 
-    // ── extract_msn_from_uri (private, tested within module) ─────────────────
+    // ── check identity ────────────────────────────────────────────────────────
+
+    /// Every finding the checks can produce has to name the check that produced it, because
+    /// the report groups findings by that name and anything unnamed lands in a catch-all row.
+    #[test]
+    fn every_check_names_itself_on_every_finding() {
+        let broken = parse_playlist(
+            "broken",
+            "#EXT-X-TARGETDURATION:6\n\
+             #EXT-X-VERSION:1\n\
+             #EXT-X-TARGETDURATION:6\n\
+             #EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXT-X-DISCONTINUITY-SEQUENCE:2\n\
+             #EXT-X-PART-INF:PART-TARGET=1.0\n\
+             #EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=6.0,HOLD-BACK=1.0\n\
+             #EXT-X-DATERANGE:ID=\"ad-1\",CLASS=\"com.apple.hls.interstitial\",\
+             START-DATE=\"2024-01-15T12:00:00Z\"\n\
+             #EXT-X-PART:DURATION=2.0,URI=\"p0.m4s\"\n\
+             #EXTINF:7.807,\n\
+             #EXT-X-PROGRAM-DATE-TIME:2024-01-15T12:00:00Z\n\
+             s0.m4s\n\
+             #EXT-X-DISCONTINUITY\n\
+             #EXTINF:4.5,\ns1.m4s\n\
+             orphan.m4s\n\
+             #EXT-X-MEDIA-SEQUENCE:10\n",
+        );
+        let other = parse_playlist(
+            "other",
+            "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-DISCONTINUITY-SEQUENCE:5\n\
+             #EXT-X-KEY:METHOD=NONE\n#EXT-X-PLAYLIST-TYPE:VOD\n\
+             #EXTINF:4.0,\ns0.m4s\n#EXTINF:4.0,\ns1.m4s\n",
+        );
+        let master = parse_master(
+            "#EXT-X-VERSION:6\n#EXT-X-VERSION:7\n\
+             #EXT-X-DEFINE:NAME=\"h\",VALUE=\"https://cdn\"\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a1\",NAME=\"en\",URI=\"a.m3u8\"\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a2\",NAME=\"fr\",URI=\"b.m3u8\"\n\
+             #EXT-X-STREAM-INF:AUDIO=\"missing\",CODECS=\"avc1.64001f\"\nv.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1000,CODECS=\"hvc1.2.4.L153\"\nv.m3u8\n",
+        );
+
+        let playlists = [broken, other];
+        let mut findings: Vec<Issue> = Vec::new();
+        for pl in &playlists {
+            findings.extend(pl.parse_issues.iter().cloned());
+        }
+        findings.extend(check_extm3u_header(&playlists));
+        findings.extend(check_target_duration_compliance(&playlists));
+        findings.extend(check_pdt_coverage(&playlists));
+        findings.extend(check_media_sequence_duplicate_tags(&playlists));
+        findings.extend(check_version_compatibility(&playlists));
+        findings.extend(check_live_playlist_min_segments(&playlists));
+        findings.extend(check_targetduration_consistency(&playlists));
+        findings.extend(check_playlist_type_endlist(&playlists));
+        findings.extend(check_encryption_consistency(&playlists));
+        findings.extend(check_discontinuity_sequence(&playlists));
+        findings.extend(check_segment_count(&playlists));
+        findings.extend(check_duration_drift(&playlists, 100.0));
+        findings.extend(check_pdt_alignment(&playlists, 100.0));
+        findings.extend(check_cumulative_drift(&playlists, 100.0));
+        findings.extend(check_ll_hls_compliance(&playlists));
+        findings.extend(check_media_sequence_continuity(&playlists));
+        findings.extend(check_interstitials(&playlists).0);
+        findings.extend(check_master_structure(&master));
+        findings.extend(check_stream_inf_consistency(&master));
+        findings.extend(check_bandwidth_required(&master));
+        findings.extend(check_media_group_membership(&master));
+        findings.extend(check_rendition_group_references(&master));
+
+        let unnamed: Vec<&str> = findings.iter()
+            .filter(|i| i.check_id == CheckId::Unassigned)
+            .map(|i| i.message.as_str())
+            .collect();
+        assert!(unnamed.is_empty(), "findings that name no check: {unnamed:#?}");
+
+        // Every check the fixture reaches. The ids deliberately not listed are PdtAlignment
+        // and SegmentCount, which need a second fully PDT-tagged / VOD-with-ENDLIST rendition
+        // this fixture does not have, and DeltaUpdates and PlaylistFetch, which are only
+        // produced by the fetching code in the parent module (covered by its own tests).
+        let named: HashSet<CheckId> = findings.iter().map(|i| i.check_id).collect();
+        let expected = [
+            CheckId::BandwidthRequired,
+            CheckId::CumulativeDrift,
+            CheckId::DiscontinuitySequence,
+            CheckId::DurationDrift,
+            CheckId::EncryptionConsistency,
+            CheckId::ExtM3uHeader,
+            CheckId::Interstitials,
+            CheckId::LlHls,
+            CheckId::LivePlaylistWindow,
+            CheckId::MediaGroupMembership,
+            CheckId::MediaSequenceTags,
+            CheckId::PdtCoverage,
+            CheckId::PlaylistTypeEndlist,
+            CheckId::RenditionGroupReferences,
+            CheckId::SegmentStructure,
+            CheckId::SingletonTags,
+            CheckId::StreamInfConsistency,
+            CheckId::TargetDurationCompliance,
+            CheckId::TargetDurationConsistency,
+            CheckId::VersionCompatibility,
+        ];
+        let missing: Vec<CheckId> = expected.iter()
+            .filter(|id| !named.contains(id))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these checks stopped reporting, or stopped naming themselves: {missing:?}"
+        );
+    }
+
+    // ── check_media_sequence_continuity ───────────────────────────────────────
 
     #[test]
-    fn extract_msn_numeric_filename() {
-        assert_eq!(extract_msn_from_uri("https://cdn.example.com/segs/151674692.mp4"), Some(151674692));
+    fn segment_uri_numbers_are_not_read_as_media_sequence_numbers() {
+        // §4.4.3.2 defines the MSN of the first segment as EXT-X-MEDIA-SEQUENCE and nothing
+        // else. Numeric segment file names that do not line up with it are not a violation.
+        let pl = parse_playlist(
+            "v",
+            "#EXTM3U\n\
+             #EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MEDIA-SEQUENCE:10\n\
+             #EXTINF:4.0,\n151674692.m4v\n\
+             #EXTINF:4.0,\n151674693.m4v\n\
+             #EXTINF:4.0,\n20260715T225158-151674694-03-ts.m4v\n",
+        );
+        let issues = check_media_sequence_continuity(&[pl]);
+        assert!(issues.is_empty(), "URI-derived MSNs must not be reported: {issues:?}");
     }
 
     #[test]
-    fn extract_msn_hyphenated_cdn_pattern() {
-        assert_eq!(
-            extract_msn_from_uri("https://cdn.example.com/20260715T225158-151674692-03-ts.m4v"),
-            Some(151674692)
+    fn media_sequence_without_the_tag_warns_on_live_only() {
+        let live = parse_playlist(
+            "live",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n\
+             #EXTINF:4.0,\ns0.m4s\n#EXTINF:4.0,\ns1.m4s\n",
+        );
+        let issues = check_media_sequence_continuity(&[live]);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, Severity::Warn, "the tag is a SHOULD for live playlists");
+
+        let vod = parse_playlist(
+            "vod",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n\
+             #EXTINF:4.0,\ns0.m4s\n#EXTINF:4.0,\ns1.m4s\n#EXT-X-ENDLIST\n",
+        );
+        assert!(check_media_sequence_continuity(&[vod]).is_empty());
+    }
+
+    #[test]
+    fn media_sequence_after_the_first_segment_is_found_across_intervening_tags() {
+        // The first segment URI is three lines below its EXTINF; the old scan only looked at
+        // the line immediately after an EXTINF and so found no segment at all.
+        let pl = parse_playlist(
+            "v",
+            "#EXTM3U\n\
+             #EXT-X-TARGETDURATION:4\n\
+             #EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n\
+             #EXTINF:4.0,\n\
+             #EXT-X-PROGRAM-DATE-TIME:2024-01-15T12:00:00Z\n\
+             #EXT-X-BYTERANGE:1000@0\n\
+             s0.m4s\n\
+             #EXT-X-MEDIA-SEQUENCE:10\n\
+             #EXTINF:4.0,\ns1.m4s\n",
+        );
+        let issues = check_media_sequence_continuity(&[pl]);
+        assert!(
+            errors(&issues).iter().any(|i| i.message.contains("MUST appear before")),
+            "expected a tag-order error: {issues:?}"
         );
     }
 
     #[test]
-    fn extract_msn_short_field_not_matched() {
-        // Second field has only 4 digits — too short to be a CDN MSN
-        assert_eq!(extract_msn_from_uri("https://cdn.example.com/seg-1234-abc.mp4"), None);
+    fn media_sequence_before_the_first_segment_passes_with_intervening_tags() {
+        let pl = parse_playlist(
+            "v",
+            "#EXTM3U\n\
+             #EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MEDIA-SEQUENCE:10\n\
+             #EXTINF:4.0,\n\
+             #EXT-X-BYTERANGE:1000@0\n\
+             s0.m4s\n",
+        );
+        assert!(check_media_sequence_continuity(&[pl]).is_empty());
+    }
+
+    // ── check_targetduration_consistency ─────────────────────────────────────
+
+    #[test]
+    fn targetduration_mismatch_across_renditions_errors() {
+        let a = parse_playlist("v0", "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\ns0.m4s\n");
+        let b = parse_playlist("v1", "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.0,\ns0.m4s\n");
+        let issues = check_targetduration_consistency(&[a, b]);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, Severity::Error, "§6.2.4 states this as a MUST");
+    }
+
+    #[test]
+    fn vod_iframe_playlist_may_declare_its_own_targetduration() {
+        let video = parse_playlist(
+            "v0",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-PLAYLIST-TYPE:VOD\n\
+             #EXTINF:6.0,\ns0.m4s\n#EXT-X-ENDLIST\n",
+        );
+        let trick = parse_playlist(
+            "iframe",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:60\n#EXT-X-PLAYLIST-TYPE:VOD\n\
+             #EXT-X-I-FRAMES-ONLY\n#EXTINF:60.0,\ni0.m4s\n#EXT-X-ENDLIST\n",
+        );
+        let issues = check_targetduration_consistency(&[video, trick]);
+        assert!(issues.is_empty(), "§6.2.4 exempts VOD I-frame playlists: {issues:?}");
+    }
+
+    // ── check_discontinuity_sequence ──────────────────────────────────────────
+
+    #[test]
+    fn discontinuity_sequence_mismatch_errors() {
+        let a = parse_playlist(
+            "v0",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-DISCONTINUITY-SEQUENCE:2\n\
+             #EXTINF:4.0,\ns0.m4s\n",
+        );
+        let b = parse_playlist(
+            "v1",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-DISCONTINUITY-SEQUENCE:5\n\
+             #EXTINF:4.0,\ns0.m4s\n",
+        );
+        let issues = check_discontinuity_sequence(&[a, b]);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert_eq!(issues[0].check_id, CheckId::DiscontinuitySequence);
+    }
+
+    // ── check_encryption_consistency ──────────────────────────────────────────
+
+    #[test]
+    fn a_clear_rendition_alongside_an_encrypted_one_warns_but_does_not_fail() {
+        let encrypted = parse_playlist(
+            "v0",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n#EXTINF:4.0,\ns0.m4s\n",
+        );
+        let clear = parse_playlist(
+            "iframe",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-KEY:METHOD=NONE\n#EXTINF:4.0,\ni0.m4s\n",
+        );
+        let issues = check_encryption_consistency(&[encrypted, clear]);
+        assert!(
+            errors(&issues).is_empty(),
+            "a mixed clear/encrypted presentation must not fail the run: {issues:?}"
+        );
+        assert!(issues.iter().any(|i| i.severity == Severity::Warn), "but it is worth a warning");
+    }
+
+    // ── check_version_compatibility ───────────────────────────────────────────
+
+    #[test]
+    fn map_without_iframes_only_requires_version_6() {
+        let v5 = parse_playlist(
+            "v",
+            "#EXTM3U\n#EXT-X-VERSION:5\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4.0,\ns0.m4s\n",
+        );
+        let issues = check_version_compatibility(&[v5]);
+        assert!(
+            errors(&issues).iter().any(|i| i.message.contains("VERSION >= 6")),
+            "EXT-X-MAP outside an I-frame playlist needs v6: {issues:?}"
+        );
+
+        let v6 = parse_playlist(
+            "v",
+            "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4.0,\ns0.m4s\n",
+        );
+        assert!(check_version_compatibility(&[v6]).is_empty());
+    }
+
+    #[test]
+    fn map_in_an_iframes_only_playlist_is_allowed_at_version_5() {
+        let pl = parse_playlist(
+            "iframe",
+            "#EXTM3U\n#EXT-X-VERSION:5\n#EXT-X-TARGETDURATION:60\n#EXT-X-I-FRAMES-ONLY\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:60.0,\ni0.m4s\n",
+        );
+        let issues = check_version_compatibility(&[pl]);
+        assert!(issues.is_empty(), "§8 allows MAP at v5 with I-FRAMES-ONLY: {issues:?}");
+    }
+
+    // ── check_ll_hls_compliance ───────────────────────────────────────────────
+
+    fn ll_playlist(server_control: &str, part_inf: bool, independent_first_part: bool) -> MediaPlaylist {
+        let first_part = if independent_first_part { ",INDEPENDENT=YES" } else { "" };
+        let content = format!(
+            "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MEDIA-SEQUENCE:1\n\
+             {server_control}\n\
+             {}\
+             #EXT-X-PART:DURATION=1.0,URI=\"p0.m4s\"{first_part}\n\
+             #EXT-X-PART:DURATION=1.0,URI=\"p1.m4s\"\n\
+             #EXTINF:4.0,\ns0.m4s\n",
+            if part_inf { "#EXT-X-PART-INF:PART-TARGET=1.0\n" } else { "" },
+        );
+        parse_playlist("v", &content)
+    }
+
+    #[test]
+    fn a_dependent_first_part_is_not_an_error() {
+        // INDEPENDENT is an OPTIONAL attribute; §4.4.4.9 only recommends it on the first part.
+        let pl = ll_playlist(
+            "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=3.0,HOLD-BACK=12.0",
+            true,
+            false,
+        );
+        let issues = check_ll_hls_compliance(&[pl]);
+        assert!(
+            !issues.iter().any(|i| i.message.contains("INDEPENDENT")),
+            "a dependent first part must not be reported: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_can_block_reload_is_not_an_error() {
+        let pl = ll_playlist(
+            "#EXT-X-SERVER-CONTROL:PART-HOLD-BACK=3.0,HOLD-BACK=12.0",
+            true,
+            true,
+        );
+        let issues = check_ll_hls_compliance(&[pl]);
+        assert!(
+            !issues.iter().any(|i| i.message.contains("CAN-BLOCK-RELOAD")),
+            "CAN-BLOCK-RELOAD is how a server advertises blocking reload, not a requirement \
+             on the playlist: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn part_inf_without_part_hold_back_errors() {
+        let pl = ll_playlist(
+            "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,HOLD-BACK=12.0",
+            true,
+            true,
+        );
+        let issues = check_ll_hls_compliance(&[pl]);
+        assert!(
+            errors(&issues).iter().any(|i| i.message.contains("PART-HOLD-BACK")
+                && i.message.contains("REQUIRED")),
+            "§4.4.3.8 makes PART-HOLD-BACK REQUIRED alongside EXT-X-PART-INF: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn part_hold_back_present_satisfies_the_requirement() {
+        let pl = ll_playlist(
+            "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=3.0,HOLD-BACK=12.0",
+            true,
+            true,
+        );
+        let issues = check_ll_hls_compliance(&[pl]);
+        assert!(
+            !issues.iter().any(|i| i.message.contains("no PART-HOLD-BACK")),
+            "unexpected PART-HOLD-BACK finding: {issues:?}"
+        );
+    }
+
+    // ── check_stream_inf_consistency ──────────────────────────────────────────
+
+    #[test]
+    fn same_uri_and_groups_with_different_codecs_warns() {
+        let master = parse_master(
+            "#EXTM3U\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"en\",URI=\"a.m3u8\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1000,AUDIO=\"aac\",CODECS=\"avc1.64001f,mp4a.40.2\"\nv.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1000,AUDIO=\"aac\",CODECS=\"avc1.64001f,mp4a.40.5\"\nv.m3u8\n",
+        );
+        let issues = check_stream_inf_consistency(&master);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Warn, "a CODECS mismatch must not fail the run");
+        assert!(issues[0].message.contains("§4.4.6.2"), "citation: {}", issues[0].message);
+    }
+
+    #[test]
+    fn same_uri_with_different_subtitle_groups_is_a_different_variant_stream() {
+        // Two Variant Streams sharing a video URI but pairing it with different SUBTITLES
+        // groups describe different presentations; their CODECS and BANDWIDTH may differ.
+        let master = parse_master(
+            "#EXTM3U\n\
+             #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs-en\",NAME=\"en\",URI=\"en.m3u8\"\n\
+             #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs-fr\",NAME=\"fr\",URI=\"fr.m3u8\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1000,SUBTITLES=\"subs-en\",CODECS=\"avc1.64001f\"\nv.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1200,SUBTITLES=\"subs-fr\",CODECS=\"avc1.64001f,mp4a.40.2\"\nv.m3u8\n",
+        );
+        let issues = check_stream_inf_consistency(&master);
+        assert!(issues.is_empty(), "expected no findings: {issues:?}");
+    }
+
+    #[test]
+    fn same_uri_with_different_video_codecs_errors() {
+        let master = parse_master(
+            "#EXTM3U\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"en\",URI=\"a.m3u8\"\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"ec3\",NAME=\"en\",URI=\"a2.m3u8\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1000,AUDIO=\"aac\",CODECS=\"avc1.64001f,mp4a.40.2\"\nv.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1400,AUDIO=\"ec3\",CODECS=\"hvc1.2.4.L153,ec-3\"\nv.m3u8\n",
+        );
+        let issues = check_stream_inf_consistency(&master);
+        let errs = errors(&issues);
+        assert_eq!(errs.len(), 1, "{issues:?}");
+        assert!(errs[0].message.contains("§6.2.4"), "citation: {}", errs[0].message);
+    }
+
+    #[test]
+    fn same_uri_with_different_video_groups_is_a_different_variant_stream() {
+        // VIDEO pairs a Variant Stream with an alternative video rendition group the same way
+        // AUDIO does, so it is part of what makes two STREAM-INF entries the same stream.
+        let master = parse_master(
+            "#EXTM3U\n\
+             #EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID=\"cam-main\",NAME=\"main\",URI=\"m.m3u8\"\n\
+             #EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID=\"cam-alt\",NAME=\"alt\",URI=\"c.m3u8\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1000,VIDEO=\"cam-main\",CODECS=\"avc1.64001f\"\nv.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1200,VIDEO=\"cam-alt\",CODECS=\"avc1.64001f,mp4a.40.2\"\nv.m3u8\n",
+        );
+        let issues = check_stream_inf_consistency(&master);
+        assert!(issues.is_empty(), "expected no findings: {issues:?}");
+    }
+
+    #[test]
+    fn same_uri_and_groups_with_different_bandwidth_warns() {
+        let master = parse_master(
+            "#EXTM3U\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1000,CODECS=\"avc1.64001f\"\nv.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=2000,CODECS=\"avc1.64001f\"\nv.m3u8\n",
+        );
+        let issues = check_stream_inf_consistency(&master);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Warn);
+        assert!(issues[0].message.contains("BANDWIDTH"));
+    }
+
+    // ── check_master_structure ────────────────────────────────────────────────
+
+    #[test]
+    fn master_without_extm3u_errors() {
+        let master = parse_master("#EXT-X-STREAM-INF:BANDWIDTH=1000\nv.m3u8\n");
+        let issues = check_master_structure(&master);
+        assert!(
+            errors(&issues).iter().any(|i| i.check_id == CheckId::ExtM3uHeader),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn master_repeating_a_singleton_tag_errors() {
+        let master = parse_master(
+            "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-VERSION:7\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1000\nv.m3u8\n",
+        );
+        let issues = check_master_structure(&master);
+        assert!(
+            errors(&issues).iter().any(|i| i.check_id == CheckId::SingletonTags
+                && i.message.contains("EXT-X-VERSION")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn master_using_variable_substitution_below_version_8_errors() {
+        let master = parse_master(
+            "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-DEFINE:NAME=\"host\",VALUE=\"https://cdn\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1000\n{$host}/v.m3u8\n",
+        );
+        let issues = check_master_structure(&master);
+        assert!(
+            errors(&issues).iter().any(|i| i.check_id == CheckId::VersionCompatibility
+                && i.message.contains("VERSION >= 8")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn a_well_formed_master_produces_no_structural_findings() {
+        let master = parse_master(
+            "#EXTM3U\n#EXT-X-VERSION:8\n#EXT-X-INDEPENDENT-SEGMENTS\n\
+             #EXT-X-DEFINE:NAME=\"host\",VALUE=\"https://cdn\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1000\n{$host}/v.m3u8\n",
+        );
+        assert!(check_master_structure(&master).is_empty());
+    }
+
+    // ── check_rendition_group_references ──────────────────────────────────────
+
+    #[test]
+    fn a_dangling_audio_group_reference_errors() {
+        let master = parse_master(
+            "#EXTM3U\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"en\",URI=\"a.m3u8\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1000,AUDIO=\"missing\"\nv.m3u8\n",
+        );
+        let issues = check_rendition_group_references(&master);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(issues[0].message.contains("AUDIO=\"missing\""), "{}", issues[0].message);
+    }
+
+    #[test]
+    fn dangling_subtitle_and_video_group_references_error() {
+        let master = parse_master(
+            "#EXTM3U\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1000,SUBTITLES=\"subs\",VIDEO=\"alt\"\nv.m3u8\n",
+        );
+        let issues = check_rendition_group_references(&master);
+        assert_eq!(issues.len(), 2, "{issues:?}");
+        assert!(issues.iter().any(|i| i.message.contains("SUBTITLES=\"subs\"")));
+        assert!(issues.iter().any(|i| i.message.contains("VIDEO=\"alt\"")));
+    }
+
+    #[test]
+    fn resolvable_group_references_and_closed_captions_none_pass() {
+        let master = parse_master(
+            "#EXTM3U\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"en\",URI=\"a.m3u8\"\n\
+             #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"en\",URI=\"s.m3u8\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1000,AUDIO=\"aac\",SUBTITLES=\"subs\",\
+             CLOSED-CAPTIONS=NONE\nv.m3u8\n",
+        );
+        let issues = check_rendition_group_references(&master);
+        assert!(issues.is_empty(), "CLOSED-CAPTIONS=NONE is not a group reference: {issues:?}");
     }
 
     // ── check_interstitials ───────────────────────────────────────────────────

@@ -185,9 +185,14 @@ pub async fn collect_stream(url: &str) -> Result<CollectedStream, FetchError> {
                 playlists.push(pl);
             }
             Err(e) => {
-                fetch_issues.push(Issue::warn(format!(
-                    "Could not fetch media playlist '{}': {}", fetch_uri, e
-                )));
+                fetch_issues.push(
+                    Issue::warn(format!(
+                        "rfc8216bis §6.2: Could not fetch media playlist '{}': {}. \
+                         No check could be run against this rendition.",
+                        fetch_uri, e
+                    ))
+                    .for_check(CheckId::PlaylistFetch),
+                );
             }
         }
     }
@@ -231,9 +236,14 @@ pub async fn collect_stream(url: &str) -> Result<CollectedStream, FetchError> {
                 playlists.push(pl);
             }
             Err(e) => {
-                fetch_issues.push(Issue::warn(format!(
-                    "Could not fetch audio rendition '{}': {}", fetch_uri, e
-                )));
+                fetch_issues.push(
+                    Issue::warn(format!(
+                        "rfc8216bis §6.2: Could not fetch audio rendition '{}': {}. \
+                         No check could be run against this rendition.",
+                        fetch_uri, e
+                    ))
+                    .for_check(CheckId::PlaylistFetch),
+                );
             }
         }
     }
@@ -257,64 +267,74 @@ pub async fn validate_hls_with_options(url: &str, tolerance_ms: f64) -> Result<V
 
     let playlists = stream.playlists;
 
-    if let Some(master) = stream.master {
-        report.issues.extend(checks::check_codecs_attribute(&master));
-        report.issues.extend(checks::check_bandwidth_required(&master));
-        report.issues.extend(checks::check_media_group_membership(&master));
+    run_fetched_stream_checks(stream.master.as_ref(), &playlists, &mut report);
 
-        // Run checks and parse interstitials
-        run_media_checks(&playlists, &mut report);
+    // Fetch delta updates for playlists with CAN-SKIP-UNTIL
+    let (delta_issues, delta_reports) = check_playlist_delta_updates(&playlists).await;
+    report.issues.extend(delta_issues);
+    report.delta_report = delta_reports;
 
-        // Parse HLS Interstitials from media playlists
-        let has_interstitials = playlists.iter().any(|pl|
-            pl.raw_content.contains("com.apple.hls.interstitial")
-        );
-        if has_interstitials {
-            let (interstitial_issues, mut interstitials) = checks::check_interstitials(&playlists);
-            report.issues.extend(interstitial_issues);
-            compute_interstitial_offsets(&mut interstitials, &playlists);
-            report.interstitials = interstitials;
-            report.has_interstitials_data = true;
-        }
+    // MSN monotonicity check: re-fetch live playlists and compare MSNs
+    let msn_issues = check_media_sequence_monotonicity(&playlists).await;
+    report.issues.extend(msn_issues);
 
-        // Collect SCTE-35 ad breaks from EXT-X-DATERANGE tags
-        let ad_breaks = collect_scte35_ad_breaks(&playlists);
-        if !ad_breaks.is_empty() {
-            report.has_scte35_data = true;
-            report.ad_breaks = ad_breaks;
-        }
-
-        // Compute playlist window duration for the SCTE-35 timeline.
-        // Use the best (highest-bandwidth) video playlist with PDT span or EXTINF sum.
-        report.playlist_window_s = playlists.iter()
-            .filter(|pl| pl.media_type == "VIDEO")
-            .max_by_key(|pl| pl.bandwidth.unwrap_or(0))
-            .map(pdt_span_or_extinf_sum)
-            .unwrap_or(0.0);
-
-        // Fetch delta updates for playlists with CAN-SKIP-UNTIL
-        let (delta_issues, delta_reports) = check_playlist_delta_updates(&playlists).await;
-        report.issues.extend(delta_issues);
-        report.delta_report = delta_reports;
-
-        // MSN monotonicity check: re-fetch live playlists and compare MSNs
-        let msn_issues = check_media_sequence_monotonicity(&playlists).await;
-        report.issues.extend(msn_issues);
-
-        // Build renditions for UI
-        report.renditions = build_renditions(&playlists);
-        report.playlists = playlists;
-        report.master = Some(master);
-    } else {
-        run_media_checks(&playlists, &mut report);
-        report.renditions = build_renditions(&playlists);
-        report.playlists = playlists;
-    }
+    report.renditions = build_renditions(&playlists);
+    report.playlists = playlists;
+    report.master = stream.master;
 
     report.finalize();
     report.check_groups = categorize_issues(&report.issues);
     report.elapsed_ms = (now_ms() - start) as u64;
     Ok(report)
+}
+
+/// Everything that can be checked from playlists already in hand, whether or not the stream
+/// was reached through a multivariant playlist.
+///
+/// Only the five checks that read the multivariant playlist itself are conditional on there
+/// being one. Interstitials, SCTE-35 and the media-playlist checks used to sit inside that
+/// same condition, so a media-playlist URL was never checked for any of them.
+fn run_fetched_stream_checks(
+    master: Option<&MasterPlaylist>,
+    playlists: &[MediaPlaylist],
+    report: &mut ValidationReport,
+) {
+    if let Some(master) = master {
+        report.issues.extend(checks::check_master_structure(master));
+        report.issues.extend(checks::check_stream_inf_consistency(master));
+        report.issues.extend(checks::check_bandwidth_required(master));
+        report.issues.extend(checks::check_media_group_membership(master));
+        report.issues.extend(checks::check_rendition_group_references(master));
+    }
+
+    run_media_checks(playlists, report);
+
+    // Parse HLS Interstitials from media playlists
+    let has_interstitials = playlists.iter().any(|pl|
+        pl.raw_content.contains("com.apple.hls.interstitial")
+    );
+    if has_interstitials {
+        let (interstitial_issues, mut interstitials) = checks::check_interstitials(playlists);
+        report.issues.extend(interstitial_issues);
+        compute_interstitial_offsets(&mut interstitials, playlists);
+        report.interstitials = interstitials;
+        report.has_interstitials_data = true;
+    }
+
+    // Collect SCTE-35 ad breaks from EXT-X-DATERANGE tags
+    let ad_breaks = collect_scte35_ad_breaks(playlists);
+    if !ad_breaks.is_empty() {
+        report.has_scte35_data = true;
+        report.ad_breaks = ad_breaks;
+    }
+
+    // Compute playlist window duration for the SCTE-35 timeline.
+    // Use the best (highest-bandwidth) video playlist with PDT span or EXTINF sum.
+    report.playlist_window_s = playlists.iter()
+        .filter(|pl| pl.media_type == "VIDEO")
+        .max_by_key(|pl| pl.bandwidth.unwrap_or(0))
+        .map(pdt_span_or_extinf_sum)
+        .unwrap_or(0.0);
 }
 
 /// Resolve EXT-X-DEFINE:IMPORT references in a media playlist against the parent (master)
@@ -355,6 +375,11 @@ pub(crate) fn apply_master_definitions(
 fn run_media_checks(playlists: &[MediaPlaylist], report: &mut ValidationReport) {
     let tolerance_ms = report.tolerance_ms;
 
+    // Segments the parser could not build carry their own findings (missing EXTINF, and
+    // similar), which would otherwise be invisible because no later check ever sees them.
+    for pl in playlists {
+        report.issues.extend(pl.parse_issues.iter().cloned());
+    }
     report.issues.extend(checks::check_extm3u_header(playlists));
     report.issues.extend(checks::check_target_duration_compliance(playlists));
     report.issues.extend(checks::check_pdt_coverage(playlists));
@@ -431,88 +456,111 @@ fn derive_color_info(video_range: Option<&str>, codecs: Option<&str>) -> Option<
     }
 }
 
-/// Check definition for categorization
+/// How a check is presented in the report table.
 struct CheckDef {
+    id: CheckId,
     name: &'static str,
     section: &'static str,
     reference: &'static str,
-    keywords: &'static [&'static str],
 }
 
+/// The report table, in display order. Every [`CheckId`] appears exactly once, which
+/// `check_defs_cover_every_check_id` enforces.
 const CHECK_DEFS: &[CheckDef] = &[
     // §4.4.1 Basic Tags
-    CheckDef { name: "EXTM3U Header", section: "Basic Tags", reference: "rfc8216bis §4.4.1.1", keywords: &["§4.4.1.1", "#EXTM3U MUST"] },
-    // §4.4.2 / §4.4.3 Singleton Tag Presence
-    CheckDef { name: "Singleton Tags", section: "Structural", reference: "rfc8216bis §4.4.1.2/§4.4.2/§4.4.3", keywords: &["appears", "times in", "MUST appear at most once"] },
+    CheckDef { id: CheckId::ExtM3uHeader, name: "EXTM3U Header", section: "Basic Tags", reference: "rfc8216bis §4.4.1.1" },
+    // §4.4.1.2 / §4.4.2 / §4.4.3 Singleton Tag Presence
+    CheckDef { id: CheckId::SingletonTags, name: "Singleton Tags", section: "Structural", reference: "rfc8216bis §4.4.1.2/§4.4.2/§4.4.3" },
     // §4.4.3.1
-    CheckDef { name: "Target Duration Compliance", section: "Structural", reference: "rfc8216bis §4.4.3.1", keywords: &["§4.4.3.1", "TARGETDURATION"] },
+    CheckDef { id: CheckId::TargetDurationCompliance, name: "Target Duration Compliance", section: "Structural", reference: "rfc8216bis §4.4.3.1" },
     // §4.4.3.2
-    CheckDef { name: "Media Sequence Tags", section: "Structural", reference: "rfc8216bis §4.4.3.2", keywords: &["§4.4.3.2", "MEDIA-SEQUENCE", "MSN monotonicity"] },
-    // §4.4.3.3
-    CheckDef { name: "Discontinuity Sequence", section: "Alignment", reference: "rfc8216bis §4.4.3.3", keywords: &["Discontinuity"] },
+    CheckDef { id: CheckId::MediaSequenceTags, name: "Media Sequence Tags", section: "Structural", reference: "rfc8216bis §4.4.3.2" },
+    // §4.4.3.3 / §6.2.4
+    CheckDef { id: CheckId::DiscontinuitySequence, name: "Discontinuity Sequence", section: "Alignment", reference: "rfc8216bis §4.4.3.3/§6.2.4" },
     // §4.4.3.5
-    CheckDef { name: "Playlist Type / ENDLIST", section: "Structural", reference: "rfc8216bis §4.4.3.5", keywords: &["§4.4.3.5", "PLAYLIST-TYPE:VOD"] },
+    CheckDef { id: CheckId::PlaylistTypeEndlist, name: "Playlist Type / ENDLIST", section: "Structural", reference: "rfc8216bis §4.4.3.5" },
+    // §4.4.4.1
+    CheckDef { id: CheckId::SegmentStructure, name: "Segment Structure", section: "Structural", reference: "rfc8216bis §4.4.4.1" },
     // §4.4.4.4
-    CheckDef { name: "Encryption Consistency", section: "Security", reference: "rfc8216bis §4.4.4.4", keywords: &["§4.4.4.4", "encryption method"] },
-    // §4.4.5.1 / §4.4.5.2
-    CheckDef { name: "Playlist Delta Updates", section: "LL-HLS", reference: "rfc8216bis §4.4.5.2/§6.2.5.1", keywords: &["§6.2.5.1", "delta update", "Delta update"] },
+    CheckDef { id: CheckId::EncryptionConsistency, name: "Encryption Consistency", section: "Security", reference: "rfc8216bis §4.4.4.4" },
+    // §4.4.5.2 / §6.2.5.1
+    CheckDef { id: CheckId::DeltaUpdates, name: "Playlist Delta Updates", section: "LL-HLS", reference: "rfc8216bis §4.4.5.2/§6.2.5.1" },
     // §4.4.6.2
-    CheckDef { name: "BANDWIDTH Required", section: "Multivariant", reference: "rfc8216bis §4.4.6.2", keywords: &["BANDWIDTH attribute, which is REQUIRED"] },
-    CheckDef { name: "CODECS Consistency", section: "Multivariant", reference: "rfc8216bis §4.4.6.2", keywords: &["§4.4.5.2", "CODECS"] },
+    CheckDef { id: CheckId::BandwidthRequired, name: "BANDWIDTH Required", section: "Multivariant", reference: "rfc8216bis §4.4.6.2" },
+    CheckDef { id: CheckId::StreamInfConsistency, name: "STREAM-INF Consistency", section: "Multivariant", reference: "rfc8216bis §4.4.6.2/§6.2.4" },
+    CheckDef { id: CheckId::RenditionGroupReferences, name: "Rendition Group References", section: "Multivariant", reference: "rfc8216bis §4.4.6.2" },
     // §4.4.6.1.1
-    CheckDef { name: "Media Group Membership", section: "Multivariant", reference: "rfc8216bis §4.4.6.1.1", keywords: &["§4.4.6.1.1", "missing member"] },
+    CheckDef { id: CheckId::MediaGroupMembership, name: "Media Group Membership", section: "Multivariant", reference: "rfc8216bis §4.4.6.1.1" },
     // §6.2.2
-    CheckDef { name: "Live Playlist Window", section: "Live", reference: "rfc8216bis §6.2.2", keywords: &["§6.2.2", "Live playlist"] },
+    CheckDef { id: CheckId::LivePlaylistWindow, name: "Live Playlist Window", section: "Live", reference: "rfc8216bis §6.2.2" },
     // §6.2.4
-    CheckDef { name: "PDT Coverage", section: "Timing", reference: "rfc8216bis §6.2.4", keywords: &["partial PDT coverage"] },
-    CheckDef { name: "PDT Alignment", section: "Alignment", reference: "rfc8216bis §6.2.4", keywords: &["PDT misalignment"] },
-    CheckDef { name: "Target Duration Consistency", section: "Alignment", reference: "rfc8216bis §6.2.4", keywords: &["TARGETDURATION values differ"] },
-    CheckDef { name: "Cumulative Drift", section: "Alignment", reference: "rfc8216bis §6.2.4", keywords: &["Cumulative EXTINF drift"] },
+    CheckDef { id: CheckId::PdtCoverage, name: "PDT Coverage", section: "Timing", reference: "rfc8216bis §6.2.4" },
+    CheckDef { id: CheckId::PdtAlignment, name: "PDT Alignment", section: "Alignment", reference: "rfc8216bis §6.2.4" },
+    CheckDef { id: CheckId::TargetDurationConsistency, name: "Target Duration Consistency", section: "Alignment", reference: "rfc8216bis §6.2.4" },
+    CheckDef { id: CheckId::CumulativeDrift, name: "Cumulative Drift", section: "Alignment", reference: "rfc8216bis §6.2.4" },
     // §4.4.4.1 drift cross-rendition
-    CheckDef { name: "EXTINF Duration Drift", section: "Alignment", reference: "rfc8216bis §4.4.4.1", keywords: &["EXTINF drift"] },
-    CheckDef { name: "Segment Count", section: "Alignment", reference: "rfc8216bis §4.4.4.1", keywords: &["Segment count mismatch"] },
+    CheckDef { id: CheckId::DurationDrift, name: "EXTINF Duration Drift", section: "Alignment", reference: "rfc8216bis §4.4.4.1" },
+    CheckDef { id: CheckId::SegmentCount, name: "Segment Count", section: "Alignment", reference: "rfc8216bis §4.4.4.1" },
     // §8
-    CheckDef { name: "Version Compatibility", section: "Version", reference: "rfc8216bis §8", keywords: &["rfc8216bis §8:", "RFC 8216bis §8:"] },
+    CheckDef { id: CheckId::VersionCompatibility, name: "Version Compatibility", section: "Version", reference: "rfc8216bis §8" },
     // LL-HLS §4.4.3–4.4.5, §6.2.5.2
-    CheckDef { name: "LL-HLS Compliance", section: "LL-HLS", reference: "rfc8216bis §4.4.3–4.4.5", keywords: &["LL-HLS", "rfc8216bis §4.4.3.8", "rfc8216bis §4.4.4.9", "rfc8216bis §4.4.5"] },
+    CheckDef { id: CheckId::LlHls, name: "LL-HLS Compliance", section: "LL-HLS", reference: "rfc8216bis §4.4.3–4.4.5" },
     // Appendix D
-    CheckDef { name: "HLS Interstitials", section: "Interstitials", reference: "rfc8216bis Appendix D", keywords: &["Interstitial:"] },
+    CheckDef { id: CheckId::Interstitials, name: "HLS Interstitials", section: "Interstitials", reference: "rfc8216bis Appendix D" },
+    // Delivery
+    CheckDef { id: CheckId::PlaylistFetch, name: "Playlist Retrieval", section: "Delivery", reference: "rfc8216bis §6.2" },
 ];
 
-/// Categorize issues into named check groups (matches Go categorizeIssues)
-fn categorize_issues(issues: &[Issue]) -> Vec<CheckGroup> {
-    let mut assigned = vec![false; issues.len()];
-    let mut groups = Vec::new();
+/// Group of last resort, so a finding whose check has no row in the table is still shown.
+const UNGROUPED_NAME: &str = "Other Findings";
 
-    for def in CHECK_DEFS {
-        let mut matched = Vec::new();
-        for (i, issue) in issues.iter().enumerate() {
-            if assigned[i] {
-                continue;
-            }
-            for kw in def.keywords {
-                if issue.message.contains(kw) {
-                    matched.push(issue.clone());
-                    assigned[i] = true;
-                    break;
-                }
-            }
-        }
-        let status = if matched.iter().any(|i| i.severity == Severity::Error) {
-            "FAIL"
-        } else if matched.iter().any(|i| i.severity == Severity::Warn) {
-            "WARN"
+/// Group issues by the check that produced them.
+///
+/// Grouping used to search each message for a check's keywords, which meant one check could
+/// claim another's findings — "TARGETDURATION" matched the target-duration row before the
+/// consistency row could see it — and a finding matching no keyword at all never reached the
+/// UI. Each finding now names its own check and this is a lookup, with anything unclaimed
+/// collected into [`UNGROUPED_NAME`] rather than dropped.
+fn categorize_issues(issues: &[Issue]) -> Vec<CheckGroup> {
+    fn status_of(issues: &[Issue]) -> String {
+        if issues.iter().any(|i| i.severity == Severity::Error) {
+            "FAIL".to_string()
+        } else if issues.iter().any(|i| i.severity == Severity::Warn) {
+            "WARN".to_string()
         } else {
-            "PASS"
-        };
-        groups.push(CheckGroup {
+            "PASS".to_string()
+        }
+    }
+
+    let mut groups: Vec<CheckGroup> = CHECK_DEFS.iter().map(|def| {
+        let matched: Vec<Issue> = issues.iter()
+            .filter(|i| i.check_id == def.id)
+            .cloned()
+            .collect();
+        CheckGroup {
             name: def.name.to_string(),
             section: def.section.to_string(),
             reference: def.reference.to_string(),
-            status: status.to_string(),
+            status: status_of(&matched),
             issues: matched,
+        }
+    }).collect();
+
+    let known: std::collections::HashSet<CheckId> = CHECK_DEFS.iter().map(|d| d.id).collect();
+    let ungrouped: Vec<Issue> = issues.iter()
+        .filter(|i| !known.contains(&i.check_id))
+        .cloned()
+        .collect();
+    if !ungrouped.is_empty() {
+        groups.push(CheckGroup {
+            name: UNGROUPED_NAME.to_string(),
+            section: "Other".to_string(),
+            reference: "rfc8216bis".to_string(),
+            status: status_of(&ungrouped),
+            issues: ungrouped,
         });
     }
+
     groups
 }
 
@@ -793,6 +841,7 @@ async fn check_media_sequence_monotonicity(playlists: &[MediaPlaylist]) -> Vec<I
                     && new_msn < pl.media_sequence {
                         issues.push(Issue {
                             severity: Severity::Error,
+                            check_id: CheckId::MediaSequenceTags,
                             segment_index: -1,
                             rendition_a: Some(pl.name.clone()),
                             rendition_b: None,
@@ -815,31 +864,106 @@ async fn check_media_sequence_monotonicity(playlists: &[MediaPlaylist]) -> Vec<I
                     }
             }
             Err(e) => {
-                issues.push(Issue::warn(format!(
-                    "rfc8216bis §4.4.3.2 — MSN monotonicity: Could not re-fetch '{}' \
-                     for monotonicity check: {}",
-                    pl.name, e
-                )));
+                issues.push(
+                    Issue::warn(format!(
+                        "rfc8216bis §4.4.3.2 — MSN monotonicity: Could not re-fetch '{}' \
+                         for monotonicity check: {}",
+                        pl.name, e
+                    ))
+                    .for_check(CheckId::PlaylistFetch),
+                );
             }
         }
     }
     issues
 }
 
-/// Fetch and validate Playlist Delta Updates for playlists that advertise CAN-SKIP-UNTIL
+/// The CAN-SKIP-UNTIL boundary to probe for `pl`, or `None` when a Playlist Delta Update
+/// does not apply to it.
+///
+/// A playlist that has ENDLIST is final: it will never gain a segment, so there is nothing
+/// for a client to skip past and no reason for a server to answer `_HLS_skip=YES` with
+/// EXT-X-SKIP.
+fn delta_update_can_skip_until(pl: &MediaPlaylist) -> Option<f64> {
+    if pl.has_endlist {
+        return None;
+    }
+    pl.server_control.as_ref()?.can_skip_until.filter(|v| *v > 0.0)
+}
+
+/// What a Playlist Delta Update response must contain (rfc8216bis §6.2.5.1, §8).
+///
+/// SKIPPED-SEGMENTS is deliberately not checked for being greater than zero: the server skips
+/// the segments older than CAN-SKIP-UNTIL, and a window that has just started or has been
+/// trimmed can have none to skip, which is a conforming answer.
+fn delta_response_issues(
+    name: &str,
+    delta_url: &str,
+    delta_content: &str,
+    delta_pl: &MediaPlaylist,
+) -> Vec<Issue> {
+    let mut issues = Vec::new();
+
+    if !delta_content.contains("#EXT-X-SKIP:") {
+        issues.push(Issue {
+            severity: Severity::Error,
+            check_id: CheckId::DeltaUpdates,
+            rendition_a: Some(name.to_string()),
+            uri_a: Some(delta_url.to_string()),
+            message: format!(
+                "rfc8216bis §6.2.5.1: Delta update response for '{}' does not contain \
+                 EXT-X-SKIP. The server MUST include EXT-X-SKIP when responding to \
+                 _HLS_skip=YES.",
+                name
+            ),
+            ..Default::default()
+        });
+    }
+    if !delta_content.contains("#EXT-X-MEDIA-SEQUENCE:") {
+        issues.push(Issue {
+            severity: Severity::Error,
+            check_id: CheckId::DeltaUpdates,
+            rendition_a: Some(name.to_string()),
+            uri_a: Some(delta_url.to_string()),
+            message: format!(
+                "rfc8216bis §6.2.5.1: Delta update response for '{}' is missing \
+                 EXT-X-MEDIA-SEQUENCE. All tags not skipped MUST remain in the delta playlist.",
+                name
+            ),
+            ..Default::default()
+        });
+    }
+    if delta_pl.version < 9 {
+        issues.push(Issue {
+            severity: Severity::Error,
+            check_id: CheckId::VersionCompatibility,
+            rendition_a: Some(name.to_string()),
+            uri_a: Some(delta_url.to_string()),
+            message: format!(
+                "rfc8216bis §8: Delta update response for '{}' declares EXT-X-VERSION:{} \
+                 but EXT-X-SKIP requires VERSION >= 9.",
+                name, delta_pl.version
+            ),
+            ..Default::default()
+        });
+    }
+
+    issues
+}
+
+/// Fetch and validate Playlist Delta Updates for playlists that advertise CAN-SKIP-UNTIL.
+///
+/// Only live playlists are probed. A Playlist Delta Update exists so a client can reload a
+/// playlist that is still changing without re-reading the whole window; a playlist that has
+/// ENDLIST will never change again, so requesting `_HLS_skip=YES` against it and then
+/// requiring EXT-X-SKIP in the answer was demanding something the spec does not.
 async fn check_playlist_delta_updates(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<DeltaReport>) {
     let mut issues = Vec::new();
     let mut reports = Vec::new();
 
     for pl in playlists {
-        let sc = match &pl.server_control {
-            Some(sc) => sc,
-            None => continue,
-        };
-        let can_skip = match sc.can_skip_until {
-            Some(v) if v > 0.0 => v,
-            _ => continue,
-        };
+        let Some(can_skip) = delta_update_can_skip_until(pl) else { continue };
+        let sc = pl.server_control.as_ref().expect("CAN-SKIP-UNTIL comes from SERVER-CONTROL");
 
         // Build delta URL by appending _HLS_skip=YES
         let sep = if pl.url.contains('?') { "&" } else { "?" };
@@ -861,81 +985,12 @@ async fn check_playlist_delta_updates(playlists: &[MediaPlaylist]) -> (Vec<Issue
                 let skipped = delta_pl.skipped_segments as usize;
                 let delta_seg_count = delta_pl.segments.len();
 
-                // Validate delta response content per rfc8216bis §6.2.5.1
-                // 1. EXT-X-SKIP MUST be present
-                if !delta_content.contains("#EXT-X-SKIP:") {
-                    issues.push(Issue {
-                        severity: Severity::Error,
-                        segment_index: -1,
-                        rendition_a: Some(pl.name.clone()),
-                        rendition_b: None,
-                        uri_a: Some(delta_url.clone()),
-                        uri_b: None,
-                        message: format!(
-                            "rfc8216bis §6.2.5.1: Delta update response for '{}' does not \
-                             contain EXT-X-SKIP. The server MUST include EXT-X-SKIP when \
-                             responding to _HLS_skip=YES.",
-                            pl.name
-                        ),
-                        uri_note: None,
-                        ..Default::default()
-                    });
-                } else if skipped == 0 {
-                    // 2. SKIPPED-SEGMENTS MUST be > 0
-                    issues.push(Issue {
-                        severity: Severity::Error,
-                        segment_index: -1,
-                        rendition_a: Some(pl.name.clone()),
-                        rendition_b: None,
-                        uri_a: Some(delta_url.clone()),
-                        uri_b: None,
-                        message: format!(
-                            "rfc8216bis §6.2.5.1: Delta update for '{}' has \
-                             EXT-X-SKIP SKIPPED-SEGMENTS=0. At least one segment \
-                             must be skipped in a valid delta response.",
-                            pl.name
-                        ),
-                        uri_note: None,
-                        ..Default::default()
-                    });
-                }
-                // 3. EXT-X-MEDIA-SEQUENCE MUST still be present in delta response
-                if !delta_content.contains("#EXT-X-MEDIA-SEQUENCE:") {
-                    issues.push(Issue {
-                        severity: Severity::Error,
-                        segment_index: -1,
-                        rendition_a: Some(pl.name.clone()),
-                        rendition_b: None,
-                        uri_a: Some(delta_url.clone()),
-                        uri_b: None,
-                        message: format!(
-                            "rfc8216bis §6.2.5.1: Delta update response for '{}' is missing \
-                             EXT-X-MEDIA-SEQUENCE. All tags not skipped MUST remain in the \
-                             delta playlist.",
-                            pl.name
-                        ),
-                        uri_note: None,
-                        ..Default::default()
-                    });
-                }
-                // 4. VERSION MUST be >= 9 when EXT-X-SKIP is used
-                if delta_pl.version < 9 {
-                    issues.push(Issue {
-                        severity: Severity::Error,
-                        segment_index: -1,
-                        rendition_a: Some(pl.name.clone()),
-                        rendition_b: None,
-                        uri_a: Some(delta_url.clone()),
-                        uri_b: None,
-                        message: format!(
-                            "rfc8216bis §8: Delta update response for '{}' declares \
-                             EXT-X-VERSION:{} but EXT-X-SKIP requires VERSION >= 9.",
-                            pl.name, delta_pl.version
-                        ),
-                        uri_note: None,
-                        ..Default::default()
-                    });
-                }
+                issues.extend(delta_response_issues(
+                    &pl.name,
+                    &delta_url,
+                    delta_content,
+                    &delta_pl,
+                ));
 
                 reports.push(DeltaReport {
                     name: pl.name.clone(),
@@ -968,6 +1023,7 @@ async fn check_playlist_delta_updates(playlists: &[MediaPlaylist]) -> (Vec<Issue
                 });
                 issues.push(Issue {
                     severity: Severity::Warn,
+                    check_id: CheckId::PlaylistFetch,
                     segment_index: -1,
                     rendition_a: Some(pl.name.clone()),
                     rendition_b: None,
@@ -1187,6 +1243,318 @@ mod tests {
 
         // Playlist's own definition must win
         assert_eq!(pl_defs.get("VAR_A"), Some(&"from_pl".to_string()));
+    }
+
+    // ── categorize_issues ─────────────────────────────────────────────────────
+
+    fn group<'a>(groups: &'a [CheckGroup], name: &str) -> &'a CheckGroup {
+        groups
+            .iter()
+            .find(|g| g.name == name)
+            .unwrap_or_else(|| panic!("no '{name}' group in {:?}", groups.iter().map(|g| &g.name).collect::<Vec<_>>()))
+    }
+
+    #[test]
+    fn check_defs_cover_every_check_id() {
+        for id in CheckId::ALL {
+            let matches = CHECK_DEFS.iter().filter(|d| d.id == *id).count();
+            assert_eq!(matches, 1, "{id:?} must have exactly one row in CHECK_DEFS, found {matches}");
+        }
+        assert!(
+            !CHECK_DEFS.iter().any(|d| d.id == CheckId::Unassigned),
+            "the catch-all group is added separately and must not be a CHECK_DEFS row"
+        );
+    }
+
+    #[test]
+    fn discontinuity_finding_lands_in_its_own_group() {
+        let issues = checks::check_discontinuity_sequence(&[
+            {
+                let mut pl = MediaPlaylist::new("v0".into(), "https://ex.com/v0.m3u8".into());
+                pl.discontinuity_sequence = 0;
+                pl
+            },
+            {
+                let mut pl = MediaPlaylist::new("v1".into(), "https://ex.com/v1.m3u8".into());
+                pl.discontinuity_sequence = 3;
+                pl
+            },
+        ]);
+        assert_eq!(issues.len(), 1, "expected one discontinuity finding: {issues:?}");
+
+        let groups = categorize_issues(&issues);
+        assert_eq!(group(&groups, "Discontinuity Sequence").issues.len(), 1);
+        assert_eq!(group(&groups, "Discontinuity Sequence").status, "FAIL");
+        assert!(
+            groups.iter().all(|g| g.name == "Discontinuity Sequence" || g.issues.is_empty()),
+            "no other group may claim the finding"
+        );
+    }
+
+    #[test]
+    fn target_duration_groups_do_not_steal_each_others_findings() {
+        // Both messages name TARGETDURATION, which is how keyword matching used to file the
+        // consistency finding under Target Duration Compliance and then drop it.
+        let issues = vec![
+            Issue::error("rfc8216bis §4.4.3.1: TARGETDURATION missing".into())
+                .for_check(CheckId::TargetDurationCompliance),
+            Issue::error("rfc8216bis §6.2.4: TARGETDURATION values differ".into())
+                .for_check(CheckId::TargetDurationConsistency),
+        ];
+        let groups = categorize_issues(&issues);
+        assert_eq!(group(&groups, "Target Duration Compliance").issues.len(), 1);
+        assert_eq!(group(&groups, "Target Duration Consistency").issues.len(), 1);
+    }
+
+    #[test]
+    fn ll_hls_findings_are_not_stolen_by_target_duration_compliance() {
+        // CAN-SKIP-UNTIL and HOLD-BACK are both expressed as multiples of TARGETDURATION.
+        let mut pl = MediaPlaylist::new("v".into(), "https://ex.com/v.m3u8".into());
+        pl.target_duration = 6.0;
+        pl.server_control = Some(ServerControl {
+            can_skip_until: Some(12.0),
+            hold_back: Some(6.0),
+            part_hold_back: None,
+            can_block_reload: true,
+            can_skip_dateranges: false,
+        });
+        let issues = checks::check_ll_hls_compliance(&[pl]);
+        assert!(
+            issues.iter().any(|i| i.message.contains("CAN-SKIP-UNTIL")),
+            "expected a CAN-SKIP-UNTIL finding: {issues:?}"
+        );
+        assert!(
+            issues.iter().any(|i| i.message.contains("HOLD-BACK")),
+            "expected a HOLD-BACK finding: {issues:?}"
+        );
+
+        let groups = categorize_issues(&issues);
+        assert_eq!(group(&groups, "LL-HLS Compliance").issues.len(), issues.len());
+        assert!(group(&groups, "Target Duration Compliance").issues.is_empty());
+    }
+
+    #[test]
+    fn fetch_failures_reach_the_report() {
+        let issues = vec![
+            Issue::warn("rfc8216bis §6.2: Could not fetch media playlist 'x': 404".into())
+                .for_check(CheckId::PlaylistFetch),
+        ];
+        let groups = categorize_issues(&issues);
+        assert_eq!(group(&groups, "Playlist Retrieval").issues.len(), 1);
+        assert_eq!(group(&groups, "Playlist Retrieval").status, "WARN");
+    }
+
+    #[test]
+    fn a_finding_that_names_no_check_is_still_reported() {
+        let issues = vec![Issue::error("something nothing claims".into())];
+        let groups = categorize_issues(&issues);
+        let other = group(&groups, UNGROUPED_NAME);
+        assert_eq!(other.issues.len(), 1, "an unclaimed finding must not be dropped");
+        assert_eq!(other.status, "FAIL");
+    }
+
+    #[test]
+    fn every_finding_is_grouped_exactly_once() {
+        let issues: Vec<Issue> = CheckId::ALL.iter()
+            .map(|id| Issue::warn(format!("finding from {id:?}")).for_check(*id))
+            .collect();
+        let groups = categorize_issues(&issues);
+        let grouped: usize = groups.iter().map(|g| g.issues.len()).sum();
+        assert_eq!(grouped, issues.len(), "every finding must appear in exactly one group");
+        assert!(
+            !groups.iter().any(|g| g.name == UNGROUPED_NAME),
+            "no finding from a known check may fall through to the catch-all group"
+        );
+    }
+
+    // ── run_fetched_stream_checks ─────────────────────────────────────────────
+
+    /// A live media playlist with a broken interstitial, a segment URI with no EXTINF, a
+    /// genuine SCTE-35 break and no #EXTM3U, so one fixture exercises each of the paths that
+    /// used to be reachable only through a multivariant playlist.
+    fn media_only_playlist() -> MediaPlaylist {
+        let content = "#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-VERSION:9\n\
+             #EXT-X-MEDIA-SEQUENCE:10\n\
+             #EXT-X-DATERANGE:ID=\"ad-1\",CLASS=\"com.apple.hls.interstitial\",\
+             START-DATE=\"2024-01-15T12:00:00Z\"\n\
+             #EXT-X-DATERANGE:ID=\"0x30-1-99\",START-DATE=\"2024-01-15T12:00:04Z\",\
+             SCTE35-OUT=0xFC\n\
+             #EXTINF:4.0,\n\
+             #EXT-X-PROGRAM-DATE-TIME:2024-01-15T12:00:00Z\n\
+             s0.m4s\n\
+             #EXTINF:4.0,\ns1.m4s\n\
+             #EXTINF:4.0,\ns2.m4s\n\
+             orphan.m4s\n";
+        let url = "https://cdn.example.com/media.m3u8";
+        let mut pl = MediaPlaylist::new("media".to_string(), url.to_string());
+        parse_media_playlist(url, content, &mut pl);
+        pl
+    }
+
+    fn report_for(master: Option<&MasterPlaylist>, playlists: &[MediaPlaylist]) -> ValidationReport {
+        let mut report = ValidationReport::new();
+        report.tolerance_ms = 100.0;
+        run_fetched_stream_checks(master, playlists, &mut report);
+        report
+    }
+
+    #[test]
+    fn a_media_only_stream_is_checked_without_a_multivariant_playlist() {
+        let playlists = vec![media_only_playlist()];
+        let report = report_for(None, &playlists);
+
+        let ids: Vec<CheckId> = report.issues.iter().map(|i| i.check_id).collect();
+        assert!(
+            ids.contains(&CheckId::Interstitials),
+            "interstitial checks must run for a media-only URL: {:#?}",
+            report.issues.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+        assert!(report.has_interstitials_data, "the UI needs the interstitial data too");
+        assert_eq!(report.interstitials.len(), 1);
+        assert!(
+            ids.contains(&CheckId::SegmentStructure),
+            "parser findings must reach the report for a media-only URL"
+        );
+        assert!(
+            ids.contains(&CheckId::ExtM3uHeader),
+            "media-playlist checks must run for a media-only URL"
+        );
+        assert!(report.has_scte35_data, "SCTE-35 collection must run for a media-only URL");
+        assert!(
+            report.playlist_window_s > 0.0,
+            "the playlist window must be computed for a media-only URL"
+        );
+    }
+
+    #[test]
+    fn multivariant_checks_run_only_when_there_is_a_multivariant_playlist() {
+        // A master with no BANDWIDTH and a dangling AUDIO reference, so the master-only
+        // checks have something to report when they are given one.
+        let master = parser::parse_master_playlist(
+            "https://cdn.example.com/master.m3u8",
+            "#EXTM3U\n#EXT-X-VERSION:9\n\
+             #EXT-X-STREAM-INF:AUDIO=\"missing\",CODECS=\"avc1.64001f\"\nv.m3u8\n",
+        );
+        let playlists = vec![media_only_playlist()];
+
+        let with_master = report_for(Some(&master), &playlists);
+        let master_ids: Vec<CheckId> = with_master.issues.iter().map(|i| i.check_id).collect();
+        assert!(master_ids.contains(&CheckId::BandwidthRequired), "{master_ids:?}");
+        assert!(master_ids.contains(&CheckId::RenditionGroupReferences), "{master_ids:?}");
+
+        let media_only = report_for(None, &playlists);
+        let media_ids: Vec<CheckId> = media_only.issues.iter().map(|i| i.check_id).collect();
+        assert!(
+            !media_ids.contains(&CheckId::BandwidthRequired)
+                && !media_ids.contains(&CheckId::RenditionGroupReferences)
+                && !media_ids.contains(&CheckId::StreamInfConsistency)
+                && !media_ids.contains(&CheckId::MediaGroupMembership),
+            "checks that read the multivariant playlist cannot run without one: {media_ids:?}"
+        );
+    }
+
+    #[test]
+    fn run_media_checks_folds_parse_issues_into_the_report() {
+        let mut pl = MediaPlaylist::new("v".into(), "https://ex.com/v.m3u8".into());
+        pl.raw_content = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-ENDLIST\n".to_string();
+        pl.target_duration = 4.0;
+        pl.has_endlist = true;
+        pl.parse_issues = vec![
+            Issue::error("rfc8216bis §4.4.4.1: Media Segment URI on line 4 has no preceding \
+                          EXTINF tag.".into())
+                .for_check(CheckId::SegmentStructure),
+        ];
+
+        let mut report = ValidationReport::new();
+        report.tolerance_ms = 100.0;
+        run_media_checks(&[pl], &mut report);
+
+        let folded: Vec<&Issue> = report.issues.iter()
+            .filter(|i| i.check_id == CheckId::SegmentStructure)
+            .collect();
+        assert_eq!(
+            folded.len(),
+            1,
+            "a segment the parser could not build must be reported: {:#?}",
+            report.issues.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+        assert_eq!(folded[0].severity, Severity::Error);
+
+        // And it survives into the grouped view the UI renders.
+        let groups = categorize_issues(&report.issues);
+        assert_eq!(group(&groups, "Segment Structure").issues.len(), 1);
+    }
+
+    // ── delta_response_issues ─────────────────────────────────────────────────
+
+    fn delta_playlist(content: &str) -> MediaPlaylist {
+        let url = "https://cdn.example.com/v.m3u8?_HLS_skip=YES";
+        let mut pl = MediaPlaylist::new("v (delta)".to_string(), url.to_string());
+        parse_media_playlist(url, content, &mut pl);
+        pl
+    }
+
+    #[test]
+    fn a_delta_response_that_skipped_nothing_is_accepted() {
+        // SKIPPED-SEGMENTS=0 is a conforming answer when the window holds nothing older than
+        // CAN-SKIP-UNTIL, so it must not be reported.
+        let content = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-SKIP:SKIPPED-SEGMENTS=0\n\
+             #EXTINF:4.0,\ns0.m4s\n";
+        let delta_pl = delta_playlist(content);
+        assert_eq!(delta_pl.skipped_segments, 0);
+        let issues = delta_response_issues("v", "https://ex.com/v.m3u8?_HLS_skip=YES", content, &delta_pl);
+        assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
+    fn a_delta_response_missing_ext_x_skip_errors() {
+        let content = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MEDIA-SEQUENCE:10\n#EXTINF:4.0,\ns0.m4s\n";
+        let delta_pl = delta_playlist(content);
+        let issues = delta_response_issues("v", "https://ex.com/v.m3u8?_HLS_skip=YES", content, &delta_pl);
+        assert_eq!(issues.len(), 1, "{issues:#?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert_eq!(issues[0].check_id, CheckId::DeltaUpdates);
+        assert!(issues[0].message.contains("EXT-X-SKIP"));
+    }
+
+    #[test]
+    fn a_delta_response_below_version_9_errors() {
+        let content = "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:4\n\
+             #EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-SKIP:SKIPPED-SEGMENTS=4\n\
+             #EXTINF:4.0,\ns0.m4s\n";
+        let delta_pl = delta_playlist(content);
+        let issues = delta_response_issues("v", "https://ex.com/v.m3u8?_HLS_skip=YES", content, &delta_pl);
+        assert_eq!(issues.len(), 1, "{issues:#?}");
+        assert_eq!(issues[0].check_id, CheckId::VersionCompatibility);
+    }
+
+    // ── delta_update_can_skip_until ───────────────────────────────────────────
+
+    #[test]
+    fn delta_updates_are_probed_only_for_live_playlists() {
+        let mut live = MediaPlaylist::new("v".into(), "https://ex.com/v.m3u8".into());
+        live.server_control = Some(ServerControl {
+            can_skip_until: Some(36.0),
+            hold_back: Some(18.0),
+            part_hold_back: None,
+            can_block_reload: true,
+            can_skip_dateranges: false,
+        });
+        assert_eq!(delta_update_can_skip_until(&live), Some(36.0));
+
+        let mut ended = live.clone();
+        ended.has_endlist = true;
+        assert_eq!(
+            delta_update_can_skip_until(&ended),
+            None,
+            "a playlist with ENDLIST cannot serve a delta update"
+        );
+
+        let plain = MediaPlaylist::new("v".into(), "https://ex.com/v.m3u8".into());
+        assert_eq!(delta_update_can_skip_until(&plain), None);
     }
 
     #[test]
