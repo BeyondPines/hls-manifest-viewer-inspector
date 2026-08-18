@@ -446,10 +446,10 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
                 issues.push(author_error(
                     "1.5",
                     format!(
-                        "HEVC/DV init '{}' could not be parsed as fMP4 ('{}' declares {})",
+                        "HEVC/DV init '{}' could not be parsed as fMP4 ({} {})",
                         entry.uri,
-                        entry.playlist_names.join("', '"),
-                        declared.hevc_or_dv.join(", ")
+                        declared.hevc_or_dv.declaring_phrase(),
+                        declared.hevc_or_dv.tokens()
                     ),
                 ));
             }
@@ -458,10 +458,10 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
                 issues.push(author_error(
                     "1.39",
                     format!(
-                        "AV1 init '{}' could not be parsed as fMP4 ('{}' declares {})",
+                        "AV1 init '{}' could not be parsed as fMP4 ({} {})",
                         entry.uri,
-                        entry.playlist_names.join("', '"),
-                        declared.av1.join(", ")
+                        declared.av1.declaring_phrase(),
+                        declared.av1.tokens()
                     ),
                 ));
             }
@@ -1598,6 +1598,15 @@ https://example.com/1080.m3u8
         assert_eq!(issues[0].severity, Severity::Warn);
     }
 
+    /// The 1920×1080 rung with its audio moved into a group whose EXT-X-MEDIA carries a
+    /// URI. That URI is what makes the ladder demuxed: without it the group is a name for
+    /// audio still muxed into the variant's own segments.
+    const DEMUXED_LADDER: &str = r#"#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en",AUTOSELECT=YES,DEFAULT=YES,URI="https://example.com/a.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=6000000,AVERAGE-BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS="avc1.640029,mp4a.40.42",FRAME-RATE=30,AUDIO="aud"
+https://example.com/1080.m3u8
+"#;
+
     /// A demuxed variant's CODECS also names its audio group's codec. That token belongs to
     /// the group's own init, so no container rule reaches this one — and §1.2 has to stay
     /// the finding that reports it, rather than standing aside for an error nobody raised.
@@ -1606,7 +1615,53 @@ https://example.com/1080.m3u8
         let mut pl = container_playlist("avc1.640029,mp4a.40.42", "m4s", true);
         pl.audio_group = Some("aud".into());
         let inits = vec![unparseable_init(&pl.name)];
-        let issues = section_issues(TWO_RUNG_LADDER, &[pl], &inits, "1.2");
+        let issues = section_issues(DEMUXED_LADDER, &[pl], &inits, "1.2");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Warn);
+    }
+
+    /// The same variant against a group whose EXT-X-MEDIA has no URI — §8.9's shape, where
+    /// the audio never left the variant's segments. §2.25 owns that init, so §1.2 stands
+    /// aside for the error rules_audio reports rather than warning about the same bytes.
+    #[test]
+    fn author_1_2_gives_way_when_a_uri_less_audio_group_leaves_the_audio_muxed() {
+        const MUXED_GROUP_LADDER: &str = r#"#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en",AUTOSELECT=YES,DEFAULT=YES
+#EXT-X-STREAM-INF:BANDWIDTH=6000000,AVERAGE-BANDWIDTH=5000000,RESOLUTION=1920x1080,CODECS="avc1.640029,mp4a.40.42",FRAME-RATE=30,AUDIO="aud"
+https://example.com/1080.m3u8
+"#;
+        let mut pl = container_playlist("avc1.640029,mp4a.40.42", "m4s", true);
+        pl.audio_group = Some("aud".into());
+        let inits = vec![unparseable_init(&pl.name)];
+        assert!(
+            section_issues(MUXED_GROUP_LADDER, &[pl], &inits, "1.2").is_empty(),
+            "§2.25 reports this init; §1.2 would only repeat it"
+        );
+    }
+
+    /// An I-frame playlist has no AUDIO attribute to reason about and often shares the
+    /// variant's EXT-X-MAP, so a packager that copied the whole CODECS string onto the
+    /// EXT-X-I-FRAME-STREAM-INF must not hand the video init an audio token. §1.2 is left
+    /// to report the init, which is what proves no container rule claimed it.
+    ///
+    /// The master declaring this playlist under EXT-X-I-FRAME-STREAM-INF is the whole
+    /// signal here: §6.8 exists because a trick-play playlist may omit the
+    /// EXT-X-I-FRAMES-ONLY tag that would say so itself.
+    #[test]
+    fn author_1_2_reports_an_init_an_iframe_playlists_copied_codecs_does_not_claim() {
+        let mut video = container_playlist("avc1.640029,mp4a.40.42", "m4s", true);
+        video.audio_group = Some("aud".into());
+        let mut iframe = container_playlist("avc1.640029,mp4a.40.42", "m4s", true);
+        iframe.name = "iframe/1920x1080".into();
+        iframe.is_iframe = true;
+        let inits = vec![InitProbeEntry {
+            uri: "https://example.com/init.mp4".into(),
+            byterange: None,
+            playlist_names: vec![video.name.clone(), iframe.name.clone()],
+            media_types: vec!["VIDEO".into()],
+            probe: InitSegmentProbe::default(),
+        }];
+        let issues = section_issues(DEMUXED_LADDER, &[video, iframe], &inits, "1.2");
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert_eq!(issues[0].severity, Severity::Warn);
     }
@@ -1634,6 +1689,34 @@ https://example.com/1080.m3u8
         let issues = section_issues(TWO_RUNG_LADDER, &[pl], &inits, "1.2");
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert_eq!(issues[0].severity, Severity::Warn);
+    }
+
+    /// A finding names its evidence, and a playlist whose token was discounted is not it.
+    /// Here an audio rendition sharing the init inherited the video's HEVC token: §1.5
+    /// still fires for the variant, and must cite the variant alone.
+    #[test]
+    fn author_1_5_names_only_the_playlist_whose_codec_it_cites() {
+        let video = container_playlist("hvc1.2.4.L123.B0", "m4s", true);
+        let mut audio = container_playlist("hvc1.2.4.L123.B0", "m4s", true);
+        audio.name = "audio/English (aud)".into();
+        audio.media_type = "AUDIO".into();
+        let inits = vec![InitProbeEntry {
+            uri: "https://example.com/init.mp4".into(),
+            byterange: None,
+            playlist_names: vec![video.name.clone(), audio.name.clone()],
+            media_types: vec!["VIDEO".into(), "AUDIO".into()],
+            probe: InitSegmentProbe::default(),
+        }];
+        let issues = section_issues(TWO_RUNG_LADDER, &[video, audio], &inits, "1.5");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(
+            issues[0]
+                .message
+                .contains("'video/1920x1080' declares hvc1.2.4.L123.B0")
+                && !issues[0].message.contains("audio/English"),
+            "got: {}",
+            issues[0].message
+        );
     }
 
     // ── §1.37 AV1 level, §1.38 APMP mono projection ──────────────────────────

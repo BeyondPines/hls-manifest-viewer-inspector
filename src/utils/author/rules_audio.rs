@@ -293,10 +293,10 @@ pub fn check(ctx: &AuthoringContext<'_>) -> Vec<Issue> {
         issues.push(author_error(
             "2.25",
             format!(
-                "init '{}' could not be parsed as fMP4 ('{}' declares {}, which MUST use fMP4)",
+                "init '{}' could not be parsed as fMP4 ({} {}, which MUST use fMP4)",
                 entry.uri,
-                entry.playlist_names.join("', '"),
-                declared.fmp4_only_audio.join(", ")
+                declared.fmp4_only_audio.declaring_phrase(),
+                declared.fmp4_only_audio.tokens()
             ),
         ));
     }
@@ -482,13 +482,20 @@ mod tests {
 
     // ── §2.19 APAC loudness, §2.25 container ─────────────────────────────────
 
-    /// Audio findings citing exactly `rule`. The citation is followed by a colon, which
-    /// keeps §2.2 from also matching §2.25 and §2.27.
-    fn rule_issues(playlists: &[MediaPlaylist], inits: &[InitProbeEntry], rule: &str) -> Vec<Issue> {
-        let master = parse_master_playlist(
-            "https://example.com/master.m3u8",
-            "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",LANGUAGE=\"en\",AUTOSELECT=YES,DEFAULT=YES,URI=\"a.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,AVERAGE-BANDWIDTH=1800000,RESOLUTION=1280x720,CODECS=\"avc1.4d401f,mp4a.40.42\",FRAME-RATE=30,AUDIO=\"aud\"\nhttps://example.com/v.m3u8\n",
-        );
+    /// A demuxed ladder: the AUDIO group's EXT-X-MEDIA carries a URI, which is what moves
+    /// the audio out of the variant's own segments and into the group's init.
+    const DEMUXED_MASTER: &str = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",LANGUAGE=\"en\",AUTOSELECT=YES,DEFAULT=YES,URI=\"a.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,AVERAGE-BANDWIDTH=1800000,RESOLUTION=1280x720,CODECS=\"avc1.4d401f,mp4a.40.42\",FRAME-RATE=30,AUDIO=\"aud\"\nhttps://example.com/v.m3u8\n";
+
+    /// Audio findings citing exactly `rule` when the rules are run over `master_text`.
+    /// The citation is followed by a colon, which keeps §2.2 from also matching §2.25
+    /// and §2.27.
+    fn rule_issues_for_master(
+        master_text: &str,
+        playlists: &[MediaPlaylist],
+        inits: &[InitProbeEntry],
+        rule: &str,
+    ) -> Vec<Issue> {
+        let master = parse_master_playlist("https://example.com/master.m3u8", master_text);
         let opts = ValidateAuthorOptions::default();
         let segs: Vec<SegmentSample> = Vec::new();
         let vtts: Vec<WebVttSample> = Vec::new();
@@ -498,6 +505,11 @@ mod tests {
             .into_iter()
             .filter(|i| i.message.contains(&needle))
             .collect()
+    }
+
+    /// The same, over the demuxed ladder most of these tests are written against.
+    fn rule_issues(playlists: &[MediaPlaylist], inits: &[InitProbeEntry], rule: &str) -> Vec<Issue> {
+        rule_issues_for_master(DEMUXED_MASTER, playlists, inits, rule)
     }
 
     /// An APAC audio init, optionally carrying the `ludt` loudness box that §2.19 says
@@ -693,6 +705,146 @@ mod tests {
         assert!(
             issues[0].message.contains("mp4a.40.42") && !issues[0].message.contains("audio init"),
             "a muxed init holds video too, so it is not an audio init, got: {}",
+            issues[0].message
+        );
+    }
+
+    /// An `EXT-X-MEDIA:TYPE=AUDIO` with no URI names a group without moving anything into
+    /// it: the audio is still in the variant's segments, which is what §8.9 warns about.
+    /// The AUDIO attribute alone must not excuse this init from the container rule.
+    #[test]
+    fn author_2_25_errors_when_a_uri_less_audio_group_leaves_the_audio_muxed() {
+        const MUXED_GROUP_MASTER: &str = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",LANGUAGE=\"en\",AUTOSELECT=YES,DEFAULT=YES\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,AVERAGE-BANDWIDTH=1800000,RESOLUTION=1280x720,CODECS=\"avc1.640029,mp4a.40.42\",FRAME-RATE=30,AUDIO=\"aud\"\nhttps://example.com/v.m3u8\n";
+        let playlists = [video_variant("avc1.640029,mp4a.40.42", Some("aud"))];
+        let issues = rule_issues_for_master(
+            MUXED_GROUP_MASTER,
+            &playlists,
+            &[unparseable_video_init()],
+            "2.25",
+        );
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(
+            issues[0].message.contains("mp4a.40.42"),
+            "got: {}",
+            issues[0].message
+        );
+    }
+
+    /// An audio-only variant may point at the group its own URI serves. It then declares
+    /// no RESOLUTION and one audio token, its EXT-X-MAP is the group's init, and standing
+    /// down on the AUDIO attribute would leave the init nobody else declares unchecked.
+    #[test]
+    fn author_2_25_errors_when_an_audio_only_variant_points_at_its_own_group() {
+        let mut pl = video_variant("mp4a.40.42", Some("aud"));
+        pl.name = "audio/English (aud)".into();
+        let inits = [InitProbeEntry {
+            uri: "https://example.com/a-init.mp4".into(),
+            byterange: None,
+            playlist_names: vec![pl.name.clone()],
+            media_types: vec!["AUDIO".into()],
+            probe: crate::utils::mp4_probe::InitSegmentProbe::default(),
+        }];
+        let issues = rule_issues(&[pl], &inits, "2.25");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(
+            issues[0].message.contains("mp4a.40.42"),
+            "got: {}",
+            issues[0].message
+        );
+    }
+
+    /// I-frame playlists carry trick-play video alone, and often share the variant's
+    /// EXT-X-MAP. A packager that copies the whole CODECS string onto the
+    /// EXT-X-I-FRAME-STREAM-INF must not thereby hand the video init an audio token the
+    /// demuxed variant referencing the same init was already excused from.
+    ///
+    /// Trick-play is recognised from either signal, and this playlist carries only its
+    /// own EXT-X-I-FRAMES-ONLY tag — the master-side EXT-X-I-FRAME-STREAM-INF is what
+    /// §1.2's counterpart test is written against.
+    #[test]
+    fn author_2_25_ignores_an_audio_token_copied_onto_an_iframe_playlist() {
+        let video = video_variant("avc1.640029,mp4a.40.42", Some("aud"));
+        let mut iframe = video_variant("avc1.640029,mp4a.40.42", None);
+        iframe.name = "iframe/1280x720".into();
+        iframe.iframes_only = true;
+        let inits = [InitProbeEntry {
+            uri: "https://example.com/v-init.mp4".into(),
+            byterange: None,
+            playlist_names: vec![video.name.clone(), iframe.name.clone()],
+            media_types: vec!["VIDEO".into()],
+            probe: crate::utils::mp4_probe::InitSegmentProbe::default(),
+        }];
+        let issues = rule_issues(&[video, iframe], &inits, "2.25");
+        assert!(
+            issues.is_empty(),
+            "the xHE-AAC is in the audio group's init, and trick-play holds no audio: {issues:?}"
+        );
+    }
+
+    /// A variant that forgot its video token still has a RESOLUTION, which is what tells
+    /// it apart from an audio-only rendition. Reading it as audio-only would put the
+    /// group's xHE-AAC back on the video init the group was demuxed out of.
+    #[test]
+    fn author_2_25_reads_a_variants_resolution_before_calling_it_audio_only() {
+        let mut pl = video_variant("mp4a.40.42", Some("aud"));
+        pl.resolution = Some("1920x1080".into());
+        let issues = rule_issues(&[pl], &[unparseable_video_init()], "2.25");
+        assert!(
+            issues.is_empty(),
+            "a variant with a RESOLUTION carries video, whatever its CODECS forgot: {issues:?}"
+        );
+    }
+
+    /// Two rungs sharing one init both declare the codec it failed to parse, so the
+    /// finding names both — and a list of two takes the plural verb.
+    #[test]
+    fn author_2_25_agrees_its_verb_with_the_playlists_it_names() {
+        let low = video_variant("avc1.640029,mp4a.40.42", None);
+        let mut high = video_variant("avc1.640029,mp4a.40.42", None);
+        high.name = "video/1920x1080".into();
+        let inits = [InitProbeEntry {
+            uri: "https://example.com/v-init.mp4".into(),
+            byterange: None,
+            playlist_names: vec![low.name.clone(), high.name.clone()],
+            media_types: vec!["VIDEO".into()],
+            probe: crate::utils::mp4_probe::InitSegmentProbe::default(),
+        }];
+        let issues = rule_issues(&[low, high], &inits, "2.25");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(
+            issues[0]
+                .message
+                .contains("'video/1280x720', 'video/1920x1080' declare mp4a.40.42")
+                && !issues[0].message.contains("declares"),
+            "two playlists take 'declare', got: {}",
+            issues[0].message
+        );
+    }
+
+    /// A finding names its evidence, and the playlists whose tokens were discounted are
+    /// not it. Only the variant that really declared the codec belongs in the message.
+    #[test]
+    fn author_2_25_names_only_the_playlist_whose_codec_it_cites() {
+        let muxed = video_variant("avc1.640029,mp4a.40.42", None);
+        let mut demuxed = video_variant("avc1.640029,mp4a.40.42", Some("aud"));
+        demuxed.name = "video/1920x1080".into();
+        let inits = [InitProbeEntry {
+            uri: "https://example.com/v-init.mp4".into(),
+            byterange: None,
+            playlist_names: vec![muxed.name.clone(), demuxed.name.clone()],
+            media_types: vec!["VIDEO".into()],
+            probe: crate::utils::mp4_probe::InitSegmentProbe::default(),
+        }];
+        let issues = rule_issues(&[muxed, demuxed], &inits, "2.25");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(
+            issues[0]
+                .message
+                .contains("'video/1280x720' declares mp4a.40.42")
+                && !issues[0].message.contains("video/1920x1080"),
+            "got: {}",
             issues[0].message
         );
     }

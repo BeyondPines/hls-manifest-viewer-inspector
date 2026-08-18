@@ -171,16 +171,59 @@ pub fn audio_requires_fmp4(token: &str) -> bool {
         || t.starts_with("flac")
 }
 
+/// The codecs one container rule was told an init carries, and the playlists that said so.
+///
+/// A finding names its evidence, and after tokens have been discounted the playlists that
+/// reference the init are no longer that evidence: the ones whose CODECS actually
+/// contributed a token are. Those are kept alongside the tokens so the message can cite
+/// them instead.
+#[derive(Debug, Clone, Default)]
+pub struct DeclaredTokens {
+    tokens: Vec<String>,
+    playlists: Vec<String>,
+}
+
+impl DeclaredTokens {
+    fn push(&mut self, token: &str, playlist: &str) {
+        if !self.tokens.iter().any(|t| t == token) {
+            self.tokens.push(token.to_string());
+        }
+        if !self.playlists.iter().any(|p| p == playlist) {
+            self.playlists.push(playlist.to_string());
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    /// The tokens as a finding lists them: `hvc1.2.4.L123.B0, dvh1.05.03`.
+    pub fn tokens(&self) -> String {
+        self.tokens.join(", ")
+    }
+
+    /// The contributing playlists and a verb that agrees with them: `'video' declares`.
+    pub fn declaring_phrase(&self) -> String {
+        let names: Vec<String> = self.playlists.iter().map(|n| format!("'{n}'")).collect();
+        let verb = if self.playlists.len() == 1 {
+            "declares"
+        } else {
+            "declare"
+        };
+        format!("{} {verb}", names.join(", "))
+    }
+}
+
 /// The codecs an init segment was meant to carry, grouped by the container rule that
 /// applies to each.
 #[derive(Debug, Clone, Default)]
 pub struct DeclaredCodecs {
     /// §1.5 codecs: HEVC and Dolby Vision.
-    pub hevc_or_dv: Vec<String>,
+    pub hevc_or_dv: DeclaredTokens,
     /// §1.39 codec: AV1.
-    pub av1: Vec<String>,
+    pub av1: DeclaredTokens,
     /// §2.25 codecs: xHE-AAC, APAC, ALAC and FLAC.
-    pub fmp4_only_audio: Vec<String>,
+    pub fmp4_only_audio: DeclaredTokens,
 }
 
 /// The fMP4-only codecs the playlists declaring `entry` say it carries.
@@ -197,16 +240,22 @@ pub struct DeclaredCodecs {
 /// of a STREAM-INF, which holds a video token when the packager wrote the two the other
 /// way round. Attributing either to this init blames it for a container rule about bytes
 /// it was never meant to carry.
+///
+/// Standing down has to be as narrow as the shape that earns it, or a real violation is
+/// lost. An AUDIO attribute on its own does not put the audio anywhere else:
+///
+/// * an `EXT-X-MEDIA:TYPE=AUDIO` with no URI is the muxed shape §8.9 warns about — the
+///   samples are in the variant's own segments even though the variant names a group;
+/// * an audio-only variant may point at the very group its own URI serves, so its init
+///   *is* the audio init and its only codec token is the one being discounted;
+/// * an I-frame playlist has no AUDIO attribute to reason about at all, and often shares
+///   the variant's EXT-X-MAP. A packager that copies the whole CODECS string onto
+///   `EXT-X-I-FRAME-STREAM-INF` would otherwise hand the video init an audio token it
+///   cannot carry — trick-play segments hold video alone.
 pub fn declared_codecs_for_init(
     ctx: &AuthoringContext<'_>,
     entry: &InitProbeEntry,
 ) -> DeclaredCodecs {
-    fn push_once(list: &mut Vec<String>, token: &str) {
-        if !list.iter().any(|t| t == token) {
-            list.push(token.to_string());
-        }
-    }
-
     let mut declared = DeclaredCodecs::default();
     let declaring = ctx
         .playlists
@@ -216,16 +265,31 @@ pub fn declared_codecs_for_init(
         let Some(codecs) = pl.codecs.as_deref() else {
             continue;
         };
-        let audio_lives_elsewhere = pl.audio_group.is_some();
+        // A group whose renditions carry a URI is one the audio was actually moved to.
+        let group_is_demuxed = pl.audio_group.as_deref().is_some_and(|group| {
+            ctx.master.is_some_and(|m| {
+                m.media_renditions
+                    .iter()
+                    .any(|r| r.media_type == "AUDIO" && r.group_id == group && r.uri.is_some())
+            })
+        });
+        // No RESOLUTION and no video token: whatever group this playlist names, the audio
+        // it declares is the only thing its own init could be holding.
+        let carries_only_audio = pl.resolution.is_none()
+            && !codec_tokens(codecs)
+                .iter()
+                .any(|t| video_codec_family(t).is_some());
+        let is_iframe = pl.is_iframe || pl.iframes_only;
+        let audio_lives_elsewhere = is_iframe || (group_is_demuxed && !carries_only_audio);
         let video_lives_elsewhere = pl.media_type == "AUDIO";
         for tok in codec_tokens(codecs) {
             match video_codec_family(tok) {
                 Some("hevc" | "dv") if !video_lives_elsewhere => {
-                    push_once(&mut declared.hevc_or_dv, tok)
+                    declared.hevc_or_dv.push(tok, &pl.name)
                 }
-                Some("av1") if !video_lives_elsewhere => push_once(&mut declared.av1, tok),
+                Some("av1") if !video_lives_elsewhere => declared.av1.push(tok, &pl.name),
                 None if audio_requires_fmp4(tok) && !audio_lives_elsewhere => {
-                    push_once(&mut declared.fmp4_only_audio, tok)
+                    declared.fmp4_only_audio.push(tok, &pl.name)
                 }
                 _ => {}
             }
