@@ -207,6 +207,9 @@ struct Mp4ProbeInfo {
     drm_systems: Vec<DrmInfo>,
     /// Boxes the walk could not decode and stepped over. See [`probe_mp4`].
     decode_errors: usize,
+    /// True only when the walk reached the last byte after reading at least one box.
+    /// An empty body and a header that will not read both leave this false.
+    walk_complete: bool,
 }
 
 impl Mp4ProbeInfo {
@@ -1057,7 +1060,16 @@ fn probe_mp4(data: Vec<u8>) -> Mp4ProbeInfo {
         while let Some(&end) = container_ends.last() {
             if reader.position() >= end { container_ends.pop(); } else { break; }
         }
-        if reader.position() as usize >= reader.get_ref().len() { break; }
+        if reader.position() as usize >= reader.get_ref().len() {
+            // Reaching the last byte is a complete walk only if something was actually
+            // read and every container closed. An empty body, and a `moov` header whose
+            // declared size runs past the data, both hit this arm and must not look
+            // like "no DRM".
+            if reader.position() > 0 && container_ends.is_empty() {
+                info.walk_complete = true;
+            }
+            break;
+        }
         let Ok(header) = Header::read_from(&mut reader) else { break; };
         let body_start = reader.position();
         let atom = match get_properties(&header, &mut reader) {
@@ -1831,7 +1843,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                         }
                         merge_drm(&mut r.drm_systems, mp4.drm_systems.clone());
                         r.init_segment_probed = true;
-                        r.init_partially_decoded |= mp4.decode_errors > 0;
+                        r.init_partially_decoded |= init_walk_was_partial(mp4);
                     }
                     Some(Err(e)) => {
                         r.probe_notes
@@ -1933,7 +1945,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                             apply_audio_init(at, amp4);
                             merge_drm(&mut r.drm_systems, amp4.drm_systems.clone());
                             r.init_segment_probed = true;
-                            r.init_partially_decoded |= amp4.decode_errors > 0;
+                            r.init_partially_decoded |= init_walk_was_partial(amp4);
                         }
                         Some(Err(e)) => {
                             r.probe_notes.push(format!(
@@ -1986,7 +1998,7 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
                     Ok(resp) => {
                         let mp4 = probe_mp4(resp.response_body);
                         r.major_brand = mp4.major_brand.clone();
-                        r.init_partially_decoded = mp4.decode_errors > 0;
+                        r.init_partially_decoded |= init_walk_was_partial(&mp4);
                         // Synthesise a single video track from what the init segment tells
                         // us. Everything here was read out of a box, so the colour fields
                         // are measured rather than inferred from a VIDEO-RANGE.
@@ -2019,6 +2031,27 @@ async fn probe_stream(url: &str, selected: &HashSet<String>) -> Result<ProbeRepo
     }
 
     Ok(r)
+}
+
+/// An init is only fully read when the walk reached the last byte without skipping a box.
+fn init_walk_was_partial(mp4: &Mp4ProbeInfo) -> bool {
+    mp4.decode_errors > 0 || !mp4.walk_complete
+}
+
+/// What the DRM row may say when no system was found. Only a complete walk of a fetched
+/// init can support "there are none".
+fn drm_status_label(probed: bool, partial: bool) -> &'static str {
+    match (probed, partial) {
+        (false, _) => "Init segment not probed",
+        (true, true) => "None in the part of the init segment that decoded",
+        (true, false) => "None found (no PSSH or known KEYFORMAT)",
+    }
+}
+
+/// Copy for the Low-Latency HLS row when there is no SERVER-CONTROL to render.
+/// `None` means no media playlist was read, so the row must not claim "Not supported".
+fn ll_hls_absence_label(protocol_set: bool) -> Option<&'static str> {
+    protocol_set.then_some("Not signalled")
 }
 
 // ── UI ────────────────────────────────────────────────────────────────────────
@@ -2244,8 +2277,8 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
     let mut notes = report.probe_notes.clone();
     if partial_init {
         notes.push(
-            "An init segment held a box that would not decode; the walk skipped it and \
-             continued, so init-segment fields may be incomplete."
+            "The init segment was not fully decoded — a box was skipped or the walk ended \
+             before the last byte — so init-segment fields may be incomplete."
                 .into(),
         );
     }
@@ -2465,7 +2498,8 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                                         </InfoRow>
                                     }.into_any()
                                 } else {
-                                    view! { <InfoRow label="Low-Latency HLS"><span>{"Not supported"}</span></InfoRow> }.into_any()
+                                    let status = ll_hls_absence_label(protocol_set).unwrap_or("—");
+                                    view! { <InfoRow label="Low-Latency HLS"><span>{status}</span></InfoRow> }.into_any()
                                 }}
                             </div>
                         })}
@@ -2527,14 +2561,7 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                                 {s_drm_systems.then(|| view! {
                                     <InfoRow label="DRM systems (PSSH / KEYFORMAT)">
                                         {if drm.is_empty() {
-                                            // Only a complete walk of a fetched init can
-                                            // support "there are none"; a partial one can
-                                            // say no more than what it managed to read.
-                                            let status = match (probed_init, partial_init) {
-                                                (false, _) => "Init segment not probed",
-                                                (true, true) => "None in the part of the init segment that decoded",
-                                                (true, false) => "None found (no PSSH or known KEYFORMAT)",
-                                            };
+                                            let status = drm_status_label(probed_init, partial_init);
                                             view! {
                                                 <span style="color: var(--color-sky-700); font-style: italic;">{status}</span>
                                             }.into_any()
@@ -3388,6 +3415,62 @@ mod tests {
         entry.extend(hvcc());
         let mp4 = probe_mp4(init(&[trak(b"vide", &boxed(b"hvc1", &entry))]));
         assert_eq!(mp4.decode_errors, 0);
+        assert!(mp4.walk_complete, "a well-formed init must be a complete walk");
+    }
+
+    #[test]
+    fn an_empty_init_body_is_not_a_complete_walk() {
+        let mp4 = probe_mp4(Vec::new());
+        assert!(!mp4.walk_complete);
+        assert_eq!(mp4.decode_errors, 0);
+    }
+
+    /// A header that will not read used to leave `decode_errors` at 0 and look like a
+    /// complete walk, so the DRM row claimed "None found".
+    #[test]
+    fn a_truncated_box_header_ends_the_walk_and_says_so() {
+        let mut data = ftyp();
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x04, 0x00]);
+        let mp4 = probe_mp4(data);
+        assert!(!mp4.walk_complete);
+        assert_eq!(mp4.decode_errors, 0);
+        assert_eq!(mp4.major_brand.as_deref(), Some("iso5"));
+    }
+
+    /// A `moov` header whose declared size runs past the buffer used to look like a
+    /// complete walk: the header itself reads, the container never closes, and the DRM
+    /// row claimed "None found" about a `moov` the walk never entered.
+    #[test]
+    fn an_unclosed_container_is_not_a_complete_walk() {
+        let mut data = ftyp();
+        data.extend_from_slice(&1000u32.to_be_bytes());
+        data.extend_from_slice(b"moov");
+        let mp4 = probe_mp4(data);
+        assert!(!mp4.walk_complete);
+        assert_eq!(mp4.major_brand.as_deref(), Some("iso5"));
+    }
+
+    #[test]
+    fn a_truncated_walk_never_claims_no_drm_was_found() {
+        assert_ne!(
+            drm_status_label(true, true),
+            "None found (no PSSH or known KEYFORMAT)",
+        );
+        assert_eq!(
+            drm_status_label(true, false),
+            "None found (no PSSH or known KEYFORMAT)",
+        );
+        let empty = probe_mp4(Vec::new());
+        assert_eq!(
+            drm_status_label(true, init_walk_was_partial(&empty)),
+            "None in the part of the init segment that decoded",
+        );
+    }
+
+    #[test]
+    fn low_latency_is_only_reported_by_a_playlist_that_was_read() {
+        assert_eq!(ll_hls_absence_label(false), None);
+        assert_eq!(ll_hls_absence_label(true), Some("Not signalled"));
     }
 
     /// An `enca` says the samples are encrypted and nothing about what they are, so the

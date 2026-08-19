@@ -75,6 +75,10 @@ pub struct InitSegmentProbe {
     /// Boxes whose body would not decode. The walk steps over them, so anything this
     /// probe reports absent may simply have been inside one of them.
     pub decode_errors: usize,
+    /// True only when the walk reached the last byte after reading at least one box.
+    /// An empty body and a header that will not read both leave this false, so callers
+    /// must not treat "not in `decode_errors`" as "the whole init was read".
+    pub walk_complete: bool,
 }
 
 fn prop_str(val: &AtomPropertyValue) -> String {
@@ -101,8 +105,10 @@ const AUDIO_SAMPLE_ENTRIES: &[&str] = &[
 /// unreadable box near the front of a `moov` would otherwise hide every `pssh`, `tenc`
 /// and codec configuration behind it, and the probe would report them absent. Only a
 /// header that will not read ends the walk, because without it there is no way to tell
-/// where the next box starts. [`InitSegmentProbe::decode_errors`] counts what was
-/// skipped so callers can say "not found in what was read" rather than "not there".
+/// where the next box starts. [`InitSegmentProbe::decode_errors`] counts skipped boxes;
+/// [`InitSegmentProbe::walk_complete`] is only set when the walk reached the last byte
+/// after reading at least one box. Callers can say "not found in what was read" only
+/// when the walk completed and `decode_errors` is zero.
 pub fn probe_init_segment(data: &[u8]) -> InitSegmentProbe {
     let mut info = InitSegmentProbe::default();
     let mut reader = Cursor::new(data.to_vec());
@@ -123,6 +129,9 @@ pub fn probe_init_segment(data: &[u8]) -> InitSegmentProbe {
             }
         }
         if reader.position() as usize >= reader.get_ref().len() {
+            if reader.position() > 0 && container_ends.is_empty() {
+                info.walk_complete = true;
+            }
             break;
         }
         let Ok(header) = Header::read_from(&mut reader) else {
@@ -1418,7 +1427,39 @@ mod tests {
 
     #[test]
     fn a_well_formed_init_reports_no_decode_errors() {
-        assert_eq!(probe_init_segment(&hevc_init(2, false, 153)).decode_errors, 0);
+        let probe = probe_init_segment(&hevc_init(2, false, 153));
+        assert_eq!(probe.decode_errors, 0);
+        assert!(
+            probe.walk_complete,
+            "a well-formed init must be a complete walk"
+        );
+    }
+
+    #[test]
+    fn an_empty_init_body_is_not_a_complete_walk() {
+        let probe = probe_init_segment(&[]);
+        assert!(!probe.walk_complete);
+        assert_eq!(probe.decode_errors, 0);
+    }
+
+    #[test]
+    fn a_truncated_box_header_ends_the_walk_and_says_so() {
+        let mut data = ftyp();
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x04, 0x00]);
+        let probe = probe_init_segment(&data);
+        assert!(!probe.walk_complete);
+        assert_eq!(probe.decode_errors, 0);
+        assert_eq!(probe.major_brand.as_deref(), Some("iso5"));
+    }
+
+    #[test]
+    fn an_unclosed_container_is_not_a_complete_walk() {
+        let mut data = ftyp();
+        data.extend_from_slice(&1000u32.to_be_bytes());
+        data.extend_from_slice(b"moov");
+        let probe = probe_init_segment(&data);
+        assert!(!probe.walk_complete);
+        assert_eq!(probe.major_brand.as_deref(), Some("iso5"));
     }
 
     #[test]
