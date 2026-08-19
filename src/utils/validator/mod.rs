@@ -351,9 +351,8 @@ fn run_fetched_stream_checks(
     run_media_checks(playlists, report);
 
     // Parse HLS Interstitials from media playlists
-    let has_interstitials = playlists.iter().any(|pl|
-        pl.raw_content.contains("com.apple.hls.interstitial")
-    );
+    let has_interstitials = playlists.iter()
+        .any(|pl| pl.date_ranges.iter().any(DateRange::is_interstitial));
     if has_interstitials {
         let (interstitial_issues, mut interstitials) = checks::check_interstitials(playlists);
         report.issues.extend(interstitial_issues);
@@ -464,10 +463,7 @@ fn build_renditions(playlists: &[MediaPlaylist]) -> Vec<Rendition> {
             },
             segment_count: pl.segments.len(),
             target_duration: pl.target_duration,
-            media_sequence: pl.media_sequence,
-            discontinuity_sequence: pl.discontinuity_sequence,
             hold_back: pl.server_control.as_ref().and_then(|sc| sc.hold_back),
-            part_target: pl.part_target,
             part_hold_back: pl.server_control.as_ref().and_then(|sc| sc.part_hold_back),
             has_parts: !pl.parts.is_empty(),
         }
@@ -696,14 +692,9 @@ pub fn collect_scte35_ad_breaks(playlists: &[MediaPlaylist]) -> Vec<AdBreak> {
         if pl.media_type != "VIDEO" {
             continue;
         }
-        for line in pl.raw_content.lines() {
-            let line = line.trim();
-            let Some(rest) = line.strip_prefix("#EXT-X-DATERANGE:") else {
-                continue;
-            };
-            let attrs = parser::parse_attributes(rest);
-            if attrs.get("CLASS").is_some_and(|c| c.contains("com.apple.hls.interstitial"))
-                && let Some(id) = attrs.get("ID") {
+        for range in &pl.date_ranges {
+            if range.is_interstitial()
+                && let Some(id) = range.id.as_ref() {
                     interstitial_ids.insert(id.clone());
                 }
         }
@@ -721,12 +712,8 @@ pub fn collect_scte35_ad_breaks(playlists: &[MediaPlaylist]) -> Vec<AdBreak> {
         }
         let first_pdt = pl.segments.first().and_then(|s| s.pdt);
 
-        for line in pl.raw_content.lines() {
-            let line = line.trim();
-            let Some(rest) = line.strip_prefix("#EXT-X-DATERANGE:") else {
-                continue;
-            };
-            let attrs = parser::parse_attributes(rest);
+        for range in &pl.date_ranges {
+            let attrs = &range.attributes;
 
             // Must carry at least one SCTE35 payload attribute
             let has_scte35 = attrs.contains_key("SCTE35-OUT") || attrs.contains_key("SCTE35-IN");
@@ -734,7 +721,7 @@ pub fn collect_scte35_ad_breaks(playlists: &[MediaPlaylist]) -> Vec<AdBreak> {
                 continue;
             }
 
-            let id = attrs.get("ID").cloned().unwrap_or_default();
+            let id = range.id.clone().unwrap_or_default();
 
             // Skip any ID associated with HLS Interstitials (catches both OUT and IN halves)
             if interstitial_ids.contains(&id) {
@@ -786,6 +773,10 @@ pub fn collect_scte35_ad_breaks(playlists: &[MediaPlaylist]) -> Vec<AdBreak> {
     // We track whether each tag is inside an "interstitial context" (i.e. the surrounding
     // DATERANGE has CLASS=com.apple.hls.interstitial) and skip those — they are already shown
     // in the Interstitials section and must not be duplicated here.
+    //
+    // Unlike the passes above, this one reads the playlist text rather than the parsed Date
+    // Ranges: what it needs is the *order* of the EXT-X-SCTE35 tags, the Date Ranges and the
+    // segment URIs between them, which is what carries the break from one line to the next.
     if map.is_empty() {
         for pl in playlists {
             if pl.media_type != "VIDEO" {
@@ -833,9 +824,11 @@ pub fn collect_scte35_ad_breaks(playlists: &[MediaPlaylist]) -> Vec<AdBreak> {
                         let type_attr = attrs.get("TYPE").cloned().unwrap_or_default();
                         let id_attr = attrs.get("ID").cloned().unwrap_or_default();
                         // Synthetic ID: "scte35-TYPE-ID" (e.g. "scte35-0x30-1")
+                        // Interstitial breaks are excluded by `in_interstitial_ctx` above, not
+                        // by this ID: no Date Range can declare one that starts with "scte35-".
                         let id = format!("scte35-{}-{}", type_attr, id_attr);
 
-                        if !interstitial_ids.contains(&id) && !map.contains_key(&id) {
+                        if !map.contains_key(&id) {
                             let planned = attrs.get("DURATION")
                                 .and_then(|v| v.parse::<f64>().ok());
                             let pdt_str = last_pdt_str.clone().unwrap_or_default();
@@ -937,47 +930,26 @@ fn delta_response_issues(
     let mut issues = Vec::new();
 
     if !delta_content.contains("#EXT-X-SKIP:") {
-        issues.push(Issue {
-            severity: Severity::Error,
-            check_id: CheckId::DeltaUpdates,
-            rendition_a: Some(name.to_string()),
-            uri_a: Some(delta_url.to_string()),
-            message: format!(
-                "rfc8216bis §6.2.5.1: Delta update response for '{}' does not contain \
-                 EXT-X-SKIP. The server MUST include EXT-X-SKIP when responding to \
-                 _HLS_skip=YES.",
-                name
-            ),
-            ..Default::default()
-        });
+        issues.push(Issue::error(format!(
+            "rfc8216bis §6.2.5.1: Delta update response for '{}' does not contain \
+             EXT-X-SKIP. The server MUST include EXT-X-SKIP when responding to \
+             _HLS_skip=YES.",
+            name
+        )).for_check(CheckId::DeltaUpdates).in_rendition(name).at_uri(delta_url));
     }
     if !delta_content.contains("#EXT-X-MEDIA-SEQUENCE:") {
-        issues.push(Issue {
-            severity: Severity::Error,
-            check_id: CheckId::DeltaUpdates,
-            rendition_a: Some(name.to_string()),
-            uri_a: Some(delta_url.to_string()),
-            message: format!(
-                "rfc8216bis §6.2.5.1: Delta update response for '{}' is missing \
-                 EXT-X-MEDIA-SEQUENCE. All tags not skipped MUST remain in the delta playlist.",
-                name
-            ),
-            ..Default::default()
-        });
+        issues.push(Issue::error(format!(
+            "rfc8216bis §6.2.5.1: Delta update response for '{}' is missing \
+             EXT-X-MEDIA-SEQUENCE. All tags not skipped MUST remain in the delta playlist.",
+            name
+        )).for_check(CheckId::DeltaUpdates).in_rendition(name).at_uri(delta_url));
     }
     if delta_pl.version < 9 {
-        issues.push(Issue {
-            severity: Severity::Error,
-            check_id: CheckId::VersionCompatibility,
-            rendition_a: Some(name.to_string()),
-            uri_a: Some(delta_url.to_string()),
-            message: format!(
-                "rfc8216bis §8: Delta update response for '{}' declares EXT-X-VERSION:{} \
-                 but EXT-X-SKIP requires VERSION >= 9.",
-                name, delta_pl.version
-            ),
-            ..Default::default()
-        });
+        issues.push(Issue::error(format!(
+            "rfc8216bis §8: Delta update response for '{}' declares EXT-X-VERSION:{} \
+             but EXT-X-SKIP requires VERSION >= 9.",
+            name, delta_pl.version
+        )).for_check(CheckId::VersionCompatibility).in_rendition(name).at_uri(delta_url));
     }
 
     issues
@@ -1035,7 +1007,6 @@ async fn check_playlist_delta_updates(playlists: &[MediaPlaylist]) -> (Vec<Issue
                 reports.push(DeltaReport {
                     name: pl.name.clone(),
                     media_type: pl.media_type.clone(),
-                    url: pl.url.clone(),
                     delta_url,
                     can_skip_until: can_skip,
                     hold_back,
@@ -1051,7 +1022,6 @@ async fn check_playlist_delta_updates(playlists: &[MediaPlaylist]) -> (Vec<Issue
                 reports.push(DeltaReport {
                     name: pl.name.clone(),
                     media_type: pl.media_type.clone(),
-                    url: pl.url.clone(),
                     delta_url: delta_url.clone(),
                     can_skip_until: can_skip,
                     hold_back,
@@ -1061,21 +1031,10 @@ async fn check_playlist_delta_updates(playlists: &[MediaPlaylist]) -> (Vec<Issue
                     skipped_segments: 0,
                     delta_error: Some(err_msg.clone()),
                 });
-                issues.push(Issue {
-                    severity: Severity::Warn,
-                    check_id: CheckId::PlaylistFetch,
-                    segment_index: -1,
-                    rendition_a: Some(pl.name.clone()),
-                    rendition_b: None,
-                    uri_a: Some(delta_url),
-                    uri_b: None,
-                    message: format!(
-                        "rfc8216bis §6.2.5.1: delta update request for '{}' failed: {}",
-                        pl.name, err_msg
-                    ),
-                    uri_note: None,
-                    ..Default::default()
-                });
+                issues.push(Issue::warn(format!(
+                    "rfc8216bis §6.2.5.1: delta update request for '{}' failed: {}",
+                    pl.name, err_msg
+                )).for_check(CheckId::PlaylistFetch).in_rendition(pl.name.as_str()).at_uri(delta_url));
             }
         }
     }
@@ -1553,6 +1512,18 @@ mod tests {
             "media-playlist checks must run for a media-only URL"
         );
         assert!(report.has_scte35_data, "SCTE-35 collection must run for a media-only URL");
+        assert_eq!(
+            report.ad_breaks.len(),
+            1,
+            "the interstitial Date Range ad-1 must be excluded; only the genuine SCTE-35 \
+             break 0x30-1-99 should remain: {:?}",
+            report.ad_breaks.iter().map(|b| &b.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            report.ad_breaks[0].id,
+            "0x30-1-99",
+            "the surviving ad break must be the SCTE-35 Date Range, not the interstitial"
+        );
         assert!(
             report.playlist_window_s > 0.0,
             "the playlist window must be computed for a media-only URL"

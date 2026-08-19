@@ -1,6 +1,4 @@
-//! Validator data model types. Some fields are populated for UI/report
-//! completeness and are not yet read by every check.
-#![allow(dead_code)]
+//! Validator data model types, shared by the Validate and Author sections.
 
 use std::collections::{HashMap, HashSet};
 
@@ -118,6 +116,8 @@ pub enum CheckId {
 
 impl CheckId {
     /// Every check that can name itself, so the group table can be verified to cover them.
+    /// The verification is the only caller, which is why this is not compiled into the app.
+    #[cfg(test)]
     pub const ALL: &'static [CheckId] = &[
         CheckId::ExtM3uHeader,
         CheckId::SingletonTags,
@@ -201,6 +201,9 @@ impl Issue {
         Self { severity: Severity::Warn, message, ..Default::default() }
     }
 
+    /// No Validate check reports at Info, and Author builds its own findings through
+    /// `author_issue`, so this exists for the tests that need an Info finding to group.
+    #[cfg(test)]
     pub fn info(message: String) -> Self {
         Self { severity: Severity::Info, message, ..Default::default() }
     }
@@ -213,6 +216,48 @@ impl Issue {
     /// Name the check that produced this finding, so the report can group it.
     pub fn for_check(mut self, check_id: CheckId) -> Self {
         self.check_id = check_id;
+        self
+    }
+
+    /// Name the rendition this finding is about.
+    pub fn in_rendition(mut self, name: impl Into<String>) -> Self {
+        self.rendition_a = Some(name.into());
+        self
+    }
+
+    /// Name the two renditions a rule compared against each other, which is what lets the
+    /// report offer to open both of them in the manifest viewer.
+    pub fn between_renditions(mut self, a: impl Into<String>, b: impl Into<String>) -> Self {
+        self.rendition_a = Some(a.into());
+        self.rendition_b = Some(b.into());
+        self
+    }
+
+    /// Record what the finding was measured on: the playlist, segment or part the reader
+    /// would open to see it for themselves. The report shows it under the message.
+    pub fn at_uri(mut self, uri: impl Into<String>) -> Self {
+        self.uri_a = Some(uri.into());
+        self
+    }
+
+    /// Record both sides of a comparison between two segments.
+    pub fn between_uris(mut self, a: impl Into<String>, b: impl Into<String>) -> Self {
+        self.uri_a = Some(a.into());
+        self.uri_b = Some(b.into());
+        self
+    }
+
+    /// The segment or Media Sequence Number this finding is about. Findings that are about a
+    /// playlist as a whole leave this at its default, which the report renders as "Global".
+    pub fn at_segment(mut self, index: i32) -> Self {
+        self.segment_index = index;
+        self
+    }
+
+    /// An aside for the report to show under the message, such as the other renditions that
+    /// repeat the same finding.
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.uri_note = Some(note.into());
         self
     }
 
@@ -229,10 +274,18 @@ impl Issue {
 pub struct Segment {
     pub uri: String,
     pub duration: f64,
+    /// The EXTINF title: free text that no rule reads, kept so the parser is not silently
+    /// discarding part of a tag it otherwise records in full. Author's rules construct
+    /// `Segment` too, so this stays where both sections can see it.
+    #[allow(dead_code)]
     pub title: Option<String>,
     pub pdt: Option<f64>,
     pub discontinuity: bool,
     pub byterange: Option<String>,
+    /// Whether the segment falls inside an ad break. Nothing sets this to `true`: ad breaks are
+    /// collected from the Date Ranges rather than marked onto the segments, so no rule may read
+    /// it as if it meant anything. Author's rules construct `Segment` with it as well.
+    #[allow(dead_code)]
     pub is_ad: bool,
     pub map_uri: Option<String>,
 }
@@ -295,10 +348,41 @@ pub struct MediaPlaylist {
     pub http_meta: PlaylistHttpMeta,
     /// Distinct EXT-X-MAP tags in playlist order (for init probing).
     pub init_maps: Vec<InitMap>,
+    /// EXT-X-DATERANGE tags in playlist order, including the later tags that augment an
+    /// earlier one and the IN tags that pair with an interstitial. Every rule that reads Date
+    /// Ranges reads these rather than re-scanning [`Self::raw_content`] for the tag.
+    pub date_ranges: Vec<DateRange>,
     /// Findings raised while parsing this playlist, e.g. a segment URI whose EXTINF is
     /// missing or unparseable. The parser cannot represent such a segment, so it records
     /// why here instead of dropping the line without a trace.
     pub parse_issues: Vec<Issue>,
+}
+
+/// One EXT-X-DATERANGE tag, as the parser read it.
+///
+/// The attributes are kept as the pairs they were written as rather than as named fields:
+/// §4.4.5.1 lets a Date Range carry any client-defined `X-` attribute, and §6.2.4 compares the
+/// whole set across renditions, so there is no fixed shape to promote them to.
+#[derive(Debug, Clone)]
+pub struct DateRange {
+    /// The ID attribute. Absent when the tag omits it, which is a finding of its own rather
+    /// than a reason for the parser to drop the tag.
+    pub id: Option<String>,
+    /// Every attribute/value pair of this tag, with the names upper-cased as
+    /// [`crate::utils::validator::parser::parse_attributes`] reads them.
+    pub attributes: HashMap<String, String>,
+    /// The attribute text as written. Two Date Ranges that both omit their ID cannot be told
+    /// apart by anything else.
+    pub raw_attributes: String,
+}
+
+impl DateRange {
+    /// Whether this Date Range declares itself an HLS Interstitial (§D.2). The paired IN tag
+    /// usually omits CLASS, so this is true of the OUT tag only.
+    pub fn is_interstitial(&self) -> bool {
+        self.attributes.get("CLASS")
+            .is_some_and(|class| class.contains("com.apple.hls.interstitial"))
+    }
 }
 
 /// One EXT-X-MAP tag: the URI and BYTERANGE that were written together.
@@ -326,8 +410,6 @@ pub struct ServerControl {
 pub struct PartialSegment {
     pub uri: String,
     pub duration: f64,
-    pub independent: bool,
-    pub gap: bool,
 }
 
 impl MediaPlaylist {
@@ -374,6 +456,7 @@ impl MediaPlaylist {
             pathway_id: None,
             http_meta: PlaylistHttpMeta::default(),
             init_maps: Vec::new(),
+            date_ranges: Vec::new(),
             parse_issues: Vec::new(),
         }
     }
@@ -426,7 +509,6 @@ pub struct MediaRendition {
     /// substitute DEFINE variables and resolve against the master URL before fetch.
     pub uri: Option<String>,
     pub language: Option<String>,
-    pub is_default: bool,
     pub autoselect: bool,
     pub channels: Option<String>,
     pub characteristics: Option<String>,
@@ -463,11 +545,8 @@ pub struct Rendition {
     pub group_id: Option<String>,
     pub segment_count: usize,
     pub target_duration: f64,
-    pub media_sequence: u64,
-    pub discontinuity_sequence: u64,
     // LL-HLS latency fields
     pub hold_back: Option<f64>,
-    pub part_target: Option<f64>,
     pub part_hold_back: Option<f64>,
     pub has_parts: bool,
 }
@@ -522,7 +601,6 @@ pub struct AdBreak {
 pub struct RenditionReport {
     pub uri: String,
     pub last_msn: i64,
-    pub last_part: i64,
 }
 
 /// Playlist Delta Update report entry
@@ -530,7 +608,6 @@ pub struct RenditionReport {
 pub struct DeltaReport {
     pub name: String,
     pub media_type: String,
-    pub url: String,
     pub delta_url: String,
     pub can_skip_until: f64,
     pub hold_back: f64,
@@ -591,7 +668,9 @@ pub struct RunInputs {
 }
 
 impl RunInputs {
-    /// Everything available, for tests that only care about how findings are grouped.
+    /// Everything available, for tests that only care about how findings are grouped. A run
+    /// reads its inputs off the playlists it fetched, with [`Self::from_run`].
+    #[cfg(test)]
     pub fn everything() -> Self {
         Self {
             has_master: true,
@@ -625,14 +704,13 @@ impl RunInputs {
             video_playlists: video.len(),
             vod_video_playlists: video.iter().filter(|pl| pl.has_endlist).count(),
             has_interstitials: playlists.iter()
-                .any(|pl| pl.raw_content.contains("com.apple.hls.interstitial")),
+                .any(|pl| pl.date_ranges.iter().any(DateRange::is_interstitial)),
             has_low_latency_tags: playlists.iter().any(|pl| {
                 !pl.parts.is_empty() || pl.part_target.is_some() || pl.server_control.is_some()
             }),
             delta_probed,
             has_encryption: playlists.iter().any(|pl| !pl.encryption_methods.is_empty()),
-            has_dateranges: playlists.iter()
-                .any(|pl| pl.raw_content.contains("#EXT-X-DATERANGE:")),
+            has_dateranges: playlists.iter().any(|pl| !pl.date_ranges.is_empty()),
             has_pdt_tags: playlists.iter().any(|pl| pl.program_date_time_tags > 0),
             has_defines: master.is_some_and(|m| m.raw_content.contains("#EXT-X-DEFINE:"))
                 || playlists.iter().any(|pl| pl.raw_content.contains("#EXT-X-DEFINE:")),
@@ -719,6 +797,31 @@ mod tests {
         assert_eq!(Confidence::Heuristic.cap(Severity::Error), Severity::Warn);
         // Capping is a ceiling, so it never promotes a lesser finding.
         assert_eq!(Confidence::Heuristic.cap(Severity::Info), Severity::Info);
+    }
+
+    #[test]
+    fn the_builders_fill_in_what_a_finding_names() {
+        let issue = Issue::error("drift".to_string())
+            .for_check(CheckId::DurationDrift)
+            .between_renditions("v-hi", "v-lo")
+            .between_uris("hi/s12.m4s", "lo/s12.m4s")
+            .at_segment(12)
+            .with_note("seen in 3 renditions");
+        assert_eq!(issue.severity, Severity::Error);
+        assert_eq!(issue.check_id, CheckId::DurationDrift);
+        assert_eq!(issue.rendition_a.as_deref(), Some("v-hi"));
+        assert_eq!(issue.rendition_b.as_deref(), Some("v-lo"));
+        assert_eq!(issue.uri_a.as_deref(), Some("hi/s12.m4s"));
+        assert_eq!(issue.uri_b.as_deref(), Some("lo/s12.m4s"));
+        assert_eq!(issue.segment_index, 12);
+        assert_eq!(issue.uri_note.as_deref(), Some("seen in 3 renditions"));
+
+        // What a finding does not name keeps the defaults the report reads as "not said".
+        let plain = Issue::warn("nothing else to say".to_string()).in_rendition("v").at_uri("v.m3u8");
+        assert_eq!(plain.rendition_a.as_deref(), Some("v"));
+        assert_eq!(plain.uri_a.as_deref(), Some("v.m3u8"));
+        assert_eq!((plain.rendition_b, plain.uri_b, plain.uri_note), (None, None, None));
+        assert_eq!((plain.segment_index, plain.count), (-1, 1));
     }
 
     #[test]

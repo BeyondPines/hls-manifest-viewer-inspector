@@ -90,21 +90,11 @@ pub fn check_extm3u_header(playlists: &[MediaPlaylist]) -> Vec<Issue> {
     for pl in playlists {
         let first_line = pl.raw_content.lines().next().unwrap_or("");
         if first_line.trim() != "#EXTM3U" {
-            issues.push(Issue {
-                severity: Severity::Error,
-                segment_index: -1,
-                rendition_a: Some(pl.name.clone()),
-                rendition_b: None,
-                uri_a: None,
-                uri_b: None,
-                message: format!(
-                    "rfc8216bis §4.4.1.1: Playlist '{}' does not start with #EXTM3U. \
-                     First line: '{}'",
-                    pl.name, first_line
-                ),
-                uri_note: None,
-                ..Default::default()
-            });
+            issues.push(Issue::error(format!(
+                "rfc8216bis §4.4.1.1: Playlist '{}' does not start with #EXTM3U. \
+                 First line: '{}'",
+                pl.name, first_line
+            )).in_rendition(pl.name.as_str()));
         }
     }
     produced_by(CheckId::ExtM3uHeader, issues)
@@ -121,50 +111,32 @@ pub fn check_master_structure(master: &MasterPlaylist) -> Vec<Issue> {
 
     let first_line = master.raw_content.lines().next().unwrap_or("");
     if first_line.trim() != "#EXTM3U" {
-        issues.push(Issue {
-            severity: Severity::Error,
-            check_id: CheckId::ExtM3uHeader,
-            message: format!(
-                "rfc8216bis §4.4.1.1: Multivariant Playlist '{}' does not start with \
-                 #EXTM3U. First line: '{}'",
-                label, first_line
-            ),
-            uri_a: Some(master.url.clone()),
-            ..Default::default()
-        });
+        issues.push(Issue::error(format!(
+            "rfc8216bis §4.4.1.1: Multivariant Playlist '{}' does not start with \
+             #EXTM3U. First line: '{}'",
+            label, first_line
+        )).for_check(CheckId::ExtM3uHeader).at_uri(master.url.as_str()));
     }
 
     // §4.4.1.2 EXT-X-VERSION, §4.4.2.1 EXT-X-INDEPENDENT-SEGMENTS, §4.4.2.2 EXT-X-START.
     for tag in ["#EXT-X-VERSION:", "#EXT-X-INDEPENDENT-SEGMENTS", "#EXT-X-START:"] {
         let count = master.raw_content.lines().filter(|l| l.trim().starts_with(tag)).count();
         if count > 1 {
-            issues.push(Issue {
-                severity: Severity::Error,
-                check_id: CheckId::SingletonTags,
-                message: format!(
-                    "rfc8216bis §4.4.1.2/§4.4.2: Singleton tag '{}' appears {} times in \
-                     Multivariant Playlist '{}'. It MUST appear at most once.",
-                    tag.trim_end_matches(':'), count, label
-                ),
-                uri_a: Some(master.url.clone()),
-                ..Default::default()
-            });
+            issues.push(Issue::error(format!(
+                "rfc8216bis §4.4.1.2/§4.4.2: Singleton tag '{}' appears {} times in \
+                 Multivariant Playlist '{}'. It MUST appear at most once.",
+                tag.trim_end_matches(':'), count, label
+            )).for_check(CheckId::SingletonTags).at_uri(master.url.as_str()));
         }
     }
 
     // §8: variable substitution requires VERSION >= 8.
     if master.version < 8 && master.raw_content.contains("#EXT-X-DEFINE:") {
-        issues.push(Issue {
-            severity: Severity::Error,
-            check_id: CheckId::VersionCompatibility,
-            message: format!(
-                "rfc8216bis §8: Multivariant Playlist '{}' uses EXT-X-DEFINE \
-                 (variable substitution) which requires VERSION >= 8. Declared version: {}.",
-                label, master.version
-            ),
-            uri_a: Some(master.url.clone()),
-            ..Default::default()
-        });
+        issues.push(Issue::error(format!(
+            "rfc8216bis §8: Multivariant Playlist '{}' uses EXT-X-DEFINE \
+             (variable substitution) which requires VERSION >= 8. Declared version: {}.",
+            label, master.version
+        )).for_check(CheckId::VersionCompatibility).at_uri(master.url.as_str()));
     }
 
     issues
@@ -208,23 +180,13 @@ pub fn check_rendition_group_references(master: &MasterPlaylist) -> Vec<Issue> {
                 names.sort_unstable();
                 if names.is_empty() { "(none)".to_string() } else { names.join(", ") }
             };
-            issues.push(Issue {
-                severity: Severity::Error,
-                segment_index: -1,
-                rendition_a: None,
-                rendition_b: None,
-                uri_a: Some(v.uri.clone()),
-                uri_b: None,
-                message: format!(
-                    "rfc8216bis §4.4.6.2: EXT-X-STREAM-INF for URI '{}' has {}=\"{}\" but no \
-                     EXT-X-MEDIA tag with TYPE={} declares that GROUP-ID. The attribute value \
-                     MUST match the GROUP-ID of a Rendition Group of that type \
-                     (declared {} groups: {}).",
-                    v.uri, attr, group, attr, attr, known
-                ),
-                uri_note: None,
-                ..Default::default()
-            });
+            issues.push(Issue::error(format!(
+                "rfc8216bis §4.4.6.2: EXT-X-STREAM-INF for URI '{}' has {}=\"{}\" but no \
+                 EXT-X-MEDIA tag with TYPE={} declares that GROUP-ID. The attribute value \
+                 MUST match the GROUP-ID of a Rendition Group of that type \
+                 (declared {} groups: {}).",
+                v.uri, attr, group, attr, attr, known
+            )).at_uri(v.uri.as_str()));
         }
     }
 
@@ -241,21 +203,11 @@ pub fn check_target_duration_compliance(playlists: &[MediaPlaylist]) -> Vec<Issu
     let mut overruns: Vec<SegmentFinding<(f64, u64)>> = Vec::new();
     for (pl_index, pl) in playlists.iter().enumerate() {
         if pl.target_duration <= 0.0 {
-            issues.push(Issue {
-                severity: Severity::Error,
-                segment_index: -1,
-                rendition_a: Some(pl.name.clone()),
-                rendition_b: None,
-                uri_a: None,
-                uri_b: None,
-                message: format!(
-                    "rfc8216bis §4.4.3.1: EXT-X-TARGETDURATION missing or zero in '{}'. \
-                     Every Media Playlist MUST declare a positive TARGETDURATION.",
-                    pl.name
-                ),
-                uri_note: None,
-                ..Default::default()
-            });
+            issues.push(Issue::error(format!(
+                "rfc8216bis §4.4.3.1: EXT-X-TARGETDURATION missing or zero in '{}'. \
+                 Every Media Playlist MUST declare a positive TARGETDURATION.",
+                pl.name
+            )).in_rendition(pl.name.as_str()));
             continue;
         }
         let target_int = pl.target_duration as u64;
@@ -265,21 +217,14 @@ pub fn check_target_duration_compliance(playlists: &[MediaPlaylist]) -> Vec<Issu
             if rounded > target_int {
                 overruns.push(SegmentFinding {
                     key: format!("{}|{}", pl_index, target_int),
-                    issue: Issue {
-                        severity: Severity::Error,
-                        segment_index: idx as i32,
-                        rendition_a: Some(pl.name.clone()),
-                        rendition_b: None,
-                        uri_a: Some(seg.uri.clone()),
-                        uri_b: None,
-                        message: format!(
-                            "rfc8216bis §4.4.3.1: Segment {} in '{}' duration {:.6}s \
-                             (round={}s) exceeds TARGETDURATION {}s.",
-                            idx, pl.name, seg.duration, rounded, target_int
-                        ),
-                        uri_note: None,
-                        ..Default::default()
-                    },
+                    issue: Issue::error(format!(
+                        "rfc8216bis §4.4.3.1: Segment {} in '{}' duration {:.6}s \
+                         (round={}s) exceeds TARGETDURATION {}s.",
+                        idx, pl.name, seg.duration, rounded, target_int
+                    ))
+                    .in_rendition(pl.name.as_str())
+                    .at_uri(seg.uri.as_str())
+                    .at_segment(idx as i32),
                     data: (seg.duration, target_int),
                 });
             }
@@ -288,22 +233,12 @@ pub fn check_target_duration_compliance(playlists: &[MediaPlaylist]) -> Vec<Issu
             let rounded_max = max_extinf.round() as u64;
             // If declared TARGETDURATION exceeds the rounded longest segment by more than 1s, warn
             if target_int > rounded_max + 1 {
-                issues.push(Issue {
-                    severity: Severity::Warn,
-                    segment_index: -1,
-                    rendition_a: Some(pl.name.clone()),
-                    rendition_b: None,
-                    uri_a: None,
-                    uri_b: None,
-                    message: format!(
-                        "rfc8216bis §4.4.3.1: TARGETDURATION={}s in '{}' is more than 1s \
-                         above the longest segment (longest={:.6}s, round={}s). \
-                         Consider reducing TARGETDURATION for accuracy.",
-                        target_int, pl.name, max_extinf, rounded_max
-                    ),
-                    uri_note: None,
-                    ..Default::default()
-                });
+                issues.push(Issue::warn(format!(
+                    "rfc8216bis §4.4.3.1: TARGETDURATION={}s in '{}' is more than 1s \
+                     above the longest segment (longest={:.6}s, round={}s). \
+                     Consider reducing TARGETDURATION for accuracy.",
+                    target_int, pl.name, max_extinf, rounded_max
+                )).in_rendition(pl.name.as_str()));
             }
         }
     }
@@ -342,20 +277,14 @@ pub fn check_pdt_coverage(playlists: &[MediaPlaylist]) -> Vec<Issue> {
     let mut issues = Vec::new();
 
     for pl in playlists {
-        if pl.program_date_time_tags == 0 && pl.raw_content.contains("#EXT-X-DATERANGE:") {
-            issues.push(Issue {
-                severity: Severity::Error,
-                rendition_a: Some(pl.name.clone()),
-                uri_a: Some(pl.url.clone()),
-                message: format!(
-                    "rfc8216bis §4.4.5.1: Playlist '{}' contains EXT-X-DATERANGE tags but no \
-                     EXT-X-PROGRAM-DATE-TIME tag. A Playlist that contains an EXT-X-DATERANGE \
-                     tag MUST also contain at least one EXT-X-PROGRAM-DATE-TIME tag, or a \
-                     client has nothing to position the Date Range against.",
-                    pl.name
-                ),
-                ..Default::default()
-            });
+        if pl.program_date_time_tags == 0 && !pl.date_ranges.is_empty() {
+            issues.push(Issue::error(format!(
+                "rfc8216bis §4.4.5.1: Playlist '{}' contains EXT-X-DATERANGE tags but no \
+                 EXT-X-PROGRAM-DATE-TIME tag. A Playlist that contains an EXT-X-DATERANGE \
+                 tag MUST also contain at least one EXT-X-PROGRAM-DATE-TIME tag, or a \
+                 client has nothing to position the Date Range against.",
+                pl.name
+            )).in_rendition(pl.name.as_str()).at_uri(pl.url.as_str()));
         }
     }
 
@@ -368,21 +297,16 @@ pub fn check_pdt_coverage(playlists: &[MediaPlaylist]) -> Vec<Issue> {
             let names = |pls: &[&MediaPlaylist]| {
                 pls.iter().map(|pl| format!("'{}'", pl.name)).collect::<Vec<_>>().join(", ")
             };
-            issues.push(Issue {
-                severity: Severity::Error,
-                uri_a: untagged.first().map(|pl| pl.url.clone()),
-                message: format!(
-                    "rfc8216bis §6.2.4: {} of {} Media Playlists declare \
-                     EXT-X-PROGRAM-DATE-TIME and {} do not ({} have it, {} do not). If any \
-                     Media Playlist in a Multivariant Playlist contains an \
-                     EXT-X-PROGRAM-DATE-TIME tag, then all of them MUST, with consistent \
-                     mappings of date and time to media timestamps — otherwise a client \
-                     cannot line the renditions up on a wall clock.",
-                    tagged.len(), playlists.len(), untagged.len(),
-                    names(&tagged), names(&untagged)
-                ),
-                ..Default::default()
-            });
+            issues.push(Issue::error(format!(
+                "rfc8216bis §6.2.4: {} of {} Media Playlists declare \
+                 EXT-X-PROGRAM-DATE-TIME and {} do not ({} have it, {} do not). If any \
+                 Media Playlist in a Multivariant Playlist contains an \
+                 EXT-X-PROGRAM-DATE-TIME tag, then all of them MUST, with consistent \
+                 mappings of date and time to media timestamps — otherwise a client \
+                 cannot line the renditions up on a wall clock.",
+                tagged.len(), playlists.len(), untagged.len(),
+                names(&tagged), names(&untagged)
+            )).at_uri(untagged[0].url.as_str()));
         }
     }
 
@@ -412,22 +336,12 @@ pub fn check_media_sequence_duplicate_tags(playlists: &[MediaPlaylist]) -> Vec<I
         for (tag, section) in &singleton_tags {
             let count = pl.raw_content.lines().filter(|l| l.trim().starts_with(tag)).count();
             if count > 1 {
-                issues.push(Issue {
-                    severity: Severity::Error,
-                    segment_index: -1,
-                    rendition_a: Some(pl.name.clone()),
-                    rendition_b: None,
-                    uri_a: None,
-                    uri_b: None,
-                    message: format!(
-                        "rfc8216bis {}: Tag '{}' appears {} times in '{}'. \
-                         There MUST NOT be more than one Media Playlist tag of each type in \
-                         any Media Playlist (§4.4.3).",
-                        section, tag.trim_end_matches(':'), count, pl.name
-                    ),
-                    uri_note: None,
-                    ..Default::default()
-                });
+                issues.push(Issue::error(format!(
+                    "rfc8216bis {}: Tag '{}' appears {} times in '{}'. \
+                     There MUST NOT be more than one Media Playlist tag of each type in \
+                     any Media Playlist (§4.4.3).",
+                    section, tag.trim_end_matches(':'), count, pl.name
+                )).in_rendition(pl.name.as_str()));
             }
         }
     }
@@ -490,17 +404,12 @@ pub fn check_stream_inf_consistency(master: &MasterPlaylist) -> Vec<Issue> {
             let details: Vec<String> = variants.iter()
                 .map(|v| format!("CODECS={}", v.codecs.as_deref().unwrap_or("(none)")))
                 .collect();
-            issues.push(Issue {
-                severity: Severity::Warn,
-                uri_a: Some((*uri).to_string()),
-                message: format!(
-                    "rfc8216bis §4.4.6.2: Multiple EXT-X-STREAM-INF tags share URI '{}' and the \
-                     same Rendition Groups ({}) but declare different CODECS values: {}. \
-                     One of them misdescribes what the URI contains.",
-                    uri, groups, details.join(", ")
-                ),
-                ..Default::default()
-            });
+            issues.push(Issue::warn(format!(
+                "rfc8216bis §4.4.6.2: Multiple EXT-X-STREAM-INF tags share URI '{}' and the \
+                 same Rendition Groups ({}) but declare different CODECS values: {}. \
+                 One of them misdescribes what the URI contains.",
+                uri, groups, details.join(", ")
+            )).at_uri(*uri));
         }
 
         let bw_set: HashSet<Option<u64>> = variants.iter().map(|v| v.bandwidth).collect();
@@ -511,17 +420,12 @@ pub fn check_stream_inf_consistency(master: &MasterPlaylist) -> Vec<Issue> {
                     v.bandwidth.map_or("(none)".to_string(), |b| b.to_string())
                 ))
                 .collect();
-            issues.push(Issue {
-                severity: Severity::Warn,
-                uri_a: Some((*uri).to_string()),
-                message: format!(
-                    "rfc8216bis §4.4.6.2: Multiple EXT-X-STREAM-INF tags share URI '{}' and the \
-                     same Rendition Groups ({}) but declare different BANDWIDTH values: {}. \
-                     BANDWIDTH is the peak bit rate of the same media in each case.",
-                    uri, groups, details.join(", ")
-                ),
-                ..Default::default()
-            });
+            issues.push(Issue::warn(format!(
+                "rfc8216bis §4.4.6.2: Multiple EXT-X-STREAM-INF tags share URI '{}' and the \
+                 same Rendition Groups ({}) but declare different BANDWIDTH values: {}. \
+                 BANDWIDTH is the peak bit rate of the same media in each case.",
+                uri, groups, details.join(", ")
+            )).at_uri(*uri));
         }
     }
 
@@ -546,18 +450,13 @@ pub fn check_stream_inf_consistency(master: &MasterPlaylist) -> Vec<Issue> {
                     v.closed_captions.as_deref().unwrap_or("(absent)")
                 ))
                 .collect();
-            issues.push(Issue {
-                severity: Severity::Error,
-                uri_a: others.first().map(|v| v.uri.clone()),
-                message: format!(
-                    "rfc8216bis §4.4.6.2: One EXT-X-STREAM-INF declares CLOSED-CAPTIONS=NONE \
-                     but {} of {} others do not: {}. Where the value NONE is used, all \
-                     EXT-X-STREAM-INF tags MUST carry it, since captions present in one \
-                     Variant Stream but not another can trigger playback inconsistencies.",
-                    others.len(), regular.len(), detail.join(", ")
-                ),
-                ..Default::default()
-            });
+            issues.push(Issue::error(format!(
+                "rfc8216bis §4.4.6.2: One EXT-X-STREAM-INF declares CLOSED-CAPTIONS=NONE \
+                 but {} of {} others do not: {}. Where the value NONE is used, all \
+                 EXT-X-STREAM-INF tags MUST carry it, since captions present in one \
+                 Variant Stream but not another can trigger playback inconsistencies.",
+                others.len(), regular.len(), detail.join(", ")
+            )).at_uri(others[0].uri.as_str()));
         }
     }
 
@@ -578,18 +477,13 @@ pub fn check_stream_inf_consistency(master: &MasterPlaylist) -> Vec<Issue> {
                     v.codecs.as_deref().unwrap_or("(none)")
                 ))
                 .collect();
-            issues.push(Issue {
-                severity: Severity::Error,
-                uri_a: Some((*uri).to_string()),
-                message: format!(
-                    "rfc8216bis §6.2.4: Multiple EXT-X-STREAM-INF tags share URI '{}' but \
-                     declare different video codecs: {}. The same media cannot be encoded two \
-                     ways, and every Variant Stream of a presentation MUST use the same video \
-                     encoding.",
-                    uri, details.join(", ")
-                ),
-                ..Default::default()
-            });
+            issues.push(Issue::error(format!(
+                "rfc8216bis §6.2.4: Multiple EXT-X-STREAM-INF tags share URI '{}' but \
+                 declare different video codecs: {}. The same media cannot be encoded two \
+                 ways, and every Variant Stream of a presentation MUST use the same video \
+                 encoding.",
+                uri, details.join(", ")
+            )).at_uri(*uri));
         }
     }
 
@@ -601,21 +495,11 @@ pub fn check_bandwidth_required(master: &MasterPlaylist) -> Vec<Issue> {
     let mut issues = Vec::new();
     for v in &master.variants {
         if v.bandwidth.is_none() {
-            issues.push(Issue {
-                severity: Severity::Error,
-                segment_index: -1,
-                rendition_a: None,
-                rendition_b: None,
-                uri_a: Some(v.uri.clone()),
-                uri_b: None,
-                message: format!(
-                    "rfc8216bis §4.4.6.2: EXT-X-STREAM-INF for URI '{}' is missing \
-                     the BANDWIDTH attribute, which is REQUIRED.",
-                    v.uri
-                ),
-                uri_note: None,
-                ..Default::default()
-            });
+            issues.push(Issue::error(format!(
+                "rfc8216bis §4.4.6.2: EXT-X-STREAM-INF for URI '{}' is missing \
+                 the BANDWIDTH attribute, which is REQUIRED.",
+                v.uri
+            )).at_uri(v.uri.as_str()));
         }
     }
     produced_by(CheckId::BandwidthRequired, issues)
@@ -654,23 +538,13 @@ pub fn check_media_group_membership(master: &MasterPlaylist) -> Vec<Issue> {
                 continue;
             }
             missing.sort_unstable();
-            issues.push(Issue {
-                severity: Severity::Error,
-                segment_index: -1,
-                rendition_a: None,
-                rendition_b: None,
-                uri_a: None,
-                uri_b: None,
-                message: format!(
-                    "rfc8216bis §4.4.6.1.1: {} Group '{}' is missing member(s) present in \
-                     other groups of the same type: {}. All groups of the same TYPE MUST \
-                     have the same set of members.",
-                    media_type, group_id,
-                    missing.iter().map(|n| format!("'{}'", n)).collect::<Vec<_>>().join(", ")
-                ),
-                uri_note: None,
-                ..Default::default()
-            });
+            issues.push(Issue::error(format!(
+                "rfc8216bis §4.4.6.1.1: {} Group '{}' is missing member(s) present in \
+                 other groups of the same type: {}. All groups of the same TYPE MUST \
+                 have the same set of members.",
+                media_type, group_id,
+                missing.iter().map(|n| format!("'{}'", n)).collect::<Vec<_>>().join(", ")
+            )));
         }
     }
     produced_by(CheckId::MediaGroupMembership, issues)
@@ -684,108 +558,58 @@ pub fn check_version_compatibility(playlists: &[MediaPlaylist]) -> Vec<Issue> {
         let content = &pl.raw_content;
         // EXT-X-KEY with IV requires v2+
         if v < 2 && content.contains("#EXT-X-KEY:") && content.contains("IV=") {
-            issues.push(Issue {
-                severity: Severity::Error,
-                segment_index: -1,
-                rendition_a: Some(pl.name.clone()),
-                rendition_b: None,
-                uri_a: None,
-                uri_b: None,
-                message: format!(
-                    "rfc8216bis §8: '{}' uses EXT-X-KEY with IV attribute \
-                     which requires VERSION >= 2. Declared version: {}.",
-                    pl.name, v
-                ),
-                uri_note: None,
-                ..Default::default()
-            });
+            issues.push(Issue::error(format!(
+                "rfc8216bis §8: '{}' uses EXT-X-KEY with IV attribute \
+                 which requires VERSION >= 2. Declared version: {}.",
+                pl.name, v
+            )).in_rendition(pl.name.as_str()));
         }
         // Floating-point EXTINF requires v3+
         if v < 3 {
             for seg in &pl.segments {
                 if seg.duration.fract() != 0.0 {
-                    issues.push(Issue {
-                        severity: Severity::Error,
-                        segment_index: -1,
-                        rendition_a: Some(pl.name.clone()),
-                        rendition_b: None,
-                        uri_a: None,
-                        uri_b: None,
-                        message: format!(
-                            "rfc8216bis §8: '{}' uses floating-point EXTINF ({:.3}s) \
-                             which requires VERSION >= 3. Declared version: {}.",
-                            pl.name, seg.duration, v
-                        ),
-                        uri_note: None,
-                        ..Default::default()
-                    });
+                    issues.push(Issue::error(format!(
+                        "rfc8216bis §8: '{}' uses floating-point EXTINF ({:.3}s) \
+                         which requires VERSION >= 3. Declared version: {}.",
+                        pl.name, seg.duration, v
+                    )).in_rendition(pl.name.as_str()));
                     break;
                 }
             }
         }
         // EXT-X-BYTERANGE requires v4+
         if v < 4 && content.contains("#EXT-X-BYTERANGE:") {
-            issues.push(Issue {
-                severity: Severity::Error,
-                segment_index: -1,
-                rendition_a: Some(pl.name.clone()),
-                rendition_b: None,
-                uri_a: None,
-                uri_b: None,
-                message: format!(
-                    "rfc8216bis §8: '{}' uses EXT-X-BYTERANGE \
-                     which requires VERSION >= 4. Declared version: {}.",
-                    pl.name, v
-                ),
-                uri_note: None,
-                ..Default::default()
-            });
+            issues.push(Issue::error(format!(
+                "rfc8216bis §8: '{}' uses EXT-X-BYTERANGE \
+                 which requires VERSION >= 4. Declared version: {}.",
+                pl.name, v
+            )).in_rendition(pl.name.as_str()));
         }
         // §8: EXT-X-MAP needs v6 on its own, and v5 in an I-frames-only playlist.
         if content.contains("#EXT-X-MAP:") {
             let iframes_only = content.contains("#EXT-X-I-FRAMES-ONLY");
             let required = if iframes_only { 5 } else { 6 };
             if v < required {
-                issues.push(Issue {
-                    severity: Severity::Error,
-                    segment_index: -1,
-                    rendition_a: Some(pl.name.clone()),
-                    rendition_b: None,
-                    uri_a: None,
-                    uri_b: None,
-                    message: format!(
-                        "rfc8216bis §8: '{}' uses EXT-X-MAP {} which requires \
-                         VERSION >= {}. Declared version: {}.",
-                        pl.name,
-                        if iframes_only {
-                            "in a playlist with EXT-X-I-FRAMES-ONLY"
-                        } else {
-                            "without EXT-X-I-FRAMES-ONLY"
-                        },
-                        required, v
-                    ),
-                    uri_note: None,
-                    ..Default::default()
-                });
+                issues.push(Issue::error(format!(
+                    "rfc8216bis §8: '{}' uses EXT-X-MAP {} which requires \
+                     VERSION >= {}. Declared version: {}.",
+                    pl.name,
+                    if iframes_only {
+                        "in a playlist with EXT-X-I-FRAMES-ONLY"
+                    } else {
+                        "without EXT-X-I-FRAMES-ONLY"
+                    },
+                    required, v
+                )).in_rendition(pl.name.as_str()));
             }
         }
         // EXT-X-SKIP requires v9+
         if v < 9 && content.contains("#EXT-X-SKIP:") {
-            issues.push(Issue {
-                severity: Severity::Error,
-                segment_index: -1,
-                rendition_a: Some(pl.name.clone()),
-                rendition_b: None,
-                uri_a: None,
-                uri_b: None,
-                message: format!(
-                    "rfc8216bis §8: '{}' uses EXT-X-SKIP \
-                     which requires VERSION >= 9. Declared version: {}.",
-                    pl.name, v
-                ),
-                uri_note: None,
-                ..Default::default()
-            });
+            issues.push(Issue::error(format!(
+                "rfc8216bis §8: '{}' uses EXT-X-SKIP \
+                 which requires VERSION >= 9. Declared version: {}.",
+                pl.name, v
+            )).in_rendition(pl.name.as_str()));
         }
     }
     produced_by(CheckId::VersionCompatibility, issues)
@@ -846,24 +670,14 @@ pub fn check_live_playlist_min_segments(playlists: &[MediaPlaylist]) -> Vec<Issu
         let window = listed + skipped;
         let required = pl.target_duration * 3.0;
         if window < required - 0.001 {
-            issues.push(Issue {
-                severity: Severity::Error,
-                segment_index: -1,
-                rendition_a: Some(pl.name.clone()),
-                rendition_b: None,
-                uri_a: Some(pl.url.clone()),
-                uri_b: None,
-                message: format!(
-                    "rfc8216bis §6.2.2: Live playlist '{}' holds {:.3}s across {} segment(s), \
-                     less than three times its TARGETDURATION of {:.3}s (needs {:.3}s), and \
-                     {}. A server MUST NOT remove a Media Segment from a playlist without \
-                     EXT-X-ENDLIST if that leaves a window shorter than three Target \
-                     Durations; a shorter window can stall playback.",
-                    pl.name, window, pl.segments.len(), pl.target_duration, required, evidence
-                ),
-                uri_note: None,
-                ..Default::default()
-            });
+            issues.push(Issue::error(format!(
+                "rfc8216bis §6.2.2: Live playlist '{}' holds {:.3}s across {} segment(s), \
+                 less than three times its TARGETDURATION of {:.3}s (needs {:.3}s), and \
+                 {}. A server MUST NOT remove a Media Segment from a playlist without \
+                 EXT-X-ENDLIST if that leaves a window shorter than three Target \
+                 Durations; a shorter window can stall playback.",
+                pl.name, window, pl.segments.len(), pl.target_duration, required, evidence
+            )).in_rendition(pl.name.as_str()).at_uri(pl.url.as_str()));
         }
     }
     produced_by(CheckId::LivePlaylistWindow, issues)
@@ -922,21 +736,11 @@ pub fn check_playlist_type_endlist(playlists: &[MediaPlaylist]) -> Vec<Issue> {
     for pl in playlists {
         match pl.playlist_type.as_deref() {
             Some("VOD") if !pl.has_endlist => {
-                issues.push(Issue {
-                    severity: Severity::Error,
-                    segment_index: -1,
-                    rendition_a: Some(pl.name.clone()),
-                    rendition_b: None,
-                    uri_a: None,
-                    uri_b: None,
-                    message: format!(
-                        "rfc8216bis §4.4.3.5: Playlist '{}' declares PLAYLIST-TYPE:VOD \
-                         but is missing EXT-X-ENDLIST. A VOD playlist MUST end with EXT-X-ENDLIST.",
-                        pl.name
-                    ),
-                    uri_note: None,
-                    ..Default::default()
-                });
+                issues.push(Issue::error(format!(
+                    "rfc8216bis §4.4.3.5: Playlist '{}' declares PLAYLIST-TYPE:VOD \
+                     but is missing EXT-X-ENDLIST. A VOD playlist MUST end with EXT-X-ENDLIST.",
+                    pl.name
+                )).in_rendition(pl.name.as_str()));
             }
             // EVENT playlists are live; EXT-X-ENDLIST is added when the event ends.
             // An EVENT playlist without ENDLIST is valid and expected during a live event.
@@ -1107,22 +911,15 @@ pub fn check_duration_drift(playlists: &[MediaPlaylist], tolerance_ms: f64) -> V
                 if diff > tolerance_s {
                     findings.push(SegmentFinding {
                         key: format!("{}|{}", i, j),
-                        issue: Issue {
-                            severity: Severity::Warn,
-                            segment_index: msn as i32,
-                            rendition_a: Some(pl_a.name.clone()),
-                            rendition_b: Some(pl_b.name.clone()),
-                            uri_a: Some(seg_a.uri.clone()),
-                            uri_b: Some(seg_b.uri.clone()),
-                            message: format!(
-                                "rfc8216bis §6.2.4: EXTINF drift at MSN {}: '{}' has {:.3}s vs \
-                                 '{}' has {:.3}s (diff={:.3}s, tolerance={:.3}s).",
-                                msn, pl_a.name, seg_a.duration, pl_b.name, seg_b.duration,
-                                diff, tolerance_s
-                            ),
-                            uri_note: None,
-                            ..Default::default()
-                        },
+                        issue: Issue::warn(format!(
+                            "rfc8216bis §6.2.4: EXTINF drift at MSN {}: '{}' has {:.3}s vs \
+                             '{}' has {:.3}s (diff={:.3}s, tolerance={:.3}s).",
+                            msn, pl_a.name, seg_a.duration, pl_b.name, seg_b.duration,
+                            diff, tolerance_s
+                        ))
+                        .between_renditions(pl_a.name.as_str(), pl_b.name.as_str())
+                        .between_uris(seg_a.uri.as_str(), seg_b.uri.as_str())
+                        .at_segment(msn as i32),
                         data: (diff, tolerance_s),
                     });
                 }
@@ -1174,21 +971,14 @@ pub fn check_pdt_alignment(playlists: &[MediaPlaylist], tolerance_ms: f64) -> Ve
                     if diff > tolerance_s {
                         findings.push(SegmentFinding {
                             key: format!("{}|{}", i, j),
-                            issue: Issue {
-                                severity: Severity::Warn,
-                                segment_index: msn as i32,
-                                rendition_a: Some(pl_a.name.clone()),
-                                rendition_b: Some(pl_b.name.clone()),
-                                uri_a: Some(seg_a.uri.clone()),
-                                uri_b: Some(seg_b.uri.clone()),
-                                message: format!(
-                                    "rfc8216bis §6.2.4: PDT misalignment at MSN {} between '{}' \
-                                     and '{}': diff={:.3}s (tolerance={:.3}s).",
-                                    msn, pl_a.name, pl_b.name, diff, tolerance_s
-                                ),
-                                uri_note: None,
-                                ..Default::default()
-                            },
+                            issue: Issue::warn(format!(
+                                "rfc8216bis §6.2.4: PDT misalignment at MSN {} between '{}' \
+                                 and '{}': diff={:.3}s (tolerance={:.3}s).",
+                                msn, pl_a.name, pl_b.name, diff, tolerance_s
+                            ))
+                            .between_renditions(pl_a.name.as_str(), pl_b.name.as_str())
+                            .between_uris(seg_a.uri.as_str(), seg_b.uri.as_str())
+                            .at_segment(msn as i32),
                             data: (diff, tolerance_s),
                         });
                     }
@@ -1312,21 +1102,11 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
 
         // 1. EXT-X-PART-INF / PART-TARGET required when parts exist
         if has_parts && !has_part_inf {
-            issues.push(Issue {
-                severity: Severity::Error,
-                segment_index: -1,
-                rendition_a: Some(pl.name.clone()),
-                rendition_b: None,
-                uri_a: None,
-                uri_b: None,
-                message: format!(
-                    "rfc8216bis §4.4.3.7: '{}' contains EXT-X-PART tags but no \
-                     EXT-X-PART-INF. PART-TARGET is required.",
-                    pl.name
-                ),
-                uri_note: None,
-                ..Default::default()
-            });
+            issues.push(Issue::error(format!(
+                "rfc8216bis §4.4.3.7: '{}' contains EXT-X-PART tags but no \
+                 EXT-X-PART-INF. PART-TARGET is required.",
+                pl.name
+            )).in_rendition(pl.name.as_str()));
         }
 
         // 2. PART-HOLD-BACK is REQUIRED once EXT-X-PART-INF is present (§4.4.3.8): it is
@@ -1335,22 +1115,12 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
             let has_part_hold_back = pl.server_control.as_ref()
                 .is_some_and(|sc| sc.part_hold_back.is_some());
             if !has_part_hold_back {
-                issues.push(Issue {
-                    severity: Severity::Error,
-                    segment_index: -1,
-                    rendition_a: Some(pl.name.clone()),
-                    rendition_b: None,
-                    uri_a: None,
-                    uri_b: None,
-                    message: format!(
-                        "rfc8216bis §4.4.3.8: '{}' declares EXT-X-PART-INF but \
-                         EXT-X-SERVER-CONTROL has no PART-HOLD-BACK. The attribute is REQUIRED \
-                         when the playlist contains EXT-X-PART-INF.",
-                        pl.name
-                    ),
-                    uri_note: None,
-                    ..Default::default()
-                });
+                issues.push(Issue::error(format!(
+                    "rfc8216bis §4.4.3.8: '{}' declares EXT-X-PART-INF but \
+                     EXT-X-SERVER-CONTROL has no PART-HOLD-BACK. The attribute is REQUIRED \
+                     when the playlist contains EXT-X-PART-INF.",
+                    pl.name
+                )).in_rendition(pl.name.as_str()));
             }
         }
 
@@ -1358,21 +1128,14 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
         if let Some(pt) = pl.part_target {
             for (idx, part) in pl.parts.iter().enumerate() {
                 if part.duration > pt + 0.001 {
-                    issues.push(Issue {
-                        severity: Severity::Error,
-                        segment_index: idx as i32,
-                        rendition_a: Some(pl.name.clone()),
-                        rendition_b: None,
-                        uri_a: Some(part.uri.clone()),
-                        uri_b: None,
-                        message: format!(
-                            "rfc8216bis §4.4.4.9: Part {} in '{}' has duration {:.5}s exceeding \
-                             PART-TARGET {:.5}s.",
-                            idx, pl.name, part.duration, pt
-                        ),
-                        uri_note: None,
-                        ..Default::default()
-                    });
+                    issues.push(Issue::error(format!(
+                        "rfc8216bis §4.4.4.9: Part {} in '{}' has duration {:.5}s exceeding \
+                         PART-TARGET {:.5}s.",
+                        idx, pl.name, part.duration, pt
+                    ))
+                    .in_rendition(pl.name.as_str())
+                    .at_uri(part.uri.as_str())
+                    .at_segment(idx as i32));
                 }
             }
         }
@@ -1382,124 +1145,72 @@ pub fn check_ll_hls_compliance(playlists: &[MediaPlaylist]) -> Vec<Issue> {
             let has_part_hint = pl.preload_hint_uri.is_some()
                 && pl.preload_hint_type.as_deref() == Some("PART");
             if !has_part_hint {
-                issues.push(Issue {
-                    severity: Severity::Warn,
-                    segment_index: -1,
-                    rendition_a: Some(pl.name.clone()),
-                    rendition_b: None,
-                    uri_a: None,
-                    uri_b: None,
-                    message: format!(
-                        "rfc8216bis §4.4.5.3: '{}' is missing EXT-X-PRELOAD-HINT with TYPE=PART \
-                         at the playlist tail. Clients cannot prefetch the next partial segment.",
-                        pl.name
-                    ),
-                    uri_note: None,
-                    ..Default::default()
-                });
+                issues.push(Issue::warn(format!(
+                    "rfc8216bis §4.4.5.3: '{}' is missing EXT-X-PRELOAD-HINT with TYPE=PART \
+                     at the playlist tail. Clients cannot prefetch the next partial segment.",
+                    pl.name
+                )).in_rendition(pl.name.as_str()));
             }
         }
 
         // 6. EXT-X-RENDITION-REPORT should be present
         if has_parts && pl.rendition_reports.is_empty() {
-            issues.push(Issue {
-                severity: Severity::Warn,
-                segment_index: -1,
-                rendition_a: Some(pl.name.clone()),
-                rendition_b: None,
-                uri_a: None,
-                uri_b: None,
-                message: format!(
-                    "rfc8216bis §4.4.5.4: '{}' has no EXT-X-RENDITION-REPORT tags. \
-                     Each media playlist should report the last MSN/Part of every \
-                     other rendition so clients can switch without extra fetches.",
-                    pl.name
-                ),
-                uri_note: None,
-                ..Default::default()
-            });
+            issues.push(Issue::warn(format!(
+                "rfc8216bis §4.4.5.4: '{}' has no EXT-X-RENDITION-REPORT tags. \
+                 Each media playlist should report the last MSN/Part of every \
+                 other rendition so clients can switch without extra fetches.",
+                pl.name
+            )).in_rendition(pl.name.as_str()));
         }
 
         // 7. SERVER-CONTROL: CAN-SKIP-UNTIL MUST be >= 6× TARGETDURATION (§4.4.3.8)
         if let Some(sc) = &pl.server_control
             && let Some(csu) = sc.can_skip_until
                 && pl.target_duration > 0.0 && csu < pl.target_duration * 6.0 - 0.001 {
-                    issues.push(Issue {
-                        severity: Severity::Error,
-                        segment_index: -1,
-                        rendition_a: Some(pl.name.clone()),
-                        rendition_b: None,
-                        uri_a: None,
-                        uri_b: None,
-                        message: format!(
-                            "rfc8216bis §4.4.3.8: '{}' CAN-SKIP-UNTIL={:.3}s < 6× \
-                             TARGETDURATION={:.3}s (MUST be ≥ {:.3}s).",
-                            pl.name, csu, pl.target_duration, pl.target_duration * 6.0
-                        ),
-                        uri_note: Some(format!(
-                            "ratio={:.2}×, minimum 6.00×", csu / pl.target_duration
-                        )),
-                        ..Default::default()
-                    });
+                    issues.push(Issue::error(format!(
+                        "rfc8216bis §4.4.3.8: '{}' CAN-SKIP-UNTIL={:.3}s < 6× \
+                         TARGETDURATION={:.3}s (MUST be ≥ {:.3}s).",
+                        pl.name, csu, pl.target_duration, pl.target_duration * 6.0
+                    ))
+                    .in_rendition(pl.name.as_str())
+                    .with_note(format!(
+                        "ratio={:.2}×, minimum 6.00×", csu / pl.target_duration
+                    )));
                 }
 
         // 8. SERVER-CONTROL: PART-HOLD-BACK >= 2× PART-TARGET (MUST), >= 3× (SHOULD)
         if let Some(sc) = &pl.server_control {
             if let (Some(phb), Some(pt)) = (sc.part_hold_back, pl.part_target) {
                 if phb < pt * 2.0 - 0.001 {
-                    issues.push(Issue {
-                        severity: Severity::Error,
-                        segment_index: -1,
-                        rendition_a: Some(pl.name.clone()),
-                        rendition_b: None,
-                        uri_a: None,
-                        uri_b: None,
-                        message: format!(
-                            "rfc8216bis §4.4.3.8: '{}' PART-HOLD-BACK={:.5}s < 2× PART-TARGET={:.5}s \
-                             (MUST be ≥ {:.5}s).",
-                            pl.name, phb, pt, pt * 2.0
-                        ),
-                        uri_note: Some(format!("ratio={:.3}×, MUST be ≥ 2.000×", phb / pt)),
-                        ..Default::default()
-                    });
+                    issues.push(Issue::error(format!(
+                        "rfc8216bis §4.4.3.8: '{}' PART-HOLD-BACK={:.5}s < 2× PART-TARGET={:.5}s \
+                         (MUST be ≥ {:.5}s).",
+                        pl.name, phb, pt, pt * 2.0
+                    ))
+                    .in_rendition(pl.name.as_str())
+                    .with_note(format!("ratio={:.3}×, MUST be ≥ 2.000×", phb / pt)));
                 } else if phb < pt * 3.0 - 0.001 {
-                    issues.push(Issue {
-                        severity: Severity::Warn,
-                        segment_index: -1,
-                        rendition_a: Some(pl.name.clone()),
-                        rendition_b: None,
-                        uri_a: None,
-                        uri_b: None,
-                        message: format!(
-                            "rfc8216bis §4.4.3.8: '{}' PART-HOLD-BACK={:.5}s < 3× PART-TARGET={:.5}s \
-                             (SHOULD be ≥ {:.5}s).",
-                            pl.name, phb, pt, pt * 3.0
-                        ),
-                        uri_note: Some(format!("ratio={:.3}×, SHOULD be ≥ 3.000×", phb / pt)),
-                        ..Default::default()
-                    });
+                    issues.push(Issue::warn(format!(
+                        "rfc8216bis §4.4.3.8: '{}' PART-HOLD-BACK={:.5}s < 3× PART-TARGET={:.5}s \
+                         (SHOULD be ≥ {:.5}s).",
+                        pl.name, phb, pt, pt * 3.0
+                    ))
+                    .in_rendition(pl.name.as_str())
+                    .with_note(format!("ratio={:.3}×, SHOULD be ≥ 3.000×", phb / pt)));
                 }
             }
             // HOLD-BACK >= 3× TARGETDURATION
             if let Some(hb) = sc.hold_back
                 && pl.target_duration > 0.0 && hb < pl.target_duration * 3.0 - 0.001 {
-                    issues.push(Issue {
-                        severity: Severity::Error,
-                        segment_index: -1,
-                        rendition_a: Some(pl.name.clone()),
-                        rendition_b: None,
-                        uri_a: None,
-                        uri_b: None,
-                        message: format!(
-                            "rfc8216bis §4.4.3.8: '{}' HOLD-BACK={:.3}s < 3× TARGETDURATION={:.3}s \
-                             (MUST be ≥ {:.3}s).",
-                            pl.name, hb, pl.target_duration, pl.target_duration * 3.0
-                        ),
-                        uri_note: Some(format!(
-                            "ratio={:.2}×, minimum 3.00×", hb / pl.target_duration
-                        )),
-                        ..Default::default()
-                    });
+                    issues.push(Issue::error(format!(
+                        "rfc8216bis §4.4.3.8: '{}' HOLD-BACK={:.3}s < 3× TARGETDURATION={:.3}s \
+                         (MUST be ≥ {:.3}s).",
+                        pl.name, hb, pl.target_duration, pl.target_duration * 3.0
+                    ))
+                    .in_rendition(pl.name.as_str())
+                    .with_note(format!(
+                        "ratio={:.2}×, minimum 3.00×", hb / pl.target_duration
+                    )));
                 }
         }
     }
@@ -1646,22 +1357,12 @@ pub fn check_media_sequence_continuity(playlists: &[MediaPlaylist]) -> Vec<Issue
             }
             if let (Some(tl), Some(sl)) = (tag_line, first_seg_line)
                 && tl > sl {
-                    issues.push(Issue {
-                        severity: Severity::Error,
-                        segment_index: -1,
-                        rendition_a: Some(pl.name.clone()),
-                        rendition_b: None,
-                        uri_a: None,
-                        uri_b: None,
-                        message: format!(
-                            "rfc8216bis §4.4.3.2: EXT-X-MEDIA-SEQUENCE MUST appear before \
-                             the first Media Segment URI in '{}' \
-                             (tag at line {}, first segment at line {}).",
-                            pl.name, tl + 1, sl + 1
-                        ),
-                        uri_note: None,
-                        ..Default::default()
-                    });
+                    issues.push(Issue::error(format!(
+                        "rfc8216bis §4.4.3.2: EXT-X-MEDIA-SEQUENCE MUST appear before \
+                         the first Media Segment URI in '{}' \
+                         (tag at line {}, first segment at line {}).",
+                        pl.name, tl + 1, sl + 1
+                    )).in_rendition(pl.name.as_str()));
                 }
         }
     }
@@ -1677,19 +1378,13 @@ pub fn check_media_sequence_continuity(playlists: &[MediaPlaylist]) -> Vec<Issue
 pub fn check_iframe_playlists(playlists: &[MediaPlaylist]) -> Vec<Issue> {
     let mut issues = Vec::new();
     for pl in playlists.iter().filter(|pl| pl.is_iframe && !pl.iframes_only) {
-        issues.push(Issue {
-            severity: Severity::Error,
-            rendition_a: Some(pl.name.clone()),
-            uri_a: Some(pl.url.clone()),
-            message: format!(
-                "rfc8216bis §4.4.6.3: '{}' is referenced by an EXT-X-I-FRAME-STREAM-INF tag \
-                 but contains no EXT-X-I-FRAMES-ONLY tag. The Playlist file identified by the \
-                 URI attribute of that tag MUST contain one, or a client cannot tell that \
-                 every segment is independently decodable.",
-                pl.name
-            ),
-            ..Default::default()
-        });
+        issues.push(Issue::error(format!(
+            "rfc8216bis §4.4.6.3: '{}' is referenced by an EXT-X-I-FRAME-STREAM-INF tag \
+             but contains no EXT-X-I-FRAMES-ONLY tag. The Playlist file identified by the \
+             URI attribute of that tag MUST contain one, or a client cannot tell that \
+             every segment is independently decodable.",
+            pl.name
+        )).in_rendition(pl.name.as_str()).at_uri(pl.url.as_str()));
     }
     produced_by(CheckId::IFramePlaylists, issues)
 }
@@ -1705,19 +1400,15 @@ type DateRanges = BTreeMap<String, BTreeMap<String, String>>;
 /// §6.2.4 compares across renditions.
 fn dateranges_of(pl: &MediaPlaylist) -> DateRanges {
     let mut ranges: DateRanges = BTreeMap::new();
-    for line in pl.raw_content.lines() {
-        let Some(rest) = line.trim().strip_prefix("#EXT-X-DATERANGE:") else {
-            continue;
-        };
-        let attrs = super::parser::parse_attributes(rest);
+    for range in &pl.date_ranges {
         // A tag with no ID is not a Date Range that can be matched up with anything; the
         // missing REQUIRED attribute is reported by the check that reads the tag itself.
-        let Some(id) = attrs.get("ID").cloned() else {
+        let Some(id) = range.id.clone() else {
             continue;
         };
         let entry = ranges.entry(id).or_default();
-        for (name, value) in attrs {
-            entry.insert(name, value);
+        for (name, value) in &range.attributes {
+            entry.insert(name.clone(), value.clone());
         }
     }
     ranges
@@ -1765,7 +1456,11 @@ pub fn check_daterange_consistency(playlists: &[MediaPlaylist]) -> Vec<Issue> {
     // Missing Date Ranges are collected per playlist, and attribute differences per Date
     // Range, so a presentation that disagrees about a hundred Date Ranges produces a handful
     // of readable findings rather than a hundred rows.
-    let mut missing_by_playlist: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    //
+    // Keyed by position in `carriers` rather than by display name: two renditions can share a
+    // NAME, and keying by it merged their two sets of missing Date Ranges into one finding
+    // that named a single rendition and counted the other one's absences against it.
+    let mut missing_by_playlist: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
     // Two carriers that give one attribute two different values contradict each other, and
     // nothing about how the presentation is being served can reconcile them. A carrier that
     // has not written an attribute another has is a weaker signal: §4.4.5.1 lets a server
@@ -1783,7 +1478,7 @@ pub fn check_daterange_consistency(playlists: &[MediaPlaylist]) -> Vec<Issue> {
             .and_then(|(_, attrs)| attrs.get("START-DATE"))
             .and_then(|d| super::parser::parse_iso8601_to_epoch(d));
 
-        for (pl, ranges) in &carriers {
+        for (position, (pl, ranges)) in carriers.iter().enumerate() {
             if ranges.contains_key(id) {
                 continue;
             }
@@ -1795,7 +1490,7 @@ pub fn check_daterange_consistency(playlists: &[MediaPlaylist]) -> Vec<Issue> {
                 _ => false,
             };
             if !outside_window {
-                missing_by_playlist.entry(pl.name.as_str()).or_default().push(id);
+                missing_by_playlist.entry(position).or_default().push(id);
             }
         }
 
@@ -1816,6 +1511,11 @@ pub fn check_daterange_consistency(playlists: &[MediaPlaylist]) -> Vec<Issue> {
                         None => absent = true,
                     }
                 }
+                // Three or more carriers can disagree about an attribute *and* leave it off
+                // one of them at the same time. The outright contradiction is the finding
+                // worth making, so the weaker absence is not reported as well: two rows about
+                // one attribute of one Date Range, one of them a Warning the reader is invited
+                // to weigh against the Error above it, says nothing the Error did not.
                 if values.len() > 1 {
                     conflicting.push(name);
                 } else if absent {
@@ -1834,21 +1534,18 @@ pub fn check_daterange_consistency(playlists: &[MediaPlaylist]) -> Vec<Issue> {
 
     let mut issues = Vec::new();
     let total = carriers.iter().map(|(_, ranges)| ranges.len()).max().unwrap_or(0);
-    for (name, mut ids) in missing_by_playlist {
+    for (position, mut ids) in missing_by_playlist {
+        let (pl, _) = carriers[position];
+        let name = pl.name.as_str();
         ids.sort_unstable();
         let shown: Vec<String> = ids.iter().take(8).map(|id| format!("'{id}'")).collect();
         let ellipsis = if ids.len() > shown.len() { ", …" } else { "" };
-        issues.push(Issue {
-            severity: Severity::Error,
-            rendition_a: Some(name.to_string()),
-            message: format!(
-                "rfc8216bis §6.2.4: '{}' carries Date Ranges but is missing {} of the {} that \
-                 other playlists carry: {}{}. Any Playlist with Date Ranges MUST contain the \
-                 same set of Date Ranges as the others that do.",
-                name, ids.len(), total, shown.join(", "), ellipsis
-            ),
-            ..Default::default()
-        });
+        issues.push(Issue::error(format!(
+            "rfc8216bis §6.2.4: '{}' carries Date Ranges but is missing {} of the {} that \
+             other playlists carry: {}{}. Any Playlist with Date Ranges MUST contain the \
+             same set of Date Ranges as the others that do.",
+            name, ids.len(), total, shown.join(", "), ellipsis
+        )).in_rendition(name).at_uri(pl.url.as_str()));
     }
     if !differing.is_empty() {
         let shown: Vec<&String> = differing.iter().take(5).collect();
@@ -1891,20 +1588,15 @@ pub fn check_daterange_consistency(playlists: &[MediaPlaylist]) -> Vec<Issue> {
                  be a Date Range still being augmented rather than a disagreement.",
             )
         };
-        issues.push(Issue {
-            severity,
-            confidence,
-            message: format!(
-                "rfc8216bis §6.2.4: {} Date Range(s) are described by more attributes in some \
-                 playlists than in others: {}{}. Corresponding EXT-X-DATERANGE tags MUST \
-                 contain the same set of attribute/value pairs. {}",
-                partial.len(),
-                shown.iter().map(|d| d.as_str()).collect::<Vec<_>>().join("; "),
-                ellipsis,
-                why
-            ),
-            ..Default::default()
-        });
+        issues.push(Issue::new(severity, -1, format!(
+            "rfc8216bis §6.2.4: {} Date Range(s) are described by more attributes in some \
+             playlists than in others: {}{}. Corresponding EXT-X-DATERANGE tags MUST \
+             contain the same set of attribute/value pairs. {}",
+            partial.len(),
+            shown.iter().map(|d| d.as_str()).collect::<Vec<_>>().join("; "),
+            ellipsis,
+            why
+        )).with_confidence(confidence));
     }
 
     produced_by(CheckId::DateRangeConsistency, issues)
@@ -1935,13 +1627,9 @@ fn merge_interstitial_findings(findings: Vec<InterstitialFinding>) -> Vec<Issue>
             }
             None => {
                 order.push(finding.key.clone());
-                let issue = Issue {
-                    severity: finding.severity,
-                    check_id: CheckId::Interstitials,
-                    rendition_a: Some(finding.rendition.clone()),
-                    message: finding.message,
-                    ..Default::default()
-                };
+                let issue = Issue::new(finding.severity, -1, finding.message)
+                    .for_check(CheckId::Interstitials)
+                    .in_rendition(finding.rendition.clone());
                 merged.insert(finding.key, (issue, vec![finding.rendition]));
             }
         }
@@ -1967,9 +1655,6 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
     let mut interstitials = Vec::new();
 
     for pl in playlists {
-        if pl.raw_content.is_empty() {
-            continue;
-        }
         // Per rfc8216bis §D.2 a DATERANGE with the same ID as a previously-seen tag in the
         // same playlist is an update; update tags don't need to repeat
         // X-ASSET-URI/X-ASSET-LIST, so only the first occurrence of each ID is validated.
@@ -1978,17 +1663,13 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
         // another rendition is the same Date Range declared again, not an update to it.
         // Findings repeated that way are merged afterwards by their key.
         let mut seen_ids: HashSet<String> = HashSet::new();
-        for line in pl.raw_content.lines() {
-            let line = line.trim();
-            let Some(rest) = line.strip_prefix("#EXT-X-DATERANGE:") else {
-                continue;
-            };
-            let attrs = super::parser::parse_attributes(rest);
-            let class = attrs.get("CLASS").cloned().unwrap_or_default();
-            if !class.contains("com.apple.hls.interstitial") {
+        for range in &pl.date_ranges {
+            if !range.is_interstitial() {
                 continue;
             }
-            let dr_id = attrs.get("ID").cloned().unwrap_or_default();
+            let attrs = &range.attributes;
+            let rest = range.raw_attributes.as_str();
+            let dr_id = range.id.clone().unwrap_or_default();
             let is_update = !dr_id.is_empty() && seen_ids.contains(&dr_id);
             if !is_update {
                 seen_ids.insert(dr_id.clone());
@@ -2226,22 +1907,21 @@ pub fn check_interstitials(playlists: &[MediaPlaylist]) -> (Vec<Issue>, Vec<Inte
         }
     }
     for pl in playlists {
-        for line in pl.raw_content.lines() {
-            let line = line.trim();
-            let Some(rest) = line.strip_prefix("#EXT-X-DATERANGE:") else { continue; };
-            let attrs = super::parser::parse_attributes(rest);
+        for range in &pl.date_ranges {
             // Skip OUT tags (already processed above) — only want IN tags (no CLASS)
-            if attrs.get("CLASS").is_some_and(|c| c.contains("com.apple.hls.interstitial")) {
+            if range.is_interstitial() {
                 continue;
             }
-            let Some(id) = attrs.get("ID") else { continue; };
+            let Some(id) = range.id.as_ref() else { continue; };
             if let Some(&idx) = id_to_idx.get(id) {
                 let it = &mut interstitials[idx];
                 if it.playout_limit.is_none() {
-                    it.playout_limit = attrs.get("X-PLAYOUT-LIMIT").and_then(|v| v.parse::<f64>().ok());
+                    it.playout_limit = range.attributes.get("X-PLAYOUT-LIMIT")
+                        .and_then(|v| v.parse::<f64>().ok());
                 }
                 if it.resume_offset.is_none() {
-                    it.resume_offset = attrs.get("X-RESUME-OFFSET").and_then(|v| v.parse::<f64>().ok());
+                    it.resume_offset = range.attributes.get("X-RESUME-OFFSET")
+                        .and_then(|v| v.parse::<f64>().ok());
                 }
             }
         }
@@ -2256,12 +1936,6 @@ mod tests {
     use super::*;
 
     // ── Test helpers ──────────────────────────────────────────────────────────
-
-    fn make_playlist(name: &str, content: &str) -> MediaPlaylist {
-        let mut pl = MediaPlaylist::new(name.to_string(), format!("https://cdn.example.com/{name}.m3u8"));
-        pl.raw_content = content.to_string();
-        pl
-    }
 
     fn make_segment(uri: &str, duration: f64) -> Segment {
         Segment {
@@ -2305,14 +1979,14 @@ mod tests {
 
     #[test]
     fn extm3u_header_passes_when_first_line_is_extm3u() {
-        let pl = make_playlist("v", "#EXTM3U\n#EXT-X-TARGETDURATION:6\n");
+        let pl = parse_playlist("v", "#EXTM3U\n#EXT-X-TARGETDURATION:6\n");
         let issues = check_extm3u_header(&[pl]);
         assert!(issues.is_empty(), "expected no issues, got: {:?}", issues);
     }
 
     #[test]
     fn extm3u_header_errors_when_first_line_is_missing() {
-        let pl = make_playlist("v", "#EXT-X-TARGETDURATION:6\n#EXTM3U\n");
+        let pl = parse_playlist("v", "#EXT-X-TARGETDURATION:6\n#EXTM3U\n");
         let issues = check_extm3u_header(&[pl]);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].severity, Severity::Error);
@@ -2322,14 +1996,14 @@ mod tests {
 
     #[test]
     fn target_duration_missing_produces_error() {
-        let pl = make_playlist("v", "#EXTM3U\n");
+        let pl = parse_playlist("v", "#EXTM3U\n");
         let issues = check_target_duration_compliance(&[pl]);
         assert!(issues.iter().any(|i| i.severity == Severity::Error && i.message.contains("missing or zero")));
     }
 
     #[test]
     fn segment_within_target_duration_passes() {
-        let mut pl = make_playlist("v", "#EXTM3U\n#EXT-X-TARGETDURATION:6\n");
+        let mut pl = parse_playlist("v", "#EXTM3U\n#EXT-X-TARGETDURATION:6\n");
         pl.target_duration = 6.0;
         pl.segments = vec![make_segment("seg0.mp4", 5.9)];
         let issues = check_target_duration_compliance(&[pl]);
@@ -2339,7 +2013,7 @@ mod tests {
     #[test]
     fn segment_rounding_to_target_passes() {
         // 5.5 rounds to 6 which equals TARGETDURATION:6 — should pass
-        let mut pl = make_playlist("v", "#EXTM3U\n#EXT-X-TARGETDURATION:6\n");
+        let mut pl = parse_playlist("v", "#EXTM3U\n#EXT-X-TARGETDURATION:6\n");
         pl.target_duration = 6.0;
         pl.segments = vec![make_segment("seg0.mp4", 5.5)];
         let issues = check_target_duration_compliance(&[pl]);
@@ -2349,7 +2023,7 @@ mod tests {
     #[test]
     fn segment_exceeding_target_duration_errors() {
         // 7.807 rounds to 8 > 6 → ERROR
-        let mut pl = make_playlist("v", "#EXTM3U\n#EXT-X-TARGETDURATION:6\n");
+        let mut pl = parse_playlist("v", "#EXTM3U\n#EXT-X-TARGETDURATION:6\n");
         pl.target_duration = 6.0;
         pl.segments = vec![make_segment("seg-bad.mp4", 7.807)];
         let issues = check_target_duration_compliance(&[pl]);
@@ -2359,7 +2033,7 @@ mod tests {
     #[test]
     fn targetduration_much_larger_than_max_segment_warns() {
         // TARGETDURATION=10, max segment=3.9 → WARN because 10 > 3+1=4
-        let mut pl = make_playlist("v", "#EXTM3U\n#EXT-X-TARGETDURATION:10\n");
+        let mut pl = parse_playlist("v", "#EXTM3U\n#EXT-X-TARGETDURATION:10\n");
         pl.target_duration = 10.0;
         pl.segments = vec![make_segment("seg0.mp4", 3.9), make_segment("seg1.mp4", 3.9)];
         let issues = check_target_duration_compliance(&[pl]);
@@ -2456,7 +2130,7 @@ mod tests {
     #[test]
     fn duplicate_targetduration_errors() {
         let content = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-TARGETDURATION:4\n";
-        let pl = make_playlist("v", content);
+        let pl = parse_playlist("v", content);
         let issues = check_media_sequence_duplicate_tags(&[pl]);
         assert!(issues.iter().any(|i| i.severity == Severity::Error && i.message.contains("EXT-X-TARGETDURATION")));
     }
@@ -2464,7 +2138,7 @@ mod tests {
     #[test]
     fn single_targetduration_passes() {
         let content = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n";
-        let pl = make_playlist("v", content);
+        let pl = parse_playlist("v", content);
         let issues = check_media_sequence_duplicate_tags(&[pl]);
         assert!(issues.is_empty());
     }
@@ -2581,7 +2255,7 @@ mod tests {
 
     #[test]
     fn vod_without_endlist_errors() {
-        let mut pl = make_playlist("v", "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n");
+        let mut pl = parse_playlist("v", "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n");
         pl.playlist_type = Some("VOD".to_string());
         pl.has_endlist = false;
         let issues = check_playlist_type_endlist(&[pl]);
@@ -2590,7 +2264,7 @@ mod tests {
 
     #[test]
     fn vod_with_endlist_passes() {
-        let mut pl = make_playlist("v", "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-ENDLIST\n");
+        let mut pl = parse_playlist("v", "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-ENDLIST\n");
         pl.playlist_type = Some("VOD".to_string());
         pl.has_endlist = true;
         let issues = check_playlist_type_endlist(&[pl]);
@@ -2600,7 +2274,7 @@ mod tests {
     #[test]
     fn event_without_endlist_passes() {
         // EVENT playlist without ENDLIST is valid during a live event
-        let mut pl = make_playlist("v", "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:EVENT\n");
+        let mut pl = parse_playlist("v", "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:EVENT\n");
         pl.playlist_type = Some("EVENT".to_string());
         pl.has_endlist = false;
         let issues = check_playlist_type_endlist(&[pl]);
@@ -3150,7 +2824,7 @@ mod tests {
             r#"CLASS="com.apple.hls.interstitial","#,
             "X-ASSET-URI=\"https://ads.example.com/ad.m3u8\"\n",
         );
-        let pl = make_playlist("v", content);
+        let pl = parse_playlist("v", content);
         let (issues, interstitials) = check_interstitials(&[pl]);
         assert!(issues.is_empty(), "valid interstitial must produce no issues: {:?}", issues);
         assert_eq!(interstitials.len(), 1);
@@ -3167,7 +2841,7 @@ mod tests {
             r#"CLASS="com.apple.hls.interstitial","#,
             "X-ASSET-URI=\"https://ads.example.com/ad.m3u8\"\n",
         );
-        let pl = make_playlist("v", content);
+        let pl = parse_playlist("v", content);
         let (issues, _) = check_interstitials(&[pl]);
         assert!(issues.iter().any(|i| i.severity == Severity::Error && i.message.contains("missing ID")));
     }
@@ -3180,7 +2854,7 @@ mod tests {
             r#"ID="ad-1",START-DATE="2024-01-15T12:00:00Z","#,
             "CLASS=\"com.apple.hls.interstitial\"\n",
         );
-        let pl = make_playlist("v", content);
+        let pl = parse_playlist("v", content);
         let (issues, _) = check_interstitials(&[pl]);
         assert!(issues.iter().any(|i| i.severity == Severity::Error && i.message.contains("X-ASSET-URI/X-ASSET-LIST")));
     }
@@ -3195,7 +2869,7 @@ mod tests {
             "X-ASSET-URI=\"https://ads.example.com/ad.m3u8\",",
             "X-ASSET-LIST=\"https://ads.example.com/ads.json\"\n",
         );
-        let pl = make_playlist("v", content);
+        let pl = parse_playlist("v", content);
         let (issues, _) = check_interstitials(&[pl]);
         assert!(issues.iter().any(|i| i.severity == Severity::Error && i.message.contains("both X-ASSET-URI and X-ASSET-LIST")));
     }
@@ -3210,7 +2884,7 @@ mod tests {
             "X-ASSET-URI=\"https://ads.example.com/ad.m3u8\",",
             "X-SNAP=\"BEFORE\"\n",
         );
-        let pl = make_playlist("v", content);
+        let pl = parse_playlist("v", content);
         let (issues, _) = check_interstitials(&[pl]);
         assert!(issues.iter().any(|i| i.severity == Severity::Warn && i.message.contains("X-SNAP")));
     }
@@ -3236,7 +2910,7 @@ mod tests {
             "CLASS=\"com.apple.hls.interstitial\",",
             "X-RESUME-OFFSET=0\n",
         );
-        let pl = make_playlist("v1", content);
+        let pl = parse_playlist("v1", content);
         let (issues, interstitials) = check_interstitials(&[pl]);
         // No errors — the update tag must not trigger a false positive
         let errors: Vec<_> = issues.iter().filter(|i| i.severity == Severity::Error).collect();
@@ -3259,9 +2933,9 @@ mod tests {
         );
         let content = format!("#EXTM3U\n{tag}");
         let playlists = vec![
-            make_playlist("v-hi", &content),
-            make_playlist("v-lo", &content),
-            make_playlist("a-en", &content),
+            parse_playlist("v-hi", &content),
+            parse_playlist("v-lo", &content),
+            parse_playlist("a-en", &content),
         ];
         let (issues, interstitials) = check_interstitials(&playlists);
         let errors = errors(&issues);
@@ -3287,7 +2961,7 @@ mod tests {
             "#EXT-X-DATERANGE:START-DATE=\"2024-01-15T12:30:00Z\",",
             "CLASS=\"com.apple.hls.interstitial\",X-ASSET-URI=\"https://ads.example.com/b.m3u8\"\n",
         );
-        let (issues, interstitials) = check_interstitials(&[make_playlist("v", content)]);
+        let (issues, interstitials) = check_interstitials(&[parse_playlist("v", content)]);
         assert_eq!(
             errors(&issues).len(), 2,
             "two Date Ranges each missing an ID are two mistakes: {issues:?}"
@@ -3306,7 +2980,7 @@ mod tests {
             "CLASS=\"com.apple.hls.interstitial\",X-ASSET-URI=\"https://ads.example.com/a.m3u8\"\n",
             "#EXT-X-DATERANGE:START-DATE=\"2024-01-15T12:00:30Z\",X-RESUME-OFFSET=12.5\n",
         );
-        let (_, interstitials) = check_interstitials(&[make_playlist("v", content)]);
+        let (_, interstitials) = check_interstitials(&[parse_playlist("v", content)]);
         assert_eq!(interstitials.len(), 1);
         assert_eq!(
             interstitials[0].resume_offset, None,
@@ -3323,7 +2997,7 @@ mod tests {
             "#EXT-X-DATERANGE:ID=\"ad-1\",START-DATE=\"2024-01-15T12:00:30Z\",",
             "X-RESUME-OFFSET=12.5,X-PLAYOUT-LIMIT=30\n",
         );
-        let (_, interstitials) = check_interstitials(&[make_playlist("v", content)]);
+        let (_, interstitials) = check_interstitials(&[parse_playlist("v", content)]);
         assert_eq!(interstitials[0].resume_offset, Some(12.5));
         assert_eq!(interstitials[0].playout_limit, Some(30.0));
     }
@@ -3468,6 +3142,39 @@ mod tests {
         assert_eq!((issues[2].seg_first, issues[2].seg_last, issues[2].count), (0, 2, 3));
     }
 
+    #[test]
+    fn two_rendition_pairs_that_share_a_name_are_folded_apart_for_pdt_too() {
+        // PDT alignment folds its per-segment findings the same way and carries the same
+        // hazard: nothing but this test stops its key going back to the pair of display names,
+        // which would run the 'v-hi'/'v-lo' findings of two different pairs together.
+        let pdt_playlist = |name: &str, url: &str, seconds: [&str; 3]| {
+            let mut content = String::from(
+                "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXT-X-MEDIA-SEQUENCE:0\n"
+            );
+            for (index, second) in seconds.iter().enumerate() {
+                content.push_str(&format!(
+                    "#EXT-X-PROGRAM-DATE-TIME:2024-01-15T12:00:{second}Z\n\
+                     #EXTINF:5.0,\ns{index}.m4s\n"
+                ));
+            }
+            named_playlist(name, url, &content)
+        };
+        // 'v-lo' (a) is a second late over the first two segments, 'v-lo' (b) over the last
+        // one, and the two are a second apart from each other throughout.
+        let hi = pdt_playlist("v-hi", "https://cdn.example.com/hi.m3u8", ["00", "05", "10"]);
+        let lo_a = pdt_playlist("v-lo", "https://cdn.example.com/a/lo.m3u8", ["01", "06", "10"]);
+        let lo_b = pdt_playlist("v-lo", "https://cdn.example.com/b/lo.m3u8", ["00", "05", "11"]);
+        let issues = check_pdt_alignment(&[hi, lo_a, lo_b], 100.0);
+        assert_eq!(
+            issues.len(),
+            3,
+            "three pairs are misaligned, and two of them name the same two renditions: {issues:?}"
+        );
+        assert_eq!((issues[0].seg_first, issues[0].seg_last, issues[0].count), (0, 1, 2));
+        assert_eq!((issues[1].segment_index, issues[1].count), (2, 1));
+        assert_eq!((issues[2].seg_first, issues[2].seg_last, issues[2].count), (0, 2, 3));
+    }
+
     // ── check_iframe_playlists ────────────────────────────────────────────────
 
     fn iframe_playlist(name: &str, iframes_only: bool) -> MediaPlaylist {
@@ -3516,12 +3223,29 @@ mod tests {
         daterange_playlist(name, start, ranges, true)
     }
 
+    /// The same again, with the display name and URL set independently, for the rules that
+    /// must not take two renditions sharing a NAME for one rendition.
+    fn named_playlist_with_dateranges(
+        name: &str,
+        url: &str,
+        start: &str,
+        ranges: &[&str],
+    ) -> MediaPlaylist {
+        named_playlist(name, url, &daterange_content(start, ranges, false))
+    }
+
     fn daterange_playlist(
         name: &str,
         start: &str,
         ranges: &[&str],
         ended: bool,
     ) -> MediaPlaylist {
+        let pl = parse_playlist(name, &daterange_content(start, ranges, ended));
+        assert_eq!(pl.has_endlist, ended);
+        pl
+    }
+
+    fn daterange_content(start: &str, ranges: &[&str], ended: bool) -> String {
         let mut content = format!(
             "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-PROGRAM-DATE-TIME:{start}\n"
         );
@@ -3533,9 +3257,7 @@ mod tests {
         if ended {
             content.push_str("#EXT-X-ENDLIST\n");
         }
-        let pl = parse_playlist(name, &content);
-        assert_eq!(pl.has_endlist, ended);
-        pl
+        content
     }
 
     const AD_1: &str = "#EXT-X-DATERANGE:ID=\"ad-1\",START-DATE=\"2024-01-15T12:00:00Z\",\
@@ -3562,6 +3284,47 @@ mod tests {
         assert_eq!(errors.len(), 1, "{issues:?}");
         assert!(errors[0].message.contains("'ad-2'"), "{}", errors[0].message);
         assert_eq!(errors[0].rendition_a.as_deref(), Some("v-lo"));
+    }
+
+    #[test]
+    fn two_renditions_sharing_a_name_each_answer_for_their_own_missing_date_ranges() {
+        // Collecting the absences by display name merged these two renditions into one
+        // finding, which then named one of them and counted the other's missing Date Range
+        // against it: "missing 2 of the 2" for a rendition that was missing one.
+        let ad_2 = "#EXT-X-DATERANGE:ID=\"ad-2\",START-DATE=\"2024-01-15T12:00:04Z\"";
+        let playlists = vec![
+            named_playlist_with_dateranges(
+                "v-hi", "https://cdn.example.com/hi.m3u8", "2024-01-15T12:00:00Z", &[AD_1, ad_2]),
+            named_playlist_with_dateranges(
+                "v-lo", "https://cdn.example.com/a/lo.m3u8", "2024-01-15T12:00:00Z", &[AD_1]),
+            named_playlist_with_dateranges(
+                "v-lo", "https://cdn.example.com/b/lo.m3u8", "2024-01-15T12:00:00Z", &[ad_2]),
+        ];
+        let issues = check_daterange_consistency(&playlists);
+        let errors = errors(&issues);
+        assert_eq!(
+            errors.len(), 2,
+            "two renditions are each missing one Date Range: {issues:?}"
+        );
+        assert!(
+            errors.iter().all(|i| i.rendition_a.as_deref() == Some("v-lo")),
+            "both findings are about the two renditions that share the name: {errors:?}"
+        );
+        assert!(
+            errors.iter().all(|i| i.message.contains("missing 1 of the 2")),
+            "neither rendition may be charged with the other's absence: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|i| i.message.contains("'ad-2'"))
+                && errors.iter().any(|i| i.message.contains("'ad-1'")),
+            "each finding must name the Date Range its own rendition is missing: {errors:?}"
+        );
+        let uris: Vec<Option<&str>> = errors.iter().map(|i| i.uri_a.as_deref()).collect();
+        assert!(
+            uris.contains(&Some("https://cdn.example.com/a/lo.m3u8"))
+                && uris.contains(&Some("https://cdn.example.com/b/lo.m3u8")),
+            "two renditions sharing a NAME are told apart by the playlist URI: {errors:?}"
+        );
     }
 
     #[test]
@@ -3592,6 +3355,33 @@ mod tests {
         assert!(
             errors[0].message.contains("'ad-1' differs in DURATION"),
             "the finding must name the attribute that differs: {}", errors[0].message
+        );
+    }
+
+    #[test]
+    fn an_attribute_that_both_conflicts_and_is_absent_is_reported_once() {
+        // Three carriers: two give DURATION different values and the third does not write it
+        // at all. The contradiction is the finding; adding a second, softer row about the same
+        // attribute of the same Date Range only invites the reader to weigh one against the
+        // other.
+        let shifted = "#EXT-X-DATERANGE:ID=\"ad-1\",START-DATE=\"2024-01-15T12:00:00Z\",\
+                       DURATION=15.0";
+        let without_duration = "#EXT-X-DATERANGE:ID=\"ad-1\",START-DATE=\"2024-01-15T12:00:00Z\"";
+        let playlists = vec![
+            playlist_with_dateranges("v-hi", "2024-01-15T12:00:00Z", &[AD_1]),
+            playlist_with_dateranges("v-mid", "2024-01-15T12:00:00Z", &[shifted]),
+            playlist_with_dateranges("v-lo", "2024-01-15T12:00:00Z", &[without_duration]),
+        ];
+        let issues = check_daterange_consistency(&playlists);
+        assert_eq!(issues.len(), 1, "one attribute, one finding: {issues:?}");
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(
+            issues[0].message.contains("'ad-1' differs in DURATION"),
+            "the finding is the contradiction: {}", issues[0].message
+        );
+        assert!(
+            !issues.iter().any(|i| i.message.contains("in some playlists only")),
+            "the absence must not be reported alongside the contradiction: {issues:?}"
         );
     }
 
@@ -3665,6 +3455,43 @@ mod tests {
             check_daterange_consistency(&playlists).is_empty(),
             "a sliding window is not a set difference"
         );
+    }
+
+    #[test]
+    fn the_date_range_rules_read_the_tags_the_parser_stored() {
+        // The tags are parsed once, as the playlist is read. Nothing here goes back to the
+        // playlist text for them, so emptying it leaves both rules saying what they said.
+        let other = "#EXT-X-DATERANGE:ID=\"ad-2\",START-DATE=\"2024-01-15T12:00:04Z\"";
+        let interstitial = "#EXT-X-DATERANGE:ID=\"ad-3\",\
+                            CLASS=\"com.apple.hls.interstitial\",\
+                            START-DATE=\"2024-01-15T12:00:04Z\"";
+        let mut playlists = vec![
+            playlist_with_dateranges(
+                "v-hi", "2024-01-15T12:00:00Z", &[AD_1, other, interstitial]),
+            playlist_with_dateranges("v-lo", "2024-01-15T12:00:00Z", &[AD_1, interstitial]),
+        ];
+        let expected_consistency = check_daterange_consistency(&playlists);
+        let (expected_interstitials, _) = check_interstitials(&playlists);
+        assert_eq!(errors(&expected_consistency).len(), 1, "{expected_consistency:?}");
+        assert_eq!(
+            errors(&expected_interstitials).len(), 1,
+            "the interstitial has no X-ASSET-URI or X-ASSET-LIST: {expected_interstitials:?}"
+        );
+
+        for pl in &mut playlists {
+            pl.raw_content.clear();
+        }
+        let consistency = check_daterange_consistency(&playlists);
+        let (interstitials, entries) = check_interstitials(&playlists);
+        assert_eq!(
+            consistency.iter().map(|i| &i.message).collect::<Vec<_>>(),
+            expected_consistency.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            interstitials.iter().map(|i| &i.message).collect::<Vec<_>>(),
+            expected_interstitials.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+        assert_eq!(entries.len(), 2, "one interstitial per carrier: {entries:?}");
     }
 
     #[test]

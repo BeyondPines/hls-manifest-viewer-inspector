@@ -159,7 +159,6 @@ pub fn parse_master_playlist(url: &str, content: &str) -> MasterPlaylist {
                 name: attrs.get("NAME").cloned().unwrap_or_default(),
                 uri: attrs.get("URI").cloned(), // raw — callers must substitute + resolve before fetch
                 language: attrs.get("LANGUAGE").cloned(),
-                is_default: attrs.get("DEFAULT").is_some_and(|v| v == "YES"),
                 autoselect: attrs.get("AUTOSELECT").is_some_and(|v| v == "YES"),
                 channels: attrs.get("CHANNELS").cloned(),
                 characteristics: attrs.get("CHARACTERISTICS").cloned(),
@@ -264,19 +263,15 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
                         raw_duration
                     )
                 };
-                parse_issues.push(Issue {
-                    severity: Severity::Error,
-                    check_id: CheckId::SegmentStructure,
-                    segment_index: pl.segments.len() as i32,
-                    rendition_a: Some(pl_label.clone()),
-                    message: format!(
-                        "rfc8216bis §4.4.4.1: EXTINF on line {} of '{}' has duration {}. \
-                         The segment it introduces was skipped and is not covered by any \
-                         other check.",
-                        line_no + 1, pl_label, reason
-                    ),
-                    ..Default::default()
-                });
+                parse_issues.push(Issue::error(format!(
+                    "rfc8216bis §4.4.4.1: EXTINF on line {} of '{}' has duration {}. \
+                     The segment it introduces was skipped and is not covered by any \
+                     other check.",
+                    line_no + 1, pl_label, reason
+                ))
+                .for_check(CheckId::SegmentStructure)
+                .in_rendition(pl_label.clone())
+                .at_segment(pl.segments.len() as i32));
             }
             if comma_pos < val.len() {
                 let title = val[comma_pos + 1..].trim();
@@ -340,8 +335,6 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
                 pl.parts.push(PartialSegment {
                     uri: resolve_url(url, uri),
                     duration: attrs.get("DURATION").and_then(|v| v.parse().ok()).unwrap_or(0.0),
-                    independent: attrs.get("INDEPENDENT").is_some_and(|v| v == "YES"),
-                    gap: attrs.get("GAP").is_some_and(|v| v == "YES"),
                 });
             }
         } else if let Some(rest) = line.strip_prefix("#EXT-X-PRELOAD-HINT:") {
@@ -354,8 +347,7 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
             let attrs = parse_attributes(rest);
             let uri = attrs.get("URI").map(|u| resolve_url(url, u)).unwrap_or_default();
             let last_msn = attrs.get("LAST-MSN").and_then(|v| v.parse::<i64>().ok()).unwrap_or(-1);
-            let last_part = attrs.get("LAST-PART").and_then(|v| v.parse::<i64>().ok()).unwrap_or(-1);
-            pl.rendition_reports.push(super::types::RenditionReport { uri, last_msn, last_part });
+            pl.rendition_reports.push(super::types::RenditionReport { uri, last_msn });
         } else if let Some(rest) = line.strip_prefix("#EXT-X-DEFINE:") {
             let attrs = parse_attributes(rest);
             if let (Some(name), Some(value)) = (attrs.get("NAME"), attrs.get("VALUE")) {
@@ -376,20 +368,16 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
                         pl.definitions.insert(name.clone(), percent_decode(&raw));
                     }
                     None => {
-                        parse_issues.push(Issue {
-                            severity: Severity::Error,
-                            check_id: CheckId::VariableDefinitions,
-                            rendition_a: Some(pl_label.clone()),
-                            uri_a: Some(url.to_string()),
-                            message: format!(
-                                "rfc8216bis §4.4.2.3: EXT-X-DEFINE on line {} of '{}' declares \
-                                 QUERYPARAM=\"{}\" but the playlist URI has no '{}' query \
-                                 parameter with a value. A parser MUST fail to parse the \
-                                 Playlist, so every {{${}}} reference in it is unresolved.",
-                                line_no + 1, pl_label, name, name, name
-                            ),
-                            ..Default::default()
-                        });
+                        parse_issues.push(Issue::error(format!(
+                            "rfc8216bis §4.4.2.3: EXT-X-DEFINE on line {} of '{}' declares \
+                             QUERYPARAM=\"{}\" but the playlist URI has no '{}' query \
+                             parameter with a value. A parser MUST fail to parse the \
+                             Playlist, so every {{${}}} reference in it is unresolved.",
+                            line_no + 1, pl_label, name, name, name
+                        ))
+                        .for_check(CheckId::VariableDefinitions)
+                        .in_rendition(pl_label.clone())
+                        .at_uri(url));
                     }
                 }
             } else if let Some(name) = attrs.get("IMPORT")
@@ -398,22 +386,28 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
                 // Imports are seeded from the Multivariant Playlist before the playlist is
                 // read (see `apply_master_definitions`), so one still unresolved here either
                 // names nothing the parent declared or was reached without a parent at all.
-                parse_issues.push(Issue {
-                    severity: Severity::Error,
-                    check_id: CheckId::VariableDefinitions,
-                    rendition_a: Some(pl_label.clone()),
-                    uri_a: Some(url.to_string()),
-                    message: format!(
-                        "rfc8216bis §4.4.2.3: EXT-X-DEFINE on line {} of '{}' imports \
-                         variable '{}', which no Multivariant Playlist read for this run \
-                         declares. Where the IMPORT names no declared variable, or the Media \
-                         Playlist was not loaded from a Multivariant Playlist, a parser MUST \
-                         fail to parse the Playlist.",
-                        line_no + 1, pl_label, name
-                    ),
-                    ..Default::default()
-                });
+                parse_issues.push(Issue::error(format!(
+                    "rfc8216bis §4.4.2.3: EXT-X-DEFINE on line {} of '{}' imports \
+                     variable '{}', which no Multivariant Playlist read for this run \
+                     declares. Where the IMPORT names no declared variable, or the Media \
+                     Playlist was not loaded from a Multivariant Playlist, a parser MUST \
+                     fail to parse the Playlist.",
+                    line_no + 1, pl_label, name
+                ))
+                .for_check(CheckId::VariableDefinitions)
+                .in_rendition(pl_label.clone())
+                .at_uri(url));
             }
+        } else if let Some(rest) = line.strip_prefix("#EXT-X-DATERANGE:") {
+            // Stored, rather than left for each rule to find in the raw text again: the
+            // consistency check, the interstitial checks and the SCTE-35 collection all read
+            // the same tags, and each of them used to re-scan and re-parse the whole playlist.
+            let attrs = parse_attributes(rest);
+            pl.date_ranges.push(DateRange {
+                id: attrs.get("ID").cloned(),
+                attributes: attrs,
+                raw_attributes: rest.to_string(),
+            });
         } else if let Some(rest) = line.strip_prefix("#EXT-X-SKIP:") {
             let attrs = parse_attributes(rest);
             if let Some(skipped) = attrs.get("SKIPPED-SEGMENTS").and_then(|v| v.parse::<u64>().ok()) {
@@ -452,20 +446,16 @@ pub fn parse_media_playlist(url: &str, content: &str, pl: &mut MediaPlaylist) {
                 // The unreadable EXTINF was already reported; this is the URI it introduced.
                 extinf_unreadable = false;
             } else {
-                parse_issues.push(Issue {
-                    severity: Severity::Error,
-                    check_id: CheckId::SegmentStructure,
-                    segment_index: pl.segments.len() as i32,
-                    rendition_a: Some(pl_label.clone()),
-                    uri_a: Some(super::absolute_fetch_uri(url, line, &pl.definitions)),
-                    message: format!(
-                        "rfc8216bis §4.4.4.1: Media Segment URI on line {} of '{}' has no \
-                         preceding EXTINF tag. Every Media Segment MUST be introduced by an \
-                         EXTINF tag; this URI was skipped and is not covered by any other check.",
-                        line_no + 1, pl_label
-                    ),
-                    ..Default::default()
-                });
+                parse_issues.push(Issue::error(format!(
+                    "rfc8216bis §4.4.4.1: Media Segment URI on line {} of '{}' has no \
+                     preceding EXTINF tag. Every Media Segment MUST be introduced by an \
+                     EXTINF tag; this URI was skipped and is not covered by any other check.",
+                    line_no + 1, pl_label
+                ))
+                .for_check(CheckId::SegmentStructure)
+                .in_rendition(pl_label.clone())
+                .at_uri(super::absolute_fetch_uri(url, line, &pl.definitions))
+                .at_segment(pl.segments.len() as i32));
             }
         }
     }
@@ -709,6 +699,49 @@ mod tests {
                 byterange: None
             }]
         );
+    }
+
+    // ── parse_media_playlist EXT-X-DATERANGE ──────────────────────────────────
+
+    #[test]
+    fn parse_media_stores_every_daterange_tag_in_playlist_order() {
+        let mut pl = MediaPlaylist::new("v1".to_string(), String::new());
+        parse_media_playlist(
+            "https://ex.com/hls/prog.m3u8",
+            "#EXTM3U\n\
+             #EXT-X-TARGETDURATION:4\n\
+             #EXT-X-PROGRAM-DATE-TIME:2024-01-15T12:00:00Z\n\
+             #EXT-X-DATERANGE:ID=\"ad-1\",CLASS=\"com.apple.hls.interstitial\",\
+             START-DATE=\"2024-01-15T12:00:00Z\",X-ASSET-URI=\"https://ads.ex.com/a.m3u8\"\n\
+             #EXT-X-DATERANGE:ID=\"ad-1\",X-RESUME-OFFSET=0\n\
+             #EXT-X-DATERANGE:START-DATE=\"2024-01-15T12:00:04Z\"\n\
+             #EXTINF:4.0,\nseg0.m4s\n",
+            &mut pl,
+        );
+        let ids: Vec<Option<&str>> = pl.date_ranges.iter()
+            .map(|range| range.id.as_deref())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![Some("ad-1"), Some("ad-1"), None],
+            "every tag is kept, including the one that augments an earlier ID and the one that \
+             has no ID at all"
+        );
+        assert_eq!(
+            pl.date_ranges[0].attributes.get("X-ASSET-URI").map(String::as_str),
+            Some("https://ads.ex.com/a.m3u8")
+        );
+        assert!(pl.date_ranges[0].is_interstitial());
+        assert!(
+            !pl.date_ranges[1].is_interstitial(),
+            "the IN tag of an interstitial carries no CLASS of its own"
+        );
+        assert_eq!(
+            pl.date_ranges[2].raw_attributes,
+            "START-DATE=\"2024-01-15T12:00:04Z\"",
+            "the text is kept because it is all that tells two ID-less Date Ranges apart"
+        );
+        assert_eq!(pl.segments.len(), 1, "a Date Range does not introduce a segment");
     }
 
     // ── parse_media_playlist EXT-X-DEFINE ─────────────────────────────────────

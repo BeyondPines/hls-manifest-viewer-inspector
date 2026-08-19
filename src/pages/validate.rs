@@ -99,6 +99,15 @@ fn shows_rendition_links(issue: &Issue) -> bool {
     )
 }
 
+/// The URIs a finding names: the playlist, segment or part it was measured on, and the second
+/// one where a rule compared a pair of them.
+///
+/// The checks have always recorded these, and the card never showed them, so a finding about
+/// one segment of one rendition left the reader to work out which segment from the message.
+fn offending_uris(issue: &Issue) -> Vec<&str> {
+    [issue.uri_a.as_deref(), issue.uri_b.as_deref()].into_iter().flatten().collect()
+}
+
 /// Build an absolute manifest-viewer URL for `playlist_url`, applying HLS variable substitution
 /// and appending `imported_definitions` when the definitions map is non-empty.
 fn manifest_viewer_href(
@@ -1230,6 +1239,10 @@ fn CheckResultsTable(
                                                 // inferred rather than measured says so next
                                                 // to its severity, as Author's table does.
                                                 let confidence_note = iss.confidence.note();
+                                                let uris: Vec<String> = offending_uris(&iss)
+                                                    .into_iter()
+                                                    .map(str::to_string)
+                                                    .collect();
                                                 view! {
                                                     <div style=format!(
                                                         "border-left: 3px solid {}; padding: 10px 12px; \
@@ -1260,6 +1273,23 @@ fn CheckResultsTable(
                                                         <div style="font-size: .85rem; line-height: 1.6; color: var(--color-sky-950);">
                                                             {iss.message.clone()}
                                                         </div>
+                                                        {(!uris.is_empty()).then(|| view! {
+                                                            <div style="margin-top: calc(var(--spacing) * 1.25); display: flex; flex-direction: column; gap: 2px;">
+                                                                {uris.into_iter().map(|uri| {
+                                                                    let full = uri.clone();
+                                                                    view! {
+                                                                        <div
+                                                                            title=full
+                                                                            style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; \
+                                                                                   font-size: .72rem; color: var(--color-sky-700); \
+                                                                                   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"
+                                                                        >
+                                                                            {uri}
+                                                                        </div>
+                                                                    }
+                                                                }).collect::<Vec<_>>()}
+                                                            </div>
+                                                        })}
                                                         {iss.uri_note.as_ref().map(|n| view! {
                                                             <div style="font-size: .78rem; color: var(--color-sky-700); margin-top: calc(var(--spacing) * 1.5); padding-top: calc(var(--spacing) * 1.5); border-top: 1px solid var(--color-sky-200); line-height: 1.5;">
                                                                 {format!("📎 {}", n)}
@@ -1406,6 +1436,26 @@ mod tests {
         assert!(
             !shows_rendition_links(&unrelated),
             "a finding about one playlist has no second rendition to open"
+        );
+    }
+
+    // ── offending_uris ────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_finding_shows_the_uris_it_was_measured_on() {
+        let pair = Issue::warn("drift at MSN 12".into())
+            .between_uris("https://cdn.ex.com/hi/s12.m4s", "https://cdn.ex.com/lo/s12.m4s");
+        assert_eq!(
+            offending_uris(&pair),
+            vec!["https://cdn.ex.com/hi/s12.m4s", "https://cdn.ex.com/lo/s12.m4s"]
+        );
+
+        let single = Issue::error("no #EXTM3U".into()).at_uri("https://cdn.ex.com/hi.m3u8");
+        assert_eq!(offending_uris(&single), vec!["https://cdn.ex.com/hi.m3u8"]);
+
+        assert!(
+            offending_uris(&Issue::warn("nothing to point at".into())).is_empty(),
+            "a finding about the presentation as a whole names no URI"
         );
     }
 
