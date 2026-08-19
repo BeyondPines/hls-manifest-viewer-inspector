@@ -14,9 +14,16 @@ pub fn absolute_fetch_uri(base: &str, uri: &str, defs: &HashMap<String, String>)
     resolve_url(base, substituted.as_ref())
 }
 
-/// Determine if content is a master (multivariant) playlist
+/// Determine if content is a master (multivariant) playlist.
+///
+/// The one place that answers this question for Validate, Author and Inspect alike, so
+/// the three cannot disagree about what kind of playlist they were handed. A tag only
+/// counts at the start of a line: the same text inside a URI query or a comment is not
+/// a tag, and reading it as one would send a media playlist down the master path.
 pub fn is_master_playlist(content: &str) -> bool {
-    content.contains("#EXT-X-STREAM-INF:") || content.contains("#EXT-X-I-FRAME-STREAM-INF:")
+    content.lines().any(|line| {
+        line.starts_with("#EXT-X-STREAM-INF:") || line.starts_with("#EXT-X-I-FRAME-STREAM-INF:")
+    })
 }
 
 /// Get current time in milliseconds (browser performance.now() or Date.now())
@@ -1074,6 +1081,15 @@ mod tests {
     #[test]
     fn is_master_false_for_media_playlist() {
         assert!(!is_master_playlist("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:4.0,\nseg0.mp4\n"));
+    }
+
+    /// A segment URI can carry the tag's text in a query parameter without the playlist
+    /// being a master, and treating it as one would probe the segments as variants.
+    #[test]
+    fn is_master_ignores_the_tag_text_inside_a_line() {
+        assert!(!is_master_playlist(
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:4.0,\nseg0.mp4?from=#EXT-X-STREAM-INF:1\n"
+        ));
     }
 
     // ── derive_color_info ─────────────────────────────────────────────────────

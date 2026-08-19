@@ -72,6 +72,9 @@ pub struct InitSegmentProbe {
     pub movie_timescale: Option<u32>,
     /// Every `trak` in the `moov`, in the order they appear.
     pub tracks: Vec<TrackProbe>,
+    /// Boxes whose body would not decode. The walk steps over them, so anything this
+    /// probe reports absent may simply have been inside one of them.
+    pub decode_errors: usize,
 }
 
 fn prop_str(val: &AtomPropertyValue) -> String {
@@ -92,7 +95,14 @@ const AUDIO_SAMPLE_ENTRIES: &[&str] = &[
     "mp4a", "ac-3", "ec-3", "ac-4", "Opus", "enca", "apac", "fLaC",
 ];
 
-/// Parse init-segment bytes (ftyp + moov). Stops on first decode error.
+/// Parse init-segment bytes (ftyp + moov).
+///
+/// A box body that will not decode is stepped over rather than ending the walk: one
+/// unreadable box near the front of a `moov` would otherwise hide every `pssh`, `tenc`
+/// and codec configuration behind it, and the probe would report them absent. Only a
+/// header that will not read ends the walk, because without it there is no way to tell
+/// where the next box starts. [`InitSegmentProbe::decode_errors`] counts what was
+/// skipped so callers can say "not found in what was read" rather than "not there".
 pub fn probe_init_segment(data: &[u8]) -> InitSegmentProbe {
     let mut info = InitSegmentProbe::default();
     let mut reader = Cursor::new(data.to_vec());
@@ -132,8 +142,50 @@ pub fn probe_init_segment(data: &[u8]) -> InitSegmentProbe {
             _ => {}
         }
 
-        let Ok(atom) = get_properties(&header, &mut reader) else {
-            break;
+        // Capture the raw sample-entry fourCC from the header kind. This reads the
+        // header alone, so it is done before the body decode that a malformed entry
+        // can fail — the fourCC is the part a codec rule needs most.
+        let is_video_entry = VIDEO_SAMPLE_ENTRIES
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(&kind));
+        let is_audio_entry = AUDIO_SAMPLE_ENTRIES
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(&kind));
+        if is_video_entry && (in_video || info.video_sample_fourcc.is_none()) {
+            if kind.eq_ignore_ascii_case("encv") {
+                info.had_encrypted_sample_entry = true;
+            }
+            info.video_sample_fourcc = Some(kind.clone());
+        }
+        if is_audio_entry && (in_audio || info.audio_sample_fourcc.is_none()) {
+            if kind.eq_ignore_ascii_case("enca") {
+                info.had_encrypted_sample_entry = true;
+            }
+            info.audio_sample_fourcc = Some(kind.clone());
+        }
+        if (is_video_entry || is_audio_entry)
+            && let Some(t) = track.as_mut()
+            && t.sample_fourcc.is_none()
+        {
+            t.sample_fourcc = Some(kind.clone());
+        }
+
+        let body_start = reader.position();
+        let atom = match get_properties(&header, &mut reader) {
+            Ok(atom) => atom,
+            Err(_) => {
+                info.decode_errors += 1;
+                // The declared size is the only way past a box that would not decode.
+                // A box with no size runs to the end of the file, so there is nothing
+                // left to step to.
+                match header.size {
+                    Some(size) => {
+                        reader.set_position(body_start + size as u64);
+                        continue;
+                    }
+                    None => break,
+                }
+            }
         };
         if let Some(e) = atom.new_depth_until {
             container_ends.push(e);
@@ -232,32 +284,6 @@ pub fn probe_init_segment(data: &[u8]) -> InitSegmentProbe {
                 info.scheme_type = get("scheme_type");
             }
             _ => {}
-        }
-
-        // Capture raw sample-entry fourCC from the header kind
-        let is_video_entry = VIDEO_SAMPLE_ENTRIES
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case(&kind));
-        let is_audio_entry = AUDIO_SAMPLE_ENTRIES
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case(&kind));
-        if is_video_entry && (in_video || info.video_sample_fourcc.is_none()) {
-            if kind.eq_ignore_ascii_case("encv") {
-                info.had_encrypted_sample_entry = true;
-            }
-            info.video_sample_fourcc = Some(kind.clone());
-        }
-        if is_audio_entry && (in_audio || info.audio_sample_fourcc.is_none()) {
-            if kind.eq_ignore_ascii_case("enca") {
-                info.had_encrypted_sample_entry = true;
-            }
-            info.audio_sample_fourcc = Some(kind.clone());
-        }
-        if (is_video_entry || is_audio_entry)
-            && let Some(t) = track.as_mut()
-            && t.sample_fourcc.is_none()
-        {
-            t.sample_fourcc = Some(kind.clone());
         }
     }
     info.tracks.extend(track);
@@ -1367,6 +1393,32 @@ mod tests {
     /// looking like it, which is why a scan has to know where the video samples are.
     fn metadata_and_video_fragments() -> Vec<Fragment> {
         vec![Fragment::new(1, 900_000), Fragment::new(2, 6_000)]
+    }
+
+    /// A box body that will not decode used to end the walk, so everything behind it
+    /// read as absent — and an encrypted init writes its `pssh` near the front of the
+    /// `moov`, ahead of the codec configuration a report is built from.
+    #[test]
+    fn a_box_that_will_not_decode_does_not_end_the_walk() {
+        let mut entry = visual();
+        entry.extend(hvcc(2, false, 153));
+        // 4 bytes is version + flags and nothing else, which no `mdhd` can be.
+        let mut moov = boxed(b"mdhd", &[0u8; 4]);
+        moov.extend(trak(1, b"vide", 90_000, &boxed(b"hvc1", &entry)));
+        let mut data = ftyp();
+        data.extend(boxed(b"moov", &moov));
+
+        let probe = probe_init_segment(&data);
+        assert_eq!(probe.decode_errors, 1, "only the truncated mdhd should be skipped");
+        assert_eq!(probe.major_brand.as_deref(), Some("iso5"));
+        assert_eq!(probe.video_sample_fourcc.as_deref(), Some("hvc1"));
+        assert_eq!(probe.video_profile.as_deref(), Some("2"));
+        assert_eq!(probe.video_timescale(), Some(90_000));
+    }
+
+    #[test]
+    fn a_well_formed_init_reports_no_decode_errors() {
+        assert_eq!(probe_init_segment(&hevc_init(2, false, 153)).decode_errors, 0);
     }
 
     #[test]
