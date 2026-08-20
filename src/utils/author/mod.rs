@@ -26,6 +26,9 @@ mod rules_video;
 pub use context::AuthoringContext;
 pub use profile::AuthorProfile;
 pub use run::{run_author_report, AuthorOptions, AuthorReport};
+// Inspect Timing strides across a VOD asset the same way a deep Author sample does, and
+// the two must not drift into picking different segments.
+pub(crate) use run::stride_indices;
 
 use crate::utils::validator::types::Issue;
 

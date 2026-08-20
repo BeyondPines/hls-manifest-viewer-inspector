@@ -1,11 +1,18 @@
+use crate::components::{TimingControls, TimingProgressBar, TimingResultsPanel};
 use crate::utils::{
     href::{playlist_href, replace_hls_variables},
     mp4_atom_properties::{AtomPropertyValue, get_properties},
     network::{FetchError, RequestRange, fetch_array_buffer, fetch_text},
+    timing::{
+        AudioSummary, DEFAULT_MEDIA_PAIRS, DEFAULT_PLAYLIST_REQUESTS, MasterSummary, MediaSummary,
+        PartEntry, PlaylistParsers, SegmentEntry, TimingOptions, TimingProgress, TimingReport,
+        TimingRequest, VariantSummary, run_timing,
+    },
     validator::is_master_playlist,
 };
 use url::Url;
 use leptos::prelude::*;
+use web_sys::AbortController;
 use mp4_atom::{Header, ReadFrom};
 use quick_m3u8::{
     HlsLine, Reader,
@@ -319,22 +326,14 @@ pub static CATEGORIES: &[CheckCat] = &[
         ],
     },
     CheckCat {
-        id: "subtitles", icon: "📝", label: "Subtitles & Captions",
+        id: SUBTITLES_CAT_ID, icon: "📝", label: "Subtitles & Captions",
         items: &[
             CheckItem { id: "subtitle_tracks", label: "Subtitle tracks",       note: None },
             CheckItem { id: "caption_tracks",  label: "Closed caption tracks", note: None },
         ],
     },
     CheckCat {
-        id: "encryption", icon: "🔒", label: "Encryption & DRM",
-        items: &[
-            CheckItem { id: "enc_method",  label: "Encryption method",  note: None },
-            CheckItem { id: "key_format",  label: "Key format",         note: None },
-            CheckItem { id: "drm_systems", label: "DRM systems", note: Some("PSSH / KEYFORMAT") },
-        ],
-    },
-    CheckCat {
-        id: "protocol", icon: "📡", label: "HLS Protocol",
+        id: PROTOCOL_CAT_ID, icon: "📡", label: "HLS Protocol",
         items: &[
             CheckItem { id: "hls_version",     label: "HLS version",             note: None },
             CheckItem { id: "target_duration", label: "Target segment duration", note: None },
@@ -343,12 +342,103 @@ pub static CATEGORIES: &[CheckCat] = &[
             CheckItem { id: "segment_count",   label: "Segment count",           note: None },
         ],
     },
+    CheckCat {
+        id: ENCRYPTION_CAT_ID, icon: "🔒", label: "Encryption & DRM",
+        items: &[
+            CheckItem { id: "enc_method",  label: "Encryption method",  note: None },
+            CheckItem { id: "key_format",  label: "Key format",         note: None },
+            CheckItem { id: "drm_systems", label: "DRM systems", note: Some("PSSH / KEYFORMAT") },
+        ],
+    },
+    CheckCat {
+        id: TIMING_CAT_ID, icon: "⏱", label: "Timing",
+        items: &[
+            CheckItem { id: TIMING_PLAYLIST_ID, label: "Playlist request timing", note: Some("extra requests") },
+            CheckItem { id: TIMING_MEDIA_ID,    label: "Media sample timing",     note: Some("VOD, downloads bytes") },
+        ],
+    },
 ];
+
+/// The Timing category, which is opt-in.
+///
+/// Everything else Inspect does costs a playlist read and possibly an init segment. Timing
+/// re-requests playlists and can download media, so it is never selected for the user.
+const TIMING_CAT_ID: &str = "timing";
+const TIMING_PLAYLIST_ID: &str = "timing_playlist";
+const TIMING_MEDIA_ID: &str = "timing_media";
+
+const SUBTITLES_CAT_ID: &str = "subtitles";
+const PROTOCOL_CAT_ID: &str = "protocol";
+const ENCRYPTION_CAT_ID: &str = "encryption";
+
+/// Category pairs that share one grid cell, the first drawn above the second.
+///
+/// Seven categories want seven tracks, more than the card fits at any laptop width, so the
+/// row wrapped and stranded a box below it. Subtitles and Protocol are the shortest boxes
+/// on the row, so a second box under them costs the row no height it did not already have.
+const STACKED_CAT_PAIRS: [(&str, &str); 2] = [
+    (SUBTITLES_CAT_ID, TIMING_CAT_ID),
+    (PROTOCOL_CAT_ID, ENCRYPTION_CAT_ID),
+];
+
+fn cat_by_id(id: &str) -> Option<&'static CheckCat> {
+    CATEGORIES.iter().find(|cat| cat.id == id)
+}
+
+/// The category drawn beneath `top` in its cell.
+///
+/// `None` also covers a pair naming a lower id that is not in `CATEGORIES`: a typo leaves
+/// the cell one box rather than panicking, which is why the tests pin the cells in order.
+fn stacked_under(top: &str) -> Option<&'static CheckCat> {
+    STACKED_CAT_PAIRS.iter()
+        .find(|(t, _)| *t == top)
+        .and_then(|(_, under)| cat_by_id(under))
+}
+
+/// Whether a category is drawn by the cell above it, and so must not claim a cell itself.
+fn is_stacked_under(id: &str) -> bool {
+    STACKED_CAT_PAIRS.iter().any(|(_, under)| *under == id)
+}
+
+/// One cell of the check grid: the categories drawn in it, top first.
+///
+/// A cell holding two categories is drawn compact, so the pair reads as one column rather
+/// than a roomy box sitting on a tight one.
+struct InspectGridCell {
+    cats: Vec<&'static CheckCat>,
+}
+
+/// The grid cells in reading order — the one walk the view draws and the tests read.
+///
+/// Cells come out of `CATEGORIES` rather than a list of ids of their own, so a category
+/// earns its box by existing. A list would let a new category's checks be selected with
+/// nowhere on the page to untick them.
+fn inspect_grid_cells() -> Vec<InspectGridCell> {
+    CATEGORIES.iter()
+        .filter(|cat| !is_stacked_under(cat.id))
+        .map(|cat| InspectGridCell {
+            cats: std::iter::once(cat).chain(stacked_under(cat.id)).collect(),
+        })
+        .collect()
+}
+
+/// Whether a category's box carries the Timing run-count inputs.
+///
+/// Timing owns those counts wherever the pairs put it, never the lower slot of a pair.
+fn draws_timing_counts(id: &str) -> bool {
+    id == TIMING_CAT_ID
+}
 
 fn all_check_ids() -> HashSet<String> {
     CATEGORIES.iter()
+        .filter(|cat| cat.id != TIMING_CAT_ID)
         .flat_map(|cat| cat.items.iter().map(|it| it.id.to_string()))
         .collect()
+}
+
+/// Check ids that only the Timing phase answers, so `probe_stream` is never asked to.
+fn is_timing_check(id: &str) -> bool {
+    matches!(id, TIMING_PLAYLIST_ID | TIMING_MEDIA_ID)
 }
 
 // ── Helper functions ─────────────────────────────────────────────────────────
@@ -614,13 +704,6 @@ struct MasterPlaylist {
     definitions: HashMap<String, String>,
 }
 
-/// A single segment entry from a media playlist.
-struct SegmentInfo {
-    duration: f64,
-    map_uri: Option<String>,
-    map_byterange: Option<RequestRange>,
-}
-
 impl MediaPlaylist {
     /// The init segment location of the first segment that declares one.
     fn init_segment(&self) -> Option<(String, Option<RequestRange>)> {
@@ -641,9 +724,11 @@ struct ServerControlInfo {
 struct MediaPlaylist {
     version: u32,
     target_duration: f64,
+    /// EXT-X-PART-INF PART-TARGET, the secondary denominator for a part's timing.
+    part_target: Option<f64>,
     playlist_type: Option<String>,
     has_endlist: bool,
-    segments: Vec<SegmentInfo>,
+    segments: Vec<SegmentEntry>,
     server_control: Option<ServerControlInfo>,
     /// Variables in scope for this playlist's URIs: what a master handed down, plus
     /// whatever this playlist's own EXT-X-DEFINE tags added.
@@ -720,6 +805,30 @@ fn apply_define_tag(
             }
         }
     }
+}
+
+/// Resolve one BYTERANGE against the resource it applies to.
+///
+/// An absent offset means "the byte after the previous sub-range of this same resource"
+/// (RFC 8216bis §4.4.4.2), which is information only the playlist order carries. Where
+/// there is no previous sub-range to continue from the playlist is malformed, and this
+/// returns `None` rather than guessing at zero and asking the server for the wrong bytes.
+/// A zero length has no range either: it would describe no bytes at all.
+fn running_range(
+    cursor: &mut HashMap<String, u64>,
+    uri: &str,
+    length: u64,
+    offset: Option<u64>,
+) -> Option<RequestRange> {
+    if length == 0 {
+        return None;
+    }
+    let start = match offset {
+        Some(offset) => offset,
+        None => *cursor.get(uri)?,
+    };
+    cursor.insert(uri.to_string(), start + length);
+    Some(RequestRange::from_length_with_offset(length, start))
 }
 
 fn audio_needs_init(at: &AudioTrackInfo) -> bool {
@@ -830,6 +939,7 @@ fn parse_media_playlist(
     let mut pl = MediaPlaylist {
         version: 3,
         target_duration: 0.0,
+        part_target: None,
         playlist_type: None,
         has_endlist: false,
         segments: Vec::new(),
@@ -844,16 +954,34 @@ fn parse_media_playlist(
     let mut pending_duration: Option<f64> = None;
     let mut current_map_uri: Option<String> = None;
     let mut current_map_byterange: Option<RequestRange> = None;
+    // EXT-X-BYTERANGE, EXT-X-GAP, EXT-X-PROGRAM-DATE-TIME and EXT-X-PART all describe the
+    // segment whose URI comes next, so each is held until that line arrives.
+    let mut pending_byterange: Option<(u64, Option<u64>)> = None;
+    let mut pending_gap = false;
+    let mut pending_pdt: Option<String> = None;
+    let mut pending_parts: Vec<PartEntry> = Vec::new();
+    // Where the last sub-range of each resource ended, which is the only place a
+    // BYTERANGE with no offset can start from.
+    let mut range_cursor: HashMap<String, u64> = HashMap::new();
 
     // First pass: collect this playlist's own DEFINE tags, so a MAP or segment URI
     // written above them still substitutes. A media-only URL has no master to inherit
     // from, which is exactly when its own NAME and QUERYPARAM variables are all there is.
+    // EXT-X-MEDIA-SEQUENCE and PART-TARGET describe the whole playlist and are read here
+    // too, so a playlist that writes them below its first segment still numbers correctly.
+    let mut next_msn: u64 = 0;
     {
         let mut reader = Reader::from_str(content, make_reader_opts());
         loop {
             match reader.read_line() {
                 Ok(Some(HlsLine::KnownTag(KnownTag::Hls(Tag::Define(d))))) => {
                     apply_define_tag(base_url, &d, &mut pl.definitions, Some(inherited));
+                }
+                Ok(Some(HlsLine::KnownTag(KnownTag::Hls(Tag::MediaSequence(ms))))) => {
+                    next_msn = ms.media_sequence();
+                }
+                Ok(Some(HlsLine::KnownTag(KnownTag::Hls(Tag::PartInf(pi))))) => {
+                    pl.part_target = Some(pi.part_target());
                 }
                 Ok(None) | Err(_) => break,
                 Ok(Some(_)) => {}
@@ -885,15 +1013,55 @@ fn parse_media_playlist(
                 HlsLine::KnownTag(KnownTag::Hls(Tag::Inf(inf))) => {
                     pending_duration = Some(inf.duration());
                 }
-                HlsLine::Uri(_uri) => {
-                    // Segment URIs are not retained for probing; MAP URI (above) is resolved
-                    // via resolve_defined_uri so init fetches honour EXT-X-DEFINE.
+                HlsLine::KnownTag(KnownTag::Hls(Tag::Byterange(br))) => {
+                    pending_byterange = Some((br.length(), br.offset()));
+                }
+                HlsLine::KnownTag(KnownTag::Hls(Tag::Gap(_))) => {
+                    pending_gap = true;
+                }
+                HlsLine::KnownTag(KnownTag::Hls(Tag::ProgramDateTime(pdt))) => {
+                    pending_pdt = Some(pdt.program_date_time().to_string());
+                }
+                HlsLine::KnownTag(KnownTag::Hls(Tag::Part(part))) => {
+                    // A PART URI goes through the same EXT-X-DEFINE substitution as any
+                    // other URI in the playlist.
+                    let uri = resolve_defined_uri(base_url, part.uri(), &definitions);
+                    let byterange = part.byterange().and_then(|br| {
+                        running_range(&mut range_cursor, &uri, br.length, br.offset)
+                    });
+                    pending_parts.push(PartEntry {
+                        uri,
+                        duration_s: part.duration(),
+                        byterange,
+                        independent: part.independent(),
+                        gap: part.gap(),
+                    });
+                }
+                HlsLine::Uri(uri) => {
+                    // A URI with no EXTINF above it is not a segment, so the tags that
+                    // were waiting for one are discarded rather than attached to it.
                     if let Some(dur) = pending_duration.take() {
-                        pl.segments.push(SegmentInfo {
-                            duration: dur,
+                        let resolved = resolve_defined_uri(base_url, &uri, &definitions);
+                        let byterange = pending_byterange.take().and_then(|(length, offset)| {
+                            running_range(&mut range_cursor, &resolved, length, offset)
+                        });
+                        pl.segments.push(SegmentEntry {
+                            uri: resolved,
+                            duration_s: dur,
+                            byterange,
+                            gap: std::mem::take(&mut pending_gap),
+                            msn: Some(next_msn),
+                            program_date_time: pending_pdt.take(),
+                            parts: std::mem::take(&mut pending_parts),
                             map_uri: current_map_uri.clone(),
                             map_byterange: current_map_byterange,
                         });
+                        next_msn += 1;
+                    } else {
+                        pending_byterange = None;
+                        pending_gap = false;
+                        pending_pdt = None;
+                        pending_parts.clear();
                     }
                 }
                 HlsLine::KnownTag(KnownTag::Hls(Tag::ServerControl(sc))) => {
@@ -910,6 +1078,81 @@ fn parse_media_playlist(
         }
     }
     pl
+}
+
+/// Inspect's parsers, as the Timing phase consumes them.
+///
+/// Timing re-reads the playlists it measures — the point is to time the requests, so it
+/// has to make them — but it reads them with these, not with a parser of its own. A second
+/// reader would eventually disagree with the report sitting above the timing table.
+pub(crate) fn timing_parsers() -> PlaylistParsers {
+    PlaylistParsers {
+        master: timing_master_summary,
+        media: timing_media_summary,
+    }
+}
+
+fn timing_master_summary(base_url: &str, content: &str) -> MasterSummary {
+    let master = parse_master_playlist(base_url, content);
+    MasterSummary {
+        variants: master
+            .variants
+            .iter()
+            .map(|v| VariantSummary {
+                uri: v.uri.clone(),
+                label: variant_label(v),
+                bandwidth: v.bandwidth,
+                is_iframe: v.is_iframe,
+                audio_group: v.audio_group.clone(),
+                // CODECS naming an audio codec is what says the segments are muxed, and
+                // therefore that the pair is one request rather than two.
+                has_audio_codec: v
+                    .codecs
+                    .as_deref()
+                    .and_then(audio_codec_token)
+                    .is_some(),
+            })
+            .collect(),
+        audio: master
+            .media_renditions
+            .iter()
+            .filter(|m| m.media_type == "AUDIO")
+            .map(|m| AudioSummary {
+                name: m.name.clone(),
+                group_id: m.group_id.clone(),
+                uri: m.uri.clone(),
+                is_default: m.is_default,
+            })
+            .collect(),
+        definitions: master.definitions,
+    }
+}
+
+fn timing_media_summary(
+    base_url: &str,
+    content: &str,
+    inherited: &HashMap<String, String>,
+) -> MediaSummary {
+    let pl = parse_media_playlist(base_url, content, inherited);
+    MediaSummary {
+        target_duration_s: (pl.target_duration > 0.0).then_some(pl.target_duration),
+        part_target_s: pl.part_target,
+        // No EXT-X-ENDLIST means the playlist can still grow, which is the only definition
+        // of live available from one snapshot.
+        is_live: !pl.has_endlist,
+        segments: pl.segments,
+    }
+}
+
+/// How the timing table names a variant: its resolution where it has one, and its declared
+/// bit rate otherwise.
+fn variant_label(variant: &VariantStream) -> String {
+    match (&variant.resolution, variant.bandwidth) {
+        (Some(res), Some(bw)) => format!("{res} @ {}", fmt_bps(bw)),
+        (Some(res), None) => res.clone(),
+        (None, Some(bw)) => fmt_bps(bw),
+        (None, None) => "variant".into(),
+    }
 }
 
 fn parse_session_data(content: &str) -> Vec<(String, String)> {
@@ -1487,7 +1730,7 @@ fn apply_protocol_from_media(r: &mut ProbeReport, pl: &MediaPlaylist) {
     r.playlist_type = pl.playlist_type.clone();
     r.is_live = !pl.has_endlist;
     r.total_segments = pl.segments.len();
-    r.duration_s = Some(pl.segments.iter().map(|s| s.duration).sum());
+    r.duration_s = Some(pl.segments.iter().map(|s| s.duration_s).sum());
     if let Some(sc) = &pl.server_control {
         r.ll_hls = Some(LlHlsInfo {
             part_hold_back: sc.part_hold_back,
@@ -2065,21 +2308,20 @@ pub fn Ffprobe() -> impl IntoView {
     let (loading, set_loading) = signal(false);
     let probe_gen = RwSignal::new(0u64);
 
-    let toggle_check = move |id: String| {
-        selected.update(|s| {
-            if s.contains(&id) { s.remove(&id); } else { s.insert(id); }
-        });
-    };
+    let playlist_requests = RwSignal::new(DEFAULT_PLAYLIST_REQUESTS);
+    let media_pairs = RwSignal::new(DEFAULT_MEDIA_PAIRS);
+    let (timing_report, set_timing_report) = signal(None::<TimingReport>);
+    let (timing_progress, set_timing_progress) = signal(None::<TimingProgress>);
+    let (timing_running, set_timing_running) = signal(false);
+    // The controller is the only thing that actually stops requests: probe_gen discards
+    // results but leaves the fetches running. AbortController is !Send, hence the local
+    // storage — WASM is single-threaded, so nothing else could reach it anyway.
+    let timing_abort = StoredValue::new_local(None::<AbortController>);
 
-    let toggle_category = move |cat_id: &'static str| {
-        let cat_items: Vec<&'static str> = CATEGORIES.iter()
-            .find(|c| c.id == cat_id)
-            .map(|c| c.items.iter().map(|i| i.id).collect())
-            .unwrap_or_default();
-        let all_selected = cat_items.iter().all(|id| selected.get_untracked().contains(*id));
-        selected.update(|s| {
-            for id in &cat_items {
-                if all_selected { s.remove(*id); } else { s.insert(id.to_string()); }
+    let abort_timing = move || {
+        timing_abort.update_value(|slot| {
+            if let Some(controller) = slot.take() {
+                controller.abort();
             }
         });
     };
@@ -2093,26 +2335,82 @@ pub fn Ffprobe() -> impl IntoView {
         let sel = selected.get();
         let generation = probe_gen.get_untracked() + 1;
         probe_gen.set(generation);
+        // A new submission supersedes whatever the last one was still measuring, and a
+        // measurement competing with a superseded run's downloads is not a measurement.
+        abort_timing();
         set_loading.set(true);
         set_error_msg.set(None);
         set_report.set(None);
+        set_timing_report.set(None);
+        set_timing_progress.set(None);
+        set_timing_running.set(false);
+
+        let probe_sel: HashSet<String> =
+            sel.iter().filter(|id| !is_timing_check(id)).cloned().collect();
+        let options = TimingOptions {
+            playlist_requests: playlist_requests.get_untracked(),
+            media_pairs: media_pairs.get_untracked(),
+            playlist_timing: sel.contains(TIMING_PLAYLIST_ID),
+            media_timing: sel.contains(TIMING_MEDIA_ID),
+        }
+        .clamped();
+        let run_timing_phase = options.playlist_timing || options.media_timing;
+
         leptos::task::spawn_local(async move {
-            match probe_stream(&u, &sel).await {
+            match probe_stream(&u, &probe_sel).await {
                 Ok(r) => {
-                    if probe_gen.get_untracked() == generation {
-                        set_report.set(Some(r));
-                        set_loading.set(false);
-                    }
+                    if probe_gen.get_untracked() != generation { return; }
+                    set_report.set(Some(r));
+                    set_loading.set(false);
                 }
                 Err(e) => {
-                    if probe_gen.get_untracked() == generation {
-                        set_error_msg.set(Some(format!("Probe failed: {e}")));
-                        set_loading.set(false);
-                    }
+                    if probe_gen.get_untracked() != generation { return; }
+                    set_error_msg.set(Some(format!("Probe failed: {e}")));
+                    set_loading.set(false);
+                    return;
                 }
+            }
+            if !run_timing_phase { return; }
+            // Timing starts only once the probe's parallel fetches have finished. A
+            // request timed while others are in flight is partly a measurement of them.
+            let Ok(controller) = AbortController::new() else {
+                set_timing_report.set(Some(TimingReport {
+                    declined: Some(
+                        "This browser exposes no AbortController, so a Timing run could not \
+                         be stopped once started and was not begun."
+                            .into(),
+                    ),
+                    ..Default::default()
+                }));
+                return;
+            };
+            let signal = controller.signal();
+            timing_abort.set_value(Some(controller));
+            set_timing_running.set(true);
+            let report = run_timing(
+                TimingRequest { url: u.clone(), options, parsers: timing_parsers() },
+                &signal,
+                move |progress| {
+                    if probe_gen.get_untracked() == generation {
+                        set_timing_progress.set(Some(progress));
+                    }
+                },
+            )
+            .await;
+            // The abort slot belongs to whichever run is current. A superseded run
+            // clearing it would drop the newer submission's controller, leaving Stop with
+            // nothing to abort while that run kept downloading.
+            if probe_gen.get_untracked() == generation {
+                timing_abort.set_value(None);
+                set_timing_report.set(Some(report));
+                set_timing_progress.set(None);
+                set_timing_running.set(false);
             }
         });
     };
+
+    let counts_for =
+        move |id: &str| draws_timing_counts(id).then_some((playlist_requests, media_pairs));
 
     view! {
         <div class="body-content" style="max-width: min(96vw, 1440px); margin-bottom: 2em;">
@@ -2128,6 +2426,13 @@ pub fn Ffprobe() -> impl IntoView {
                          unencrypted codec and DRM metadata. Where a value is inferred from a \
                          playlist attribute rather than read from the init segment, the table \
                          marks it \u{201c}assumed\u{201d}."
+                    </p>
+                    <p class="body-content body-text">
+                        "Timing is off by default because it costs requests: it re-fetches the \
+                         chosen media playlist several times and can download media samples. \
+                         What it reports is what this browser could observe \u{2014} which is \
+                         less than a network measurement, and the table says where each figure \
+                         came from."
                     </p>
                 </div>
             </div>
@@ -2162,66 +2467,26 @@ pub fn Ffprobe() -> impl IntoView {
                     </div>
 
                     // ── Check category boxes ────────────────────────────────
-                    <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); \
-                                gap: calc(var(--spacing) * 3);">
-                        {CATEGORIES.iter().map(|cat| {
-                            let cat_id = cat.id;
+                    // auto-fit, not auto-fill: six tracks fit the card by two pixels, so
+                    // five cells leave the sixth blank and pin every box to its minimum.
+                    // align-items: start, or the grid's default stretch would pull a
+                    // two-check box like Subtitles up to the height of the Video column.
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); \
+                                gap: calc(var(--spacing) * 3); align-items: start;">
+                        {inspect_grid_cells().into_iter().map(|cell| {
+                            // The stack's gap matches the grid's, so a pair reads as two
+                            // cells in a column, not one box with another glued underneath.
+                            let compact = cell.cats.len() > 1;
                             view! {
-                                <div style="background: var(--color-sky-50); border: 1px solid var(--color-sky-200); \
-                                            border-radius: 8px; padding: calc(var(--spacing) * 3);">
-                                    <div style="display: flex; align-items: center; gap: calc(var(--spacing) * 1.5); \
-                                                margin-bottom: calc(var(--spacing) * 2);">
-                                        <span style="font-size: .85rem;">{cat.icon}</span>
-                                        <span style="font-size: .78rem; font-weight: 700; \
-                                                     color: var(--color-sky-950); text-transform: uppercase; \
-                                                     letter-spacing: .06em;">
-                                            {cat.label}
-                                        </span>
-                                        <button
-                                            type="button"
-                                            // sky-700 rather than sky-300: this sits on the
-                                            // sky-50 panel, where the lighter token is barely
-                                            // distinguishable from the background.
-                                            style="margin-left: auto; font-size: .65rem; font-weight: 600; \
-                                                   color: var(--color-sky-700); background: none; border: none; \
-                                                   cursor: pointer; padding: 0;"
-                                            on:click=move |_| toggle_category(cat_id)
-                                        >
-                                            {move || {
-                                                let cat_items: Vec<&str> = CATEGORIES.iter()
-                                                    .find(|c| c.id == cat_id)
-                                                    .map(|c| c.items.iter().map(|i| i.id).collect())
-                                                    .unwrap_or_default();
-                                                let all = cat_items.iter().all(|id| selected.get().contains(*id));
-                                                if all { "Deselect all" } else { "Select all" }
-                                            }}
-                                        </button>
-                                    </div>
-                                    {cat.items.iter().map(|item| {
-                                        let id = item.id.to_string();
-                                        let id2 = id.clone();
-                                        let label = item.label;
-                                        let note = item.note;
-                                        view! {
-                                            <label style="display: flex; align-items: center; gap: calc(var(--spacing) * 1.5); \
-                                                          font-size: .78rem; color: var(--color-sky-800); \
-                                                          margin-bottom: var(--spacing); cursor: pointer;">
-                                                <input
-                                                    type="checkbox"
-                                                    prop:checked=move || selected.get().contains(&id)
-                                                    on:change=move |_| toggle_check(id2.clone())
-                                                />
-                                                {label}
-                                                {note.map(|n| view! {
-                                                    // Same reasoning as the Select-all button:
-                                                    // sky-200 on sky-50 is unreadable.
-                                                    <span style="font-size: .68rem; color: var(--color-sky-700); \
-                                                                 font-style: italic;">
-                                                        {format!("({})", n)}
-                                                    </span>
-                                                })}
-                                            </label>
-                                        }
+                                <div style="display: flex; flex-direction: column; \
+                                            gap: calc(var(--spacing) * 3);">
+                                    {cell.cats.into_iter().map(|cat| view! {
+                                        <CheckCatBox
+                                            cat=cat
+                                            selected=selected
+                                            compact=compact
+                                            timing_counts=counts_for(cat.id)
+                                        />
                                     }).collect::<Vec<_>>()}
                                 </div>
                             }
@@ -2256,9 +2521,120 @@ pub fn Ffprobe() -> impl IntoView {
                 </div>
             })}
 
+            // ── Timing progress + Stop ──────────────────────────────────────
+            <TimingProgressBar
+                progress=Memo::new(move |_| timing_running.get().then(|| timing_progress.get()).flatten())
+                on_stop=Callback::new(move |()| abort_timing())
+            />
+
             // ── Results ─────────────────────────────────────────────────────
             {move || report.get().map(|r| view! {
                 <ProbeResults report=r selected=selected.get() />
+            })}
+
+            {move || timing_report.get().map(|r| view! { <TimingResultsPanel report=r /> })}
+        </div>
+    }
+}
+
+/// One check-category box: a header with its select-all toggle, then a checkbox per check.
+///
+/// `compact` tightens padding and margins for both boxes of a shared cell — a roomy box
+/// stacked 12px above a tight one reads as a mistake, where a whole column being denser
+/// than its neighbours does not. `timing_counts` draws the Timing run-count inputs.
+#[component]
+fn CheckCatBox(
+    cat: &'static CheckCat,
+    selected: RwSignal<HashSet<String>>,
+    compact: bool,
+    #[prop(optional_no_strip)] timing_counts: Option<(RwSignal<usize>, RwSignal<usize>)>,
+) -> impl IntoView {
+    let toggle_check = move |id: String| {
+        selected.update(|s| {
+            if s.contains(&id) { s.remove(&id); } else { s.insert(id); }
+        });
+    };
+
+    let toggle_category = move || {
+        let all_selected = cat.items.iter().all(|it| selected.get_untracked().contains(it.id));
+        selected.update(|s| {
+            for it in cat.items {
+                if all_selected { s.remove(it.id); } else { s.insert(it.id.to_string()); }
+            }
+        });
+    };
+
+    let pad = if compact { "2" } else { "3" };
+    let header_gap = if compact { "1.5" } else { "2" };
+    let item_gap = if compact { "calc(var(--spacing) * .5)" } else { "var(--spacing)" };
+    let last_item = cat.items.len().saturating_sub(1);
+
+    view! {
+        <div style=format!(
+            "background: var(--color-sky-50); border: 1px solid var(--color-sky-200); \
+             border-radius: 8px; padding: calc(var(--spacing) * {pad});"
+        )>
+            <div style=format!(
+                "display: flex; align-items: center; gap: calc(var(--spacing) * 1.5); \
+                 margin-bottom: calc(var(--spacing) * {header_gap});"
+            )>
+                <span style="font-size: .85rem;">{cat.icon}</span>
+                <span style="font-size: .78rem; font-weight: 700; \
+                             color: var(--color-sky-950); text-transform: uppercase; \
+                             letter-spacing: .06em;">
+                    {cat.label}
+                </span>
+                <button
+                    type="button"
+                    // sky-700 rather than sky-300: this sits on the
+                    // sky-50 panel, where the lighter token is barely
+                    // distinguishable from the background.
+                    style="margin-left: auto; font-size: .65rem; font-weight: 600; \
+                           color: var(--color-sky-700); background: none; border: none; \
+                           cursor: pointer; padding: 0;"
+                    on:click=move |_| toggle_category()
+                >
+                    {move || {
+                        let all = cat.items.iter().all(|it| selected.get().contains(it.id));
+                        if all { "Deselect all" } else { "Select all" }
+                    }}
+                </button>
+            </div>
+            {cat.items.iter().enumerate().map(|(i, item)| {
+                let id = item.id.to_string();
+                let id2 = id.clone();
+                let label = item.label;
+                let note = item.note;
+                // No trailing margin under the last check: it only padded the box out.
+                let margin = if i == last_item { "0" } else { item_gap };
+                view! {
+                    <label style=format!(
+                        "display: flex; align-items: center; gap: calc(var(--spacing) * 1.5); \
+                         font-size: .78rem; color: var(--color-sky-800); \
+                         margin-bottom: {margin}; cursor: pointer;"
+                    )>
+                        <input
+                            type="checkbox"
+                            prop:checked=move || selected.get().contains(&id)
+                            on:change=move |_| toggle_check(id2.clone())
+                        />
+                        {label}
+                        {note.map(|n| view! {
+                            // Same reasoning as the Select-all button:
+                            // sky-200 on sky-50 is unreadable.
+                            <span style="font-size: .68rem; color: var(--color-sky-700); \
+                                         font-style: italic;">
+                                {format!("({})", n)}
+                            </span>
+                        })}
+                    </label>
+                }
+            }).collect::<Vec<_>>()}
+            {timing_counts.map(|(playlist_requests, media_pairs)| view! {
+                <TimingControls
+                    playlist_requests=playlist_requests
+                    media_pairs=media_pairs
+                />
             })}
         </div>
     }
@@ -2443,75 +2819,42 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                 }
             })}
 
-            // ── Format & Container  +  HLS Protocol  (side by side)
-            <div style="display: flex; gap: 20px; align-items: flex-start; flex-wrap: wrap;">
-                <div style="flex: 1; min-width: 280px;">
-                    <ProbeSection title="📦 Format & Container" show=show_format>
-                        <ProbeRow label="Format" value=report.format_name.clone() show=s_format_name />
-                        <ProbeRow label="Container (ftyp)" value=report.major_brand.clone() show=s_container />
-                        <ProbeRow label="Duration" value=report.duration_s.map(fmt_dur) show=s_duration />
-                        <ProbeRow label="Overall bitrate" value=report.overall_bitrate_bps.map(fmt_bps) show=s_overall_br />
-                        <ProbeRow label="Streams" value=Some(report.stream_count.to_string()) show=s_stream_count />
-                        {s_session_tags.then(|| {
-                            view! {
-                                <InfoRow label="Tags / metadata">
-                                    {if tags.is_empty() {
-                                        // An em dash, as every other empty row shows —
-                                        // dropping the row made a selected check look
-                                        // like it had not run.
-                                        view! { <span>{"—"}</span> }.into_any()
-                                    } else {
-                                        view! {
-                                            <div>
-                                                {tags.iter().map(|(k, v)| view! {
-                                                    <div style="font-size: .78rem;">
-                                                        <b>{k.clone()}</b>{format!(": {}", v)}
-                                                    </div>
-                                                }).collect::<Vec<_>>()}
-                                            </div>
-                                        }.into_any()
-                                    }}
-                                </InfoRow>
-                            }
-                        })}
-                    </ProbeSection>
-                </div>
-                <div style="flex: 1; min-width: 280px;">
-                    <ProbeSection title="📡 HLS Protocol" show=show_hls>
-                        <ProbeRow label="HLS version" value=report.hls_version.map(|v| format!("{}", v)) show=s_hls_version />
-                        <ProbeRow label="Target duration" value=report.target_duration.map(|d| format!("{} s", d)) show=s_target_dur />
-                        // Both rows describe a media playlist, so they stay empty until one
-                        // was read. "VOD" and a segment count of 0 are what the defaults
-                        // look like, and printing them turned a failed fetch into a claim.
-                        <ProbeRow label="Playlist type" value=protocol_set.then(|| if report.is_live { "Live (no EXT-X-ENDLIST)".into() } else { report.playlist_type.clone().unwrap_or_else(|| "VOD".into()) }) show=s_playlist_type />
-                        <ProbeRow label="Segment count" value=protocol_set.then(|| report.total_segments.to_string()) show=s_segment_count />
-                        {s_ll_hls.then(|| view! {
-                            <div>
-                                {if let Some(ll) = ll {
-                                    view! {
-                                        <InfoRow label="Low-Latency HLS">
-                                            <div style="font-size: .78rem;">
-                                                {ll.part_hold_back.map(|v| format!("PART-HOLD-BACK={:.3}s ", v)).unwrap_or_default()}
-                                                {ll.can_skip_until.map(|v| format!("CAN-SKIP-UNTIL={:.1}s ", v)).unwrap_or_default()}
-                                                {if ll.can_block_reload { "CAN-BLOCK-RELOAD=YES" } else { "" }}
-                                            </div>
-                                        </InfoRow>
-                                    }.into_any()
-                                } else {
-                                    let status = ll_hls_absence_label(protocol_set).unwrap_or("—");
-                                    view! { <InfoRow label="Low-Latency HLS"><span>{status}</span></InfoRow> }.into_any()
-                                }}
-                            </div>
-                        })}
-                    </ProbeSection>
-                </div>
-            </div>
-
-            // ── Subtitles & Captions  +  Encryption & DRM  (side by side)
-            {(show_subs || show_drm).then(|| view! {
+            // ── Two columns, each pairing the sections whose check boxes sit in the same
+            // grid column: Format then Subtitles on the left, HLS then Encryption on the
+            // right. A hidden section drops out of its column rather than leaving a hole.
+            {(show_format || show_hls || show_subs || show_drm).then(|| view! {
                 <div style="display: flex; gap: 20px; align-items: flex-start; flex-wrap: wrap;">
-                    // Subtitles & Captions
+                    // Left column
                     <div style="flex: 1; min-width: 280px;">
+                        <ProbeSection title="📦 Format & Container" show=show_format>
+                            <ProbeRow label="Format" value=report.format_name.clone() show=s_format_name />
+                            <ProbeRow label="Container (ftyp)" value=report.major_brand.clone() show=s_container />
+                            <ProbeRow label="Duration" value=report.duration_s.map(fmt_dur) show=s_duration />
+                            <ProbeRow label="Overall bitrate" value=report.overall_bitrate_bps.map(fmt_bps) show=s_overall_br />
+                            <ProbeRow label="Streams" value=Some(report.stream_count.to_string()) show=s_stream_count />
+                            {s_session_tags.then(|| {
+                                view! {
+                                    <InfoRow label="Tags / metadata">
+                                        {if tags.is_empty() {
+                                            // An em dash, as every other empty row shows —
+                                            // dropping the row made a selected check look
+                                            // like it had not run.
+                                            view! { <span>{"—"}</span> }.into_any()
+                                        } else {
+                                            view! {
+                                                <div>
+                                                    {tags.iter().map(|(k, v)| view! {
+                                                        <div style="font-size: .78rem;">
+                                                            <b>{k.clone()}</b>{format!(": {}", v)}
+                                                        </div>
+                                                    }).collect::<Vec<_>>()}
+                                                </div>
+                                            }.into_any()
+                                        }}
+                                    </InfoRow>
+                                }
+                            })}
+                        </ProbeSection>
                         {show_subs.then(|| view! {
                             <div>
                                 <SectionTitle label="📝 Subtitles & Captions" />
@@ -2552,37 +2895,62 @@ fn ProbeResults(report: ProbeReport, selected: HashSet<String>) -> impl IntoView
                             </div>
                         })}
                     </div>
-                    // Encryption & DRM
+                    // Right column
                     <div style="flex: 1; min-width: 280px;">
-                        {show_drm.then(|| view! {
-                            <ProbeSection title="🔒 Encryption & DRM" show=true>
-                                <ProbeRow label="Encryption methods" value=(!enc.is_empty()).then(|| enc.join(", ")) show=s_enc_method />
-                                <ProbeRow label="Key formats" value=(!kf.is_empty()).then(|| kf.join(", ")) show=s_key_format />
-                                {s_drm_systems.then(|| view! {
-                                    <InfoRow label="DRM systems (PSSH / KEYFORMAT)">
-                                        {if drm.is_empty() {
-                                            let status = drm_status_label(probed_init, partial_init);
-                                            view! {
-                                                <span style="color: var(--color-sky-700); font-style: italic;">{status}</span>
-                                            }.into_any()
-                                        } else {
-                                            view! {
-                                                <div>
-                                                    {drm.iter().map(|d| view! {
-                                                        <div style="font-size: .8rem; margin-bottom: calc(var(--spacing) * 0.75);">
-                                                            <b>{d.system_name.clone()}</b>
-                                                            <span style="color: var(--color-sky-700); font-family: monospace; font-size: .72rem;">
-                                                                {format!(" — {}", d.display_id())}
-                                                            </span>
-                                                        </div>
-                                                    }).collect::<Vec<_>>()}
+                        <ProbeSection title="📡 HLS Protocol" show=show_hls>
+                            <ProbeRow label="HLS version" value=report.hls_version.map(|v| format!("{}", v)) show=s_hls_version />
+                            <ProbeRow label="Target duration" value=report.target_duration.map(|d| format!("{} s", d)) show=s_target_dur />
+                            // Both rows describe a media playlist, so they stay empty until one
+                            // was read. "VOD" and a segment count of 0 are what the defaults
+                            // look like, and printing them turned a failed fetch into a claim.
+                            <ProbeRow label="Playlist type" value=protocol_set.then(|| if report.is_live { "Live (no EXT-X-ENDLIST)".into() } else { report.playlist_type.clone().unwrap_or_else(|| "VOD".into()) }) show=s_playlist_type />
+                            <ProbeRow label="Segment count" value=protocol_set.then(|| report.total_segments.to_string()) show=s_segment_count />
+                            {s_ll_hls.then(|| view! {
+                                <div>
+                                    {if let Some(ll) = ll {
+                                        view! {
+                                            <InfoRow label="Low-Latency HLS">
+                                                <div style="font-size: .78rem;">
+                                                    {ll.part_hold_back.map(|v| format!("PART-HOLD-BACK={:.3}s ", v)).unwrap_or_default()}
+                                                    {ll.can_skip_until.map(|v| format!("CAN-SKIP-UNTIL={:.1}s ", v)).unwrap_or_default()}
+                                                    {if ll.can_block_reload { "CAN-BLOCK-RELOAD=YES" } else { "" }}
                                                 </div>
-                                            }.into_any()
-                                        }}
-                                    </InfoRow>
-                                })}
-                            </ProbeSection>
-                        })}
+                                            </InfoRow>
+                                        }.into_any()
+                                    } else {
+                                        let status = ll_hls_absence_label(protocol_set).unwrap_or("—");
+                                        view! { <InfoRow label="Low-Latency HLS"><span>{status}</span></InfoRow> }.into_any()
+                                    }}
+                                </div>
+                            })}
+                        </ProbeSection>
+                        <ProbeSection title="🔒 Encryption & DRM" show=show_drm>
+                            <ProbeRow label="Encryption methods" value=(!enc.is_empty()).then(|| enc.join(", ")) show=s_enc_method />
+                            <ProbeRow label="Key formats" value=(!kf.is_empty()).then(|| kf.join(", ")) show=s_key_format />
+                            {s_drm_systems.then(|| view! {
+                                <InfoRow label="DRM systems (PSSH / KEYFORMAT)">
+                                    {if drm.is_empty() {
+                                        let status = drm_status_label(probed_init, partial_init);
+                                        view! {
+                                            <span style="color: var(--color-sky-700); font-style: italic;">{status}</span>
+                                        }.into_any()
+                                    } else {
+                                        view! {
+                                            <div>
+                                                {drm.iter().map(|d| view! {
+                                                    <div style="font-size: .8rem; margin-bottom: calc(var(--spacing) * 0.75);">
+                                                        <b>{d.system_name.clone()}</b>
+                                                        <span style="color: var(--color-sky-700); font-family: monospace; font-size: .72rem;">
+                                                            {format!(" — {}", d.display_id())}
+                                                        </span>
+                                                    </div>
+                                                }).collect::<Vec<_>>()}
+                                            </div>
+                                        }.into_any()
+                                    }}
+                                </InfoRow>
+                            })}
+                        </ProbeSection>
                     </div>
                 </div>
             })}
@@ -3744,5 +4112,264 @@ mod tests {
         assert_eq!(long.as_deref(), Some("Dolby Vision (HEVC)"));
         assert_eq!(profile.as_deref(), Some("Dolby Vision Profile 5"));
         assert_eq!(level.as_deref(), Some("6"));
+    }
+
+    // ── Timing: what the parser has to retain ────────────────────────────────
+
+    const BASE: &str = "https://example.com/hls/prog_index.m3u8";
+
+    /// A VOD playlist exercising the pieces a media sample needs: resolved segment URIs, a
+    /// BYTERANGE with an offset and one without, a GAP, media sequence numbering and an
+    /// EXT-X-PROGRAM-DATE-TIME.
+    const TIMING_MEDIA: &str = "#EXTM3U\n\
+        #EXT-X-VERSION:7\n\
+        #EXT-X-TARGETDURATION:6\n\
+        #EXT-X-MEDIA-SEQUENCE:100\n\
+        #EXT-X-PLAYLIST-TYPE:VOD\n\
+        #EXT-X-MAP:URI=\"init.mp4\"\n\
+        #EXT-X-PROGRAM-DATE-TIME:2026-08-20T10:00:00.000Z\n\
+        #EXTINF:4.0,\n\
+        #EXT-X-BYTERANGE:1000@500\n\
+        all.mp4\n\
+        #EXTINF:4.0,\n\
+        #EXT-X-BYTERANGE:2000\n\
+        all.mp4\n\
+        #EXTINF:4.0,\n\
+        #EXT-X-GAP\n\
+        gap.mp4\n\
+        #EXTINF:3.5,\n\
+        last.mp4\n\
+        #EXT-X-ENDLIST\n";
+
+    /// A playlist whose part URIs are written with an EXT-X-DEFINE variable, and which
+    /// declares PART-TARGET below its first segment.
+    const TIMING_PARTS: &str = "#EXTM3U\n\
+        #EXT-X-VERSION:9\n\
+        #EXT-X-TARGETDURATION:4\n\
+        #EXT-X-DEFINE:NAME=\"cdn\",VALUE=\"edge1\"\n\
+        #EXTINF:4.0,\n\
+        #EXT-X-PART:DURATION=0.5,URI=\"{$cdn}/seg0.0.m4s\",INDEPENDENT=YES\n\
+        #EXT-X-PART:DURATION=0.5,URI=\"{$cdn}/seg0.1.m4s\",BYTERANGE=\"900@100\"\n\
+        #EXT-X-PART:DURATION=0.5,URI=\"{$cdn}/seg0.2.m4s\",GAP=YES\n\
+        seg0.m4s\n\
+        #EXT-X-PART-INF:PART-TARGET=0.5\n\
+        #EXT-X-ENDLIST\n";
+
+    fn timing_media(content: &str) -> MediaSummary {
+        timing_media_summary(BASE, content, &HashMap::new())
+    }
+
+    #[test]
+    fn segment_uris_are_retained_and_resolved() {
+        let summary = timing_media(TIMING_MEDIA);
+        let uris: Vec<&str> = summary.segments.iter().map(|s| s.uri.as_str()).collect();
+        assert_eq!(
+            uris,
+            vec![
+                "https://example.com/hls/all.mp4",
+                "https://example.com/hls/all.mp4",
+                "https://example.com/hls/gap.mp4",
+                "https://example.com/hls/last.mp4",
+            ]
+        );
+        assert_eq!(summary.target_duration_s, Some(6.0));
+        assert!(!summary.is_live);
+        assert_eq!(
+            summary.segments[0].map_uri.as_deref(),
+            Some("https://example.com/hls/init.mp4")
+        );
+    }
+
+    #[test]
+    fn a_byterange_with_no_offset_continues_the_previous_sub_range() {
+        let summary = timing_media(TIMING_MEDIA);
+        assert_eq!(
+            summary.segments[0].byterange,
+            Some(RequestRange::from_length_with_offset(1_000, 500))
+        );
+        // 500 + 1000 = 1500, which is where the next sub-range of all.mp4 begins.
+        assert_eq!(
+            summary.segments[1].byterange,
+            Some(RequestRange::from_length_with_offset(2_000, 1_500))
+        );
+        // A segment with no BYTERANGE is the whole resource.
+        assert_eq!(summary.segments[3].byterange, None);
+    }
+
+    #[test]
+    fn a_gap_segment_is_flagged_so_it_is_never_fetched() {
+        let summary = timing_media(TIMING_MEDIA);
+        let gaps: Vec<bool> = summary.segments.iter().map(|s| s.gap).collect();
+        assert_eq!(gaps, vec![false, false, true, false]);
+    }
+
+    #[test]
+    fn media_sequence_numbers_and_program_date_time_are_retained() {
+        let summary = timing_media(TIMING_MEDIA);
+        let msns: Vec<Option<u64>> = summary.segments.iter().map(|s| s.msn).collect();
+        assert_eq!(msns, vec![Some(100), Some(101), Some(102), Some(103)]);
+        // Only the segment that carries the tag claims a date: an extrapolated one would
+        // be this parser's arithmetic rather than the playlist's statement.
+        assert!(summary.segments[0].program_date_time.is_some());
+        assert!(summary.segments[1].program_date_time.is_none());
+    }
+
+    #[test]
+    fn a_playlist_with_no_media_sequence_tag_starts_at_zero() {
+        let summary = timing_media(
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\na.m4s\n#EXTINF:6.0,\nb.m4s\n#EXT-X-ENDLIST\n",
+        );
+        assert_eq!(summary.segments[0].msn, Some(0));
+        assert_eq!(summary.segments[1].msn, Some(1));
+    }
+
+    #[test]
+    fn part_uris_go_through_define_substitution() {
+        let summary = timing_media(TIMING_PARTS);
+        let parts = &summary.segments[0].parts;
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].uri, "https://example.com/hls/edge1/seg0.0.m4s");
+        assert_eq!(parts[1].uri, "https://example.com/hls/edge1/seg0.1.m4s");
+    }
+
+    #[test]
+    fn part_byterange_independent_and_gap_are_retained() {
+        let summary = timing_media(TIMING_PARTS);
+        let parts = &summary.segments[0].parts;
+        assert_eq!(parts[0].byterange, None);
+        assert!(parts[0].independent);
+        assert!(!parts[0].gap);
+        assert_eq!(
+            parts[1].byterange,
+            Some(RequestRange::from_length_with_offset(900, 100))
+        );
+        assert!(!parts[1].independent);
+        assert!(parts[2].gap);
+        assert_eq!(parts[0].duration_s, 0.5);
+    }
+
+    #[test]
+    fn part_target_is_read_wherever_the_playlist_writes_it() {
+        // The tag sits below the first segment here, which a single forward pass would
+        // miss — and PART-TARGET is the secondary denominator for every part row.
+        assert_eq!(timing_media(TIMING_PARTS).part_target_s, Some(0.5));
+        assert_eq!(timing_media(TIMING_MEDIA).part_target_s, None);
+    }
+
+    #[test]
+    fn a_playlist_with_no_endlist_is_live() {
+        let summary = timing_media("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\na.m4s\n");
+        assert!(summary.is_live);
+    }
+
+    #[test]
+    fn a_byterange_with_no_offset_and_nothing_to_continue_from_is_not_a_range() {
+        // The playlist is malformed. Asking for bytes 0.. would be a guess at what the
+        // author meant, so no range is sent at all.
+        let summary = timing_media(
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\n#EXT-X-BYTERANGE:1000\na.mp4\n#EXT-X-ENDLIST\n",
+        );
+        assert_eq!(summary.segments[0].byterange, None);
+    }
+
+    #[test]
+    fn the_ladder_summary_names_renditions_and_says_which_are_muxed() {
+        let summary = timing_master_summary("https://example.com/hls/master.m3u8", APPLE_MASTER);
+        assert_eq!(summary.variants.len(), 2);
+        assert_eq!(summary.variants[0].label, "1024x576 @ 3.31 Mbps");
+        // Both variants declare an audio codec in CODECS, so their segments are muxed and
+        // a pair is one request rather than two.
+        assert!(summary.variants.iter().all(|v| v.has_audio_codec));
+        assert_eq!(summary.variants[0].audio_group.as_deref(), Some("aache-44-64"));
+        assert_eq!(summary.audio.len(), 2);
+        assert!(summary.audio.iter().all(|a| a.is_default && a.uri.is_some()));
+    }
+
+    #[test]
+    fn a_demuxed_ladder_is_not_reported_as_muxed() {
+        let master = "#EXTM3U\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",DEFAULT=YES,URI=\"a/index.m3u8\"\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS=\"avc1.64001f\",RESOLUTION=640x360,AUDIO=\"aud\"\n\
+            v/index.m3u8\n";
+        let summary = timing_master_summary("https://example.com/hls/master.m3u8", master);
+        assert!(!summary.variants[0].has_audio_codec);
+    }
+
+    #[test]
+    fn the_timing_category_is_never_selected_for_the_user() {
+        let initial = all_check_ids();
+        assert!(!initial.contains(TIMING_PLAYLIST_ID));
+        assert!(!initial.contains(TIMING_MEDIA_ID));
+        assert!(initial.contains("format_name"));
+        // The category is still offered, so it can be opted into.
+        assert!(CATEGORIES.iter().any(|c| c.id == TIMING_CAT_ID));
+        assert!(is_timing_check(TIMING_PLAYLIST_ID));
+        assert!(is_timing_check(TIMING_MEDIA_ID));
+        assert!(!is_timing_check("format_name"));
+    }
+
+    /// The category id of every box the grid draws, in reading order.
+    fn drawn_box_ids(cells: &[InspectGridCell]) -> Vec<&'static str> {
+        cells.iter().flat_map(|cell| cell.cats.iter().map(|cat| cat.id)).collect()
+    }
+
+    #[test]
+    fn the_grid_fills_five_cells_and_stacks_timing_under_subtitles_and_encryption_under_protocol() {
+        // Which cells share a row, and how tight a compact box sits, are CSS the browser
+        // resolves; what is pinned here is the order and pairing the view iterates.
+        let cells = inspect_grid_cells();
+        let ids: Vec<Vec<&str>> = cells.iter()
+            .map(|cell| cell.cats.iter().map(|cat| cat.id).collect())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                vec!["format"],
+                vec!["video"],
+                vec!["audio"],
+                vec![SUBTITLES_CAT_ID, TIMING_CAT_ID],
+                vec![PROTOCOL_CAT_ID, ENCRYPTION_CAT_ID],
+            ],
+        );
+        assert_eq!(cat_by_id(TIMING_CAT_ID).map(|c| c.label), Some("Timing"));
+        assert_eq!(cat_by_id(ENCRYPTION_CAT_ID).map(|c| c.label), Some("Encryption & DRM"));
+    }
+
+    #[test]
+    fn every_category_gets_exactly_one_box_somewhere_in_the_grid() {
+        // A pair table loses or repeats a box silently: an id that is both a pair top and
+        // an under never draws its own under, and the same under listed twice draws twice.
+        let cells = inspect_grid_cells();
+        let mut drawn = drawn_box_ids(&cells);
+        let mut expected: Vec<&str> = CATEGORIES.iter().map(|cat| cat.id).collect();
+        drawn.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(drawn, expected);
+    }
+
+    #[test]
+    fn the_timing_category_is_drawn_wherever_the_pair_table_puts_it() {
+        // Holds whether Timing is stacked under Subtitles or promoted to a cell of its own.
+        let cells = inspect_grid_cells();
+        assert!(drawn_box_ids(&cells).contains(&TIMING_CAT_ID));
+    }
+
+    #[test]
+    fn only_the_timing_box_carries_the_run_count_inputs() {
+        let cells = inspect_grid_cells();
+        let with_counts: Vec<&str> = drawn_box_ids(&cells).into_iter()
+            .filter(|id| draws_timing_counts(id))
+            .collect();
+        assert_eq!(with_counts, [TIMING_CAT_ID]);
+    }
+
+    #[test]
+    fn the_probe_report_still_counts_and_sums_the_segments_it_always_did() {
+        let mut report = ProbeReport::default();
+        let pl = parse_media_playlist(BASE, TIMING_MEDIA, &HashMap::new());
+        apply_protocol_from_media(&mut report, &pl);
+        assert_eq!(report.total_segments, 4);
+        assert_eq!(report.duration_s, Some(15.5));
+        assert!(!report.is_live);
     }
 }

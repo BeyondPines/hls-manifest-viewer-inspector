@@ -126,7 +126,7 @@ fn parse_byterange(br: &str) -> Option<RequestRange> {
 
 /// Evenly spaced segment indices, so a deep sample strides across the whole asset
 /// instead of measuring only its opening seconds.
-fn stride_indices(segment_count: usize, max_samples: usize) -> Vec<usize> {
+pub(crate) fn stride_indices(segment_count: usize, max_samples: usize) -> Vec<usize> {
     if segment_count == 0 || max_samples == 0 {
         return Vec::new();
     }

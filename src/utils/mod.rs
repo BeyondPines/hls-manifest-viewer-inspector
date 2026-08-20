@@ -9,6 +9,7 @@ pub mod network;
 mod pssh_data;
 pub mod query_codec;
 pub mod response;
+pub mod timing;
 pub mod validator;
 
 #[cfg(test)]
