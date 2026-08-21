@@ -26,6 +26,9 @@ web-sys = { version = "0.3", features = [
     "AbortSignal",
     "PerformanceEntry",
     "PerformanceResourceTiming",
+    # Inspect Timing, live edge: a blocking reload is capped by a setTimeout on a child
+    # controller, and cancelled with the run by listening for the parent signal's abort.
+    "EventTarget",
 ] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

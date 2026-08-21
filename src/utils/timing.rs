@@ -19,6 +19,9 @@ use crate::utils::network::{
 use std::collections::HashMap;
 use web_sys::AbortSignal;
 
+/// The live edge: reload planning, `_HLS_msn` / `_HLS_part`, and the observation lag.
+mod live;
+
 // ── Options and limits ───────────────────────────────────────────────────────
 
 pub const DEFAULT_PLAYLIST_REQUESTS: usize = 4;
@@ -45,8 +48,14 @@ pub struct TimingOptions {
     pub media_pairs: usize,
     /// Whether the playlist rows are wanted at all.
     pub playlist_timing: bool,
-    /// Whether media bytes may be downloaded.
+    /// Whether media bytes may be downloaded from a **finished** asset: `EXT-X-ENDLIST`
+    /// present, segments strided across the whole duration. This flag never waits at a
+    /// live edge, because striding a sliding window would report percentages of an asset
+    /// that is still being written.
     pub media_timing: bool,
+    /// Whether the **live edge** may be watched: blocking reloads or polling, then the
+    /// item that appeared. Costs waits rather than a stride, so it is asked for separately.
+    pub live_timing: bool,
 }
 
 impl Default for TimingOptions {
@@ -56,6 +65,7 @@ impl Default for TimingOptions {
             media_pairs: DEFAULT_MEDIA_PAIRS,
             playlist_timing: true,
             media_timing: false,
+            live_timing: false,
         }
     }
 }
@@ -72,6 +82,46 @@ impl TimingOptions {
             media_pairs: clamp_count(self.media_pairs, MIN_MEDIA_PAIRS, MAX_MEDIA_PAIRS),
             ..self
         }
+    }
+
+    /// Whether either media check was asked for, so the run has a media phase to enter at
+    /// all. Which of the two applies cannot be known until a playlist has said whether it
+    /// carries `EXT-X-ENDLIST`; that is [`media_phase_kind`]'s job.
+    pub fn wants_media_samples(self) -> bool {
+        self.media_timing || self.live_timing
+    }
+}
+
+/// What the media phase of a run does, for one playlist kind and one pair of checks.
+///
+/// The two media checks measure different things and neither substitutes for the other, so
+/// a check that cannot apply to the playlist in hand declines out loud instead of quietly
+/// running the other one. `run_timing` matches on this, so the table below is the branch
+/// the run takes rather than a description of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaPhaseKind {
+    /// Neither media check was ticked: the run ends after the playlist rows.
+    Skip,
+    /// Stride a finished asset. `live_declined` is the both-boxes case, where the live edge
+    /// was also asked for and there is no edge to watch.
+    Vod { live_declined: bool },
+    /// Watch the live edge. `vod_declined` is the both-boxes case, where a VOD stride was
+    /// also asked for and this playlist is still being written.
+    Live { vod_declined: bool },
+    /// VOD sampling on a playlist with no `EXT-X-ENDLIST`. No media bytes are taken.
+    DeclineVodOnLive,
+    /// Live edge timing on a playlist that has `EXT-X-ENDLIST`. No media bytes are taken.
+    DeclineLiveOnVod,
+}
+
+/// Which media phase one playlist and one pair of checks add up to.
+pub fn media_phase_kind(is_live: bool, media_timing: bool, live_timing: bool) -> MediaPhaseKind {
+    match (is_live, media_timing, live_timing) {
+        (_, false, false) => MediaPhaseKind::Skip,
+        (true, vod_declined, true) => MediaPhaseKind::Live { vod_declined },
+        (true, true, false) => MediaPhaseKind::DeclineVodOnLive,
+        (false, true, live_declined) => MediaPhaseKind::Vod { live_declined },
+        (false, false, true) => MediaPhaseKind::DeclineLiveOnVod,
     }
 }
 
@@ -329,20 +379,37 @@ pub struct AudioSummary {
 }
 
 /// What the Timing phase needs from a media playlist.
+///
+/// The EXT-X-SERVER-CONTROL fields are what decide how a live edge can be watched at all:
+/// with `CAN-BLOCK-RELOAD=YES` the origin holds a reload until it has something to
+/// publish, and without it there is nothing to do but poll and accept that a URI may have
+/// appeared up to one interval before this tab saw it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MediaSummary {
     pub target_duration_s: Option<f64>,
     pub part_target_s: Option<f64>,
     pub is_live: bool,
+    pub can_block_reload: bool,
+    /// EXT-X-SERVER-CONTROL HOLD-BACK, in seconds.
+    pub hold_back_s: Option<f64>,
+    /// EXT-X-SERVER-CONTROL PART-HOLD-BACK, in seconds.
+    pub part_hold_back_s: Option<f64>,
+    /// The playlist's segments, and — for a live playlist read through Inspect's parser —
+    /// the parent segment at the edge whose parts are published but whose URI is not.
+    /// That entry has an empty `uri` and is only fetchable through its parts.
     pub segments: Vec<SegmentEntry>,
 }
+
+/// Inspect's media-playlist reader. Named because a live run has to carry it into each
+/// reload it makes, and a function pointer is the whole of what it needs.
+pub type MediaParser = fn(&str, &str, &HashMap<String, String>) -> MediaSummary;
 
 /// Inspect's own playlist parsers, handed in so this module does not grow a second HLS
 /// reader that could disagree with the one the report is built from.
 #[derive(Clone, Copy)]
 pub struct PlaylistParsers {
     pub master: fn(&str, &str) -> MasterSummary,
-    pub media: fn(&str, &str, &HashMap<String, String>) -> MediaSummary,
+    pub media: MediaParser,
 }
 
 // ── Rendition and sample planning ────────────────────────────────────────────
@@ -392,6 +459,11 @@ pub fn default_audio_rendition<'a>(
 pub enum RequestClass {
     MultivariantPlaylist,
     MediaPlaylist,
+    /// A media playlist re-requested at the live edge, which the origin may hold until it
+    /// has something to publish. Kept apart from an ordinary repeat because its duration
+    /// is a wait on an author rather than a download, and a median over both would
+    /// describe neither.
+    LivePlaylistReload,
     VideoSegment,
     AudioSegment,
     /// One request carrying both video and audio, so a pair is a single download. Only
@@ -407,6 +479,7 @@ impl RequestClass {
         match self {
             Self::MultivariantPlaylist => "Multivariant playlist",
             Self::MediaPlaylist => "Media playlist",
+            Self::LivePlaylistReload => "Live playlist reload (held)",
             Self::VideoSegment => "Video segment",
             Self::AudioSegment => "Audio segment",
             Self::MuxedSegment => "Muxed segment",
@@ -585,10 +658,16 @@ pub fn plan_pairs(
 }
 
 /// One rendition the plan can sample from: its segment list, and how the table names it.
+///
+/// The playlist URI and its variables are kept alongside because a live run has to
+/// re-request that playlist to watch its edge, and has to read the reloads with the same
+/// EXT-X-DEFINE substitutions the first read used.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MediaRenditionPlan {
     pub class: RequestClass,
     pub rendition: String,
+    pub playlist_uri: String,
+    pub definitions: HashMap<String, String>,
     pub summary: MediaSummary,
 }
 
@@ -655,6 +734,21 @@ pub struct Measurement {
     pub range_ignored: bool,
 }
 
+impl Measurement {
+    /// The total this measurement is divided by, and where it came from.
+    ///
+    /// Resource Timing wins whenever an entry matched: it is the browser's own figure and
+    /// carries none of the app's scheduling.
+    pub fn authoritative_total_ms(&self) -> Option<(f64, TotalSource)> {
+        if let Some(rt) = self.rt.as_ref().and_then(ResourceTimingSample::total_ms) {
+            return Some((rt, TotalSource::ResourceTiming));
+        }
+        self.app
+            .total_ms()
+            .map(|total| (total, TotalSource::AppObserved))
+    }
+}
+
 /// What became of one planned request.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RowOutcome {
@@ -692,6 +786,10 @@ pub struct TimingRow {
     pub media_duration_source: Option<DurationSource>,
     pub target_duration_s: Option<f64>,
     pub target_duration_source: Option<DurationSource>,
+    /// For a live media row: the time from this tab first seeing this URI in a playlist
+    /// body to its bytes being in hand. `None` for VOD, for playlist rows, and wherever
+    /// either end of the interval is missing — it is never a zero.
+    pub observation_lag_ms: Option<f64>,
     pub outcome: RowOutcome,
 }
 
@@ -763,10 +861,7 @@ impl TimingRow {
 
     /// The total the percentage columns divide, and where it came from.
     pub fn authoritative_total_ms(&self) -> Option<(f64, TotalSource)> {
-        if let Some(rt) = self.rt_total_ms() {
-            return Some((rt, TotalSource::ResourceTiming));
-        }
-        self.app_total_ms().map(|t| (t, TotalSource::AppObserved))
+        self.measurement()?.authoritative_total_ms()
     }
 
     pub fn connection_state(&self) -> ConnectionState {
@@ -799,6 +894,19 @@ impl TimingRow {
         }
         let (total, _) = self.authoritative_total_ms()?;
         percent_of_duration(total, self.target_duration_s?)
+    }
+
+    /// The observation lag as a percentage of the target this item is bounded by:
+    /// PART-TARGET for a part, TARGETDURATION for a segment.
+    ///
+    /// Suppressed for an ignored range for the same reason the other ratios are: the lag
+    /// then contains the download of the whole resource while the denominator bounds one
+    /// slice of it.
+    pub fn observation_lag_percent_of_target(&self) -> Option<f64> {
+        if self.range_ignored() {
+            return None;
+        }
+        percent_of_duration(self.observation_lag_ms?, self.target_duration_s?)
     }
 
     pub fn range_ignored(&self) -> bool {
@@ -869,7 +977,22 @@ impl TimingNote {
 }
 
 pub const NOTE_BYTE_BUDGET: &str = "byte_budget_reached";
+/// Live, but nothing could be sampled: no numbered media to wait beyond, or every wait
+/// ended without a new URI appearing.
 pub const NOTE_LIVE_NOT_MEASURED: &str = "live_lag_not_measured";
+/// What the observation lag is and is not, pushed by every run that takes live samples.
+pub const NOTE_LIVE_OBSERVATION_BOUND: &str = "live_observation_lag_bound";
+/// The origin advertised CAN-BLOCK-RELOAD, so the reloads carried `_HLS_msn` / `_HLS_part`
+/// and the playlist rows include the hold.
+pub const NOTE_LIVE_BLOCKING_RELOAD: &str = "live_blocking_reload";
+/// No CAN-BLOCK-RELOAD, so the edge was polled and an appearance can be seen late.
+pub const NOTE_LIVE_POLLED: &str = "live_edge_polled";
+/// A wait ran out of time with nothing new on the playlist.
+pub const NOTE_LIVE_WAIT_TIMEOUT: &str = "live_wait_timed_out";
+/// VOD media sampling was asked for, but the playlist carries no `EXT-X-ENDLIST`.
+pub const NOTE_VOD_SAMPLE_ON_LIVE: &str = "vod_sampling_on_live_playlist";
+/// Live edge timing was asked for, but the playlist carries `EXT-X-ENDLIST`.
+pub const NOTE_LIVE_SAMPLE_ON_VOD: &str = "live_timing_on_vod_playlist";
 pub const NOTE_CLOCK_UNAVAILABLE: &str = "clock_unavailable";
 pub const NOTE_RANGE_IGNORED: &str = "range_ignored";
 pub const NOTE_MUXING_UNKNOWN: &str = "muxing_not_established";
@@ -925,6 +1048,20 @@ pub fn provenance_notes() -> Vec<&'static str> {
         "Raw rows and a median only. Four samples do not support a mean or a standard \
          deviation.",
         "A few pairs of one rung are not a measurement of the whole ladder.",
+        "Observation lag, on live rows, runs from this tab first seeing a URI in a playlist \
+         body to that item's bytes being in hand. It is an upper bound on what the fetch \
+         cost — it also contains this tab's own scheduling between reading the playlist and \
+         issuing the request — and at the same time a floor on the interval from the item \
+         being published to its bytes being in hand, because whatever passed before this tab \
+         read the body is outside it.",
+        "Observation lag is not the time from a segment being added to the playlist. No \
+         browser can see that moment, and EXT-X-PROGRAM-DATE-TIME is an authoring clock, \
+         not a latency. Where a blocking reload returned quickly the item was already \
+         published before this tab asked for it, and the lag then measures this tab's \
+         lateness rather than the origin's.",
+        "A blocking reload's playlist row is the origin holding the request until it had \
+         something to publish. That hold is not a media download and is not a time to \
+         first byte for the part that followed it.",
     ]
 }
 
@@ -1106,8 +1243,12 @@ pub async fn run_timing(
         report.total_bytes = report
             .total_bytes
             .saturating_add(measured_bytes(&result).unwrap_or(0));
+        // A live baseline has to be the newest body this run read. Diffing a later reload
+        // against the first repeat would date a URI's appearance to a request that had
+        // already carried it, which is the one thing a live measurement must not do.
+        let stale_live = video_summary.as_ref().is_some_and(|s| s.is_live);
         if let Ok((_, body)) = &result
-            && video_summary.is_none()
+            && (video_summary.is_none() || stale_live)
         {
             let definitions = master
                 .as_ref()
@@ -1132,7 +1273,7 @@ pub async fn run_timing(
     }
 
     // ── Media samples ────────────────────────────────────────────────────────
-    if !options.media_timing {
+    if !options.wants_media_samples() {
         return finish(report, signal);
     }
     let Some(video_summary) = video_summary else {
@@ -1142,28 +1283,43 @@ pub async fn run_timing(
         );
         return finish(report, signal);
     };
-    if video_summary.is_live {
-        report.push_note(
-            NOTE_LIVE_NOT_MEASURED,
-            "This is a live playlist. Availability lag — how long after a segment is added \
-             the client can get it — is not measured yet, and no media samples were \
-             downloaded: a VOD-style duration percentage taken from a live playlist looks \
-             like a latency figure and is not one. The playlist rows above are still real \
-             measurements.",
-        );
-        return finish(report, signal);
+    // Which media check applies is decided here, before anything is fetched for the sample
+    // plan: a check that cannot describe this playlist declines without spending a request.
+    let phase = media_phase_kind(
+        video_summary.is_live,
+        options.media_timing,
+        options.live_timing,
+    );
+    match phase {
+        MediaPhaseKind::Skip => return finish(report, signal),
+        MediaPhaseKind::DeclineVodOnLive => {
+            report.push_note(NOTE_VOD_SAMPLE_ON_LIVE, vod_on_live_note(false));
+            return finish(report, signal);
+        }
+        MediaPhaseKind::DeclineLiveOnVod => {
+            report.push_note(NOTE_LIVE_SAMPLE_ON_VOD, live_on_vod_note(false));
+            return finish(report, signal);
+        }
+        // Both boxes ticked, one of which this playlist cannot answer. The samples below
+        // are of the other kind, and the note says which measurement is missing.
+        MediaPhaseKind::Vod { live_declined: true } => {
+            report.push_note(NOTE_LIVE_SAMPLE_ON_VOD, live_on_vod_note(true));
+        }
+        MediaPhaseKind::Live { vod_declined: true } => {
+            report.push_note(NOTE_VOD_SAMPLE_ON_LIVE, vod_on_live_note(true));
+        }
+        MediaPhaseKind::Vod { .. } | MediaPhaseKind::Live { .. } => {}
     }
-
-    // A GAP carries no media, so it is excluded from the stride rather than fetched. Said
-    // out loud, because a sample plan that quietly moved past a third of the asset would
-    // be describing a different asset.
+    // A GAP carries no media, so it is dropped from the sample plan rather than fetched.
+    // Said out loud, because a sample plan that quietly moved past a third of the asset
+    // would be describing a different asset.
     let gaps = video_summary.segments.iter().filter(|s| s.gap).count();
     if gaps > 0 {
         report.push_note(
             "gap_segments_excluded",
             format!(
                 "{gaps} of {} segment(s) are marked EXT-X-GAP and carry no media, so they were \
-                 excluded from the sample stride and never requested.",
+                 left out of the sample plan and never requested.",
                 video_summary.segments.len(),
             ),
         );
@@ -1173,9 +1329,15 @@ pub async fn run_timing(
     // so its pair is a single request. Where there is no multivariant playlist to say,
     // the muxing is simply unknown and the class says so rather than claiming muxed.
     let (media_class, audio_group) = sample_class_and_audio_group(chosen.as_ref());
-    let video_plan = MediaRenditionPlan {
+    let definitions = master
+        .as_ref()
+        .map(|m| m.definitions.clone())
+        .unwrap_or_default();
+    let mut video_plan = MediaRenditionPlan {
         class: media_class,
         rendition: media_label.clone().unwrap_or_else(|| "media".into()),
+        playlist_uri: media_playlist_uri.clone(),
+        definitions: definitions.clone(),
         summary: video_summary,
     };
 
@@ -1201,6 +1363,8 @@ pub async fn run_timing(
             audio_plan = Some(MediaRenditionPlan {
                 class: RequestClass::AudioSegment,
                 rendition: rendition.name.clone(),
+                playlist_uri: uri.clone(),
+                definitions: master.definitions.clone(),
                 summary: (request.parsers.media)(&uri, body, &master.definitions),
             });
         }
@@ -1217,6 +1381,21 @@ pub async fn run_timing(
     }
 
     push_media_plan_notes(&mut report, media_class, audio_plan.is_some());
+
+    // ── Live: watch the edge instead of striding a finished asset ────────────
+    if matches!(phase, MediaPhaseKind::Live { .. }) {
+        live::run_live_samples(
+            &request,
+            options,
+            &mut report,
+            &mut video_plan,
+            audio_plan.as_mut(),
+            signal,
+            &on_progress,
+        )
+        .await;
+        return finish(report, signal);
+    }
 
     let pairs = plan_pairs(&video_plan, audio_plan.as_ref(), options.media_pairs);
     if pairs.is_empty() {
@@ -1273,18 +1452,9 @@ pub async fn run_timing(
                 }
                 Err(error) => outcome_from_error(&error),
             };
-            report.rows.push(TimingRow {
-                class: spec.class,
-                rendition: Some(spec.rendition.clone()),
-                sample_label: sample_label.clone(),
-                uri: spec.uri.clone(),
-                byterange: spec.byterange,
-                media_duration_s: spec.media_duration_s,
-                media_duration_source: spec.media_duration_source,
-                target_duration_s: spec.target_duration_s,
-                target_duration_source: spec.target_duration_source,
-                outcome,
-            });
+            report
+                .rows
+                .push(media_row(spec, sample_label.clone(), outcome, None));
         }
 
         if run_stopped(&report, signal) {
@@ -1312,7 +1482,12 @@ pub async fn run_timing(
                     .into_iter()
                     .flatten()
                 {
-                    report.rows.push(skipped_row(spec, label.clone()));
+                    report.rows.push(media_row(
+                        spec,
+                        label.clone(),
+                        RowOutcome::Skipped("byte cap reached before this pair".into()),
+                        None,
+                    ));
                 }
             }
             break;
@@ -1353,6 +1528,42 @@ fn push_media_plan_notes(report: &mut TimingReport, class: RequestClass, has_aud
              video-only and understate what a player would have had to download.",
         );
     }
+}
+
+/// Why a VOD stride cannot describe a playlist that is still being written.
+///
+/// `took_live_samples` is the both-boxes case, where the note is about the stride that did
+/// not happen rather than about a phase that took no bytes at all.
+fn vod_on_live_note(took_live_samples: bool) -> String {
+    let tail = if took_live_samples {
+        "The live edge was watched instead, so the media rows below are edge samples rather \
+         than a stride across the asset."
+    } else {
+        "No media bytes were taken. Select \"Live edge timing\" to measure the edge instead. \
+         The playlist rows below stand as measured."
+    };
+    format!(
+        "\"Media sample timing\" samples a finished asset, and this playlist carries no \
+         EXT-X-ENDLIST. Striding a sliding window would give percentages of an asset that is \
+         still being written, and would time media that was published before the run started. \
+         {tail}"
+    )
+}
+
+/// Why there is no edge to watch on a playlist that has finished publishing.
+fn live_on_vod_note(took_vod_samples: bool) -> String {
+    let tail = if took_vod_samples {
+        "The VOD samples below are a stride across the finished asset, and carry no \
+         observation lag."
+    } else {
+        "No media bytes were taken. Select \"Media sample timing\" for samples of the finished \
+         asset. The playlist rows below stand as measured."
+    };
+    format!(
+        "\"Live edge timing\" waits for media to appear, and this playlist carries \
+         EXT-X-ENDLIST: every segment it lists is already published, so there is no edge to \
+         wait at and no observation lag to report. {tail}"
+    )
 }
 
 /// Whether the run should stop: the signal fired, or the last row it produced says the
@@ -1423,11 +1634,21 @@ fn playlist_row(
         media_duration_source: None,
         target_duration_s: None,
         target_duration_source: None,
+        observation_lag_ms: None,
         outcome,
     }
 }
 
-fn skipped_row(spec: &MediaRequestSpec, sample_label: String) -> TimingRow {
+/// One row for a planned media request, whatever became of it.
+///
+/// `observation_lag_ms` is only ever `Some` on a live row, and only where both ends of the
+/// interval were read from the same clock.
+fn media_row(
+    spec: &MediaRequestSpec,
+    sample_label: String,
+    outcome: RowOutcome,
+    observation_lag_ms: Option<f64>,
+) -> TimingRow {
     TimingRow {
         class: spec.class,
         rendition: Some(spec.rendition.clone()),
@@ -1438,7 +1659,8 @@ fn skipped_row(spec: &MediaRequestSpec, sample_label: String) -> TimingRow {
         media_duration_source: spec.media_duration_source,
         target_duration_s: spec.target_duration_s,
         target_duration_source: spec.target_duration_source,
-        outcome: RowOutcome::Skipped("byte cap reached before this pair".into()),
+        observation_lag_ms,
+        outcome,
     }
 }
 
@@ -1516,6 +1738,7 @@ mod tests {
             media_duration_source: None,
             target_duration_s: None,
             target_duration_source: None,
+            observation_lag_ms: None,
             outcome: RowOutcome::Measured(Measurement {
                 status: 200,
                 bytes: 1_000,
@@ -1540,6 +1763,8 @@ mod tests {
         MediaRenditionPlan {
             class,
             rendition: name.into(),
+            playlist_uri: format!("https://example.com/hls/{name}.m3u8"),
+            definitions: HashMap::new(),
             summary: MediaSummary {
                 target_duration_s: Some(6.0),
                 segments,
@@ -1750,6 +1975,42 @@ mod tests {
         assert_eq!(summary[1].app_total_median_ms, None);
     }
 
+    #[test]
+    fn a_held_live_reload_is_not_averaged_into_the_media_playlist_median() {
+        // The hold is the origin waiting until it had something to publish. Counted with
+        // the repeats it would swamp them, and the median would describe neither.
+        let rows = vec![
+            measured_row(
+                RequestClass::MediaPlaylist,
+                app(0.0, 10.0, 20.0),
+                Some(rt_without_tao(0.0, 20.0)),
+            ),
+            measured_row(
+                RequestClass::MediaPlaylist,
+                app(0.0, 10.0, 30.0),
+                Some(rt_without_tao(0.0, 30.0)),
+            ),
+            measured_row(
+                RequestClass::LivePlaylistReload,
+                app(0.0, 10.0, 4_000.0),
+                Some(rt_without_tao(0.0, 4_000.0)),
+            ),
+        ];
+        let summary = medians(&rows);
+        assert_eq!(summary.len(), 2);
+        assert_eq!(summary[0].class, RequestClass::MediaPlaylist);
+        assert_eq!(summary[0].samples, 2);
+        assert_eq!(summary[0].rt_total_median_ms, Some(25.0));
+        assert_eq!(summary[1].class, RequestClass::LivePlaylistReload);
+        assert_eq!(summary[1].rt_total_median_ms, Some(4_000.0));
+        // And a hold is not a download, so it is not counted as media anywhere.
+        assert!(!RequestClass::LivePlaylistReload.is_media());
+        assert_ne!(
+            RequestClass::LivePlaylistReload.label(),
+            RequestClass::MediaPlaylist.label()
+        );
+    }
+
     // ── Percentage ratios ────────────────────────────────────────────────────
 
     #[test]
@@ -1801,6 +2062,52 @@ mod tests {
     }
 
     #[test]
+    fn a_live_rows_observation_lag_is_read_against_the_target_that_bounds_it() {
+        let mut row = measured_row(
+            RequestClass::VideoSegment,
+            app(0.0, 30.0, 400.0),
+            Some(rt_without_tao(0.0, 300.0)),
+        );
+        // A part row: PART-TARGET is what bounds a part, so it is the denominator.
+        row.media_duration_s = Some(1.0);
+        row.media_duration_source = Some(DurationSource::PartDuration);
+        row.target_duration_s = Some(1.0);
+        row.target_duration_source = Some(DurationSource::PartTarget);
+        row.observation_lag_ms = Some(350.0);
+        assert_eq!(row.observation_lag_percent_of_target(), Some(35.0));
+        // The download ratio stays the download's, and is not replaced by the lag.
+        assert_eq!(row.percent_of_media_duration(), Some(30.0));
+    }
+
+    #[test]
+    fn an_ignored_range_leaves_the_observation_lag_percentage_empty_too() {
+        let mut row = measured_row(
+            RequestClass::VideoSegment,
+            app(0.0, 30.0, 400.0),
+            Some(rt_without_tao(0.0, 300.0)),
+        );
+        row.byterange = Some(RequestRange::from_length_with_offset(1_000, 500));
+        row.target_duration_s = Some(1.0);
+        row.observation_lag_ms = Some(350.0);
+        if let RowOutcome::Measured(m) = &mut row.outcome {
+            m.range_ignored = true;
+        }
+        // The lag contains the download of the whole resource while PART-TARGET bounds one
+        // slice of it, so the ratio would compare two different things.
+        assert_eq!(row.observation_lag_percent_of_target(), None);
+        // The lag itself is still what this tab waited, and is not thrown away.
+        assert_eq!(row.observation_lag_ms, Some(350.0));
+    }
+
+    #[test]
+    fn a_row_with_no_observation_lag_has_no_percentage_of_one() {
+        let mut row = measured_row(RequestClass::VideoSegment, app(0.0, 30.0, 400.0), None);
+        row.target_duration_s = Some(6.0);
+        assert_eq!(row.observation_lag_ms, None);
+        assert_eq!(row.observation_lag_percent_of_target(), None);
+    }
+
+    #[test]
     fn a_missing_extinf_leaves_the_percentage_empty_rather_than_zero() {
         let mut row = measured_row(RequestClass::VideoSegment, app(0.0, 30.0, 900.0), None);
         row.target_duration_s = Some(6.0);
@@ -1817,13 +2124,99 @@ mod tests {
             media_pairs: 0,
             playlist_timing: true,
             media_timing: true,
+            live_timing: true,
         }
         .clamped();
         assert_eq!(clamped.playlist_requests, MAX_PLAYLIST_REQUESTS);
         assert_eq!(clamped.media_pairs, MIN_MEDIA_PAIRS);
+        // Clamping is about the counts. A flag the user ticked has to survive it.
+        assert!(clamped.media_timing);
+        assert!(clamped.live_timing);
         let defaults = TimingOptions::default();
         assert_eq!(defaults.playlist_requests, 4);
         assert_eq!(defaults.media_pairs, 4);
+    }
+
+    #[test]
+    fn neither_kind_of_media_sampling_is_on_by_default() {
+        // Both cost bytes or waits, so both are opt-in however the page is reached.
+        let defaults = TimingOptions::default();
+        assert!(!defaults.media_timing);
+        assert!(!defaults.live_timing);
+        assert!(!defaults.wants_media_samples());
+        assert!(
+            TimingOptions { media_timing: true, ..Default::default() }.wants_media_samples()
+        );
+        assert!(TimingOptions { live_timing: true, ..Default::default() }.wants_media_samples());
+    }
+
+    // ── Which media phase a run enters ───────────────────────────────────────
+
+    #[test]
+    fn a_vod_playlist_is_strided_only_when_vod_media_sampling_was_asked_for() {
+        assert_eq!(
+            media_phase_kind(false, true, false),
+            MediaPhaseKind::Vod { live_declined: false },
+        );
+        // Both boxes on a finished asset: the stride runs and the edge is declined, so the
+        // report says why there is no observation lag rather than leaving it unexplained.
+        assert_eq!(
+            media_phase_kind(false, true, true),
+            MediaPhaseKind::Vod { live_declined: true },
+        );
+    }
+
+    #[test]
+    fn a_live_playlist_is_watched_only_when_live_edge_timing_was_asked_for() {
+        assert_eq!(
+            media_phase_kind(true, false, true),
+            MediaPhaseKind::Live { vod_declined: false },
+        );
+        assert_eq!(
+            media_phase_kind(true, true, true),
+            MediaPhaseKind::Live { vod_declined: true },
+        );
+    }
+
+    #[test]
+    fn vod_media_sampling_on_a_live_playlist_declines_instead_of_watching_the_edge() {
+        // The bug this pins: one checkbox for both kinds meant a VOD-labelled check held
+        // `_HLS_msn` and downloaded live media.
+        assert_eq!(
+            media_phase_kind(true, true, false),
+            MediaPhaseKind::DeclineVodOnLive,
+        );
+    }
+
+    #[test]
+    fn live_edge_timing_on_a_vod_playlist_declines_instead_of_striding_the_asset() {
+        assert_eq!(
+            media_phase_kind(false, false, true),
+            MediaPhaseKind::DeclineLiveOnVod,
+        );
+    }
+
+    #[test]
+    fn neither_media_check_leaves_the_run_at_its_playlist_rows() {
+        assert_eq!(media_phase_kind(false, false, false), MediaPhaseKind::Skip);
+        assert_eq!(media_phase_kind(true, false, false), MediaPhaseKind::Skip);
+    }
+
+    #[test]
+    fn a_declined_media_phase_explains_which_check_could_not_apply() {
+        // The note is what the user reads instead of an empty media table, so it has to
+        // name the check that was ticked and the tag that ruled it out.
+        let declined = vod_on_live_note(false);
+        assert!(declined.contains("Media sample timing"));
+        assert!(declined.contains("EXT-X-ENDLIST"));
+        assert!(declined.contains("No media bytes were taken"));
+        // Where the edge was watched, no bytes claim would be false.
+        assert!(!vod_on_live_note(true).contains("No media bytes were taken"));
+        let live_declined = live_on_vod_note(false);
+        assert!(live_declined.contains("Live edge timing"));
+        assert!(live_declined.contains("EXT-X-ENDLIST"));
+        assert!(live_declined.contains("No media bytes were taken"));
+        assert!(!live_on_vod_note(true).contains("No media bytes were taken"));
     }
 
     // ── Rendition choice ─────────────────────────────────────────────────────
@@ -2174,6 +2567,55 @@ mod tests {
         assert!(!report.notes.iter().any(|n| n.id == NOTE_LIVE_NOT_MEASURED));
         // The same note twice is one note.
         assert_eq!(report.notes.len(), 1);
+    }
+
+    #[test]
+    fn the_live_notes_say_which_live_story_a_run_told() {
+        // "Not measured" used to be the only thing a live run could say. It is now one
+        // outcome among several, and each has a name of its own so a run can be asked
+        // which happened without matching on prose.
+        let ids = [
+            NOTE_LIVE_NOT_MEASURED,
+            NOTE_LIVE_OBSERVATION_BOUND,
+            NOTE_LIVE_BLOCKING_RELOAD,
+            NOTE_LIVE_POLLED,
+            NOTE_LIVE_WAIT_TIMEOUT,
+        ];
+        let mut unique: Vec<&str> = ids.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len());
+
+        // A run that measured the edge carries the bound, and does not claim it measured
+        // nothing.
+        let mut report = TimingReport::default();
+        report.push_note(NOTE_LIVE_OBSERVATION_BOUND, "an upper bound, not an add time");
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.id == NOTE_LIVE_OBSERVATION_BOUND)
+        );
+        assert!(!report.notes.iter().any(|n| n.id == NOTE_LIVE_NOT_MEASURED));
+    }
+
+    #[test]
+    fn the_provenance_list_says_what_the_observation_lag_is_not() {
+        let notes = provenance_notes();
+        assert!(notes.iter().any(|n| n.contains("upper bound")));
+        // Both directions, because the figure bounds the fetch from above and the
+        // publication-to-bytes interval from below, and either alone reads as a claim.
+        assert!(notes.iter().any(|n| n.contains("a floor on the interval")));
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("EXT-X-PROGRAM-DATE-TIME is an authoring clock"))
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("blocking reload's playlist row"))
+        );
     }
 
     #[test]

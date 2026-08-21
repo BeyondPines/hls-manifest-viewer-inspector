@@ -9,7 +9,9 @@ use web_sys::{
     js_sys::{ArrayBuffer, TypeError, Uint8Array},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// A byte range of one resource. Hashable because a low-latency playlist routinely names
+/// several parts inside a single file, so a range is part of what identifies an item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RequestRange {
     pub start: u64,
     pub end: u64,

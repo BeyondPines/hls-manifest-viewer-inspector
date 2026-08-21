@@ -140,6 +140,11 @@ const TIMING_COLUMNS: &[&str] = &[
     "Target duration",
     "% of media duration",
     "% of target duration",
+    // Live only. Named by its two ends because the moment the item was added is not
+    // observable at all: the figure bounds the fetch from above and the latency a client
+    // would experience from below.
+    "Observation lag (seen → bytes, ≤ true latency)",
+    "% of target (observation lag)",
 ];
 
 /// The Timing results: the caveats, the raw rows, and a median of them.
@@ -321,7 +326,24 @@ fn row_cells(row: &TimingRow) -> Vec<String> {
         target_duration_cell(row),
         percent_cell(row.percent_of_media_duration(), row),
         percent_cell(row.percent_of_target_duration(), row),
+        fmt_ms(row.observation_lag_ms),
+        lag_percent_cell(row),
     ]
+}
+
+/// The observation lag against the target this item is bounded by: PART-TARGET for a part,
+/// TARGETDURATION for a segment.
+///
+/// Suppressed with a reason where a range was ignored, because the lag then contains the
+/// download of a whole resource while the denominator bounds one slice of it.
+fn lag_percent_cell(row: &TimingRow) -> String {
+    if row.range_ignored() {
+        return format!("{EMPTY} (range ignored)");
+    }
+    match row.observation_lag_percent_of_target() {
+        Some(percent) => format!("{percent:.1}%"),
+        None => EMPTY.into(),
+    }
 }
 
 fn status_cell(row: &TimingRow) -> String {
@@ -431,6 +453,7 @@ mod tests {
             media_duration_source: None,
             target_duration_s: Some(6.0),
             target_duration_source: None,
+            observation_lag_ms: None,
             outcome,
         }
     }
@@ -467,8 +490,9 @@ mod tests {
     fn a_missing_measurement_renders_as_an_em_dash_not_a_zero() {
         let cells = row_cells(&row(RowOutcome::Cancelled));
         assert!(cells.contains(&"cancelled".to_string()));
-        // Bytes, five duration columns and both percentages.
-        assert_eq!(cells.iter().filter(|c| *c == EMPTY).count(), 8);
+        // Bytes, five duration columns, both percentages, and the observation lag with
+        // its own percentage.
+        assert_eq!(cells.iter().filter(|c| *c == EMPTY).count(), 10);
         // Nothing that reads as a measurement survives a cancelled request.
         assert!(!cells.iter().any(|c| c.contains(" ms")));
         assert!(!cells.iter().any(|c| c.contains('%')));
@@ -521,15 +545,39 @@ mod tests {
         let cells = row_cells(&r);
         // A ratio of the whole resource's duration to one slice's EXTINF is not a ratio.
         assert!(!cells.iter().any(|c| c.contains('%')), "{cells:?}");
+        // Both duration percentages and the observation lag's percentage.
         assert_eq!(
             cells
                 .iter()
                 .filter(|c| *c == &format!("{EMPTY} (range ignored)"))
                 .count(),
-            2
+            3
         );
         // The row still says the range was ignored where the status is reported.
         assert!(cells.iter().any(|c| c == "200 (range ignored)"));
+    }
+
+    #[test]
+    fn a_live_row_shows_its_observation_lag_and_what_it_is_a_fraction_of() {
+        let mut r = row(measured(Some(ResourceTimingSample {
+            start_time: 0.0,
+            response_end: 120.0,
+            ..Default::default()
+        })));
+        // A part row: PART-TARGET is the bound, so the lag is read against half a second.
+        r.target_duration_s = Some(0.5);
+        r.observation_lag_ms = Some(150.0);
+        let cells = row_cells(&r);
+        assert!(cells.iter().any(|c| c == "150.0 ms"), "{cells:?}");
+        assert!(cells.iter().any(|c| c == "30.0%"), "{cells:?}");
+    }
+
+    #[test]
+    fn a_vod_row_leaves_the_observation_lag_empty_rather_than_zero() {
+        // There is no live edge to have observed, so both live cells are em dashes.
+        let cells = row_cells(&row(measured(None)));
+        assert_eq!(cells[TIMING_COLUMNS.len() - 2], EMPTY);
+        assert_eq!(cells[TIMING_COLUMNS.len() - 1], EMPTY);
     }
 
     #[test]

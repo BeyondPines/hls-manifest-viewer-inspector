@@ -355,6 +355,7 @@ pub static CATEGORIES: &[CheckCat] = &[
         items: &[
             CheckItem { id: TIMING_PLAYLIST_ID, label: "Playlist request timing", note: Some("extra requests") },
             CheckItem { id: TIMING_MEDIA_ID,    label: "Media sample timing",     note: Some("VOD, downloads bytes") },
+            CheckItem { id: TIMING_LIVE_ID,     label: "Live edge timing",        note: Some("live, extra waits") },
         ],
     },
 ];
@@ -365,7 +366,13 @@ pub static CATEGORIES: &[CheckCat] = &[
 /// re-requests playlists and can download media, so it is never selected for the user.
 const TIMING_CAT_ID: &str = "timing";
 const TIMING_PLAYLIST_ID: &str = "timing_playlist";
+/// Samples of a finished asset. Never waits at a live edge, so a live URL under this check
+/// alone downloads no media.
 const TIMING_MEDIA_ID: &str = "timing_media";
+/// The live edge: blocking reloads or polling, and the observation lag. Separate from the
+/// VOD check because it costs waits rather than a stride, and because a stream is one or
+/// the other.
+const TIMING_LIVE_ID: &str = "timing_live";
 
 const SUBTITLES_CAT_ID: &str = "subtitles";
 const PROTOCOL_CAT_ID: &str = "protocol";
@@ -438,7 +445,7 @@ fn all_check_ids() -> HashSet<String> {
 
 /// Check ids that only the Timing phase answers, so `probe_stream` is never asked to.
 fn is_timing_check(id: &str) -> bool {
-    matches!(id, TIMING_PLAYLIST_ID | TIMING_MEDIA_ID)
+    matches!(id, TIMING_PLAYLIST_ID | TIMING_MEDIA_ID | TIMING_LIVE_ID)
 }
 
 // ── Helper functions ─────────────────────────────────────────────────────────
@@ -715,6 +722,7 @@ impl MediaPlaylist {
 
 /// Parsed server control tag data.
 struct ServerControlInfo {
+    hold_back: Option<f64>,
     part_hold_back: Option<f64>,
     can_skip_until: Option<f64>,
     can_block_reload: bool,
@@ -729,6 +737,13 @@ struct MediaPlaylist {
     playlist_type: Option<String>,
     has_endlist: bool,
     segments: Vec<SegmentEntry>,
+    /// The parent segment at the live edge: parts the server has published for a segment
+    /// whose EXTINF and URI it has not written yet.
+    ///
+    /// Kept out of `segments` because it is not a segment — it has no URI, no declared
+    /// duration and nothing that counts towards the presentation. Only the Timing phase
+    /// reads it, and only to know that the next thing which can appear is a part.
+    trailing_segment: Option<SegmentEntry>,
     server_control: Option<ServerControlInfo>,
     /// Variables in scope for this playlist's URIs: what a master handed down, plus
     /// whatever this playlist's own EXT-X-DEFINE tags added.
@@ -943,6 +958,7 @@ fn parse_media_playlist(
         playlist_type: None,
         has_endlist: false,
         segments: Vec::new(),
+        trailing_segment: None,
         server_control: None,
         // The master's variables stay in scope. RFC 8216bis §4.4.2.3 asks a media
         // playlist to IMPORT each one it uses, but a MAP URI written with a variable the
@@ -1066,6 +1082,7 @@ fn parse_media_playlist(
                 }
                 HlsLine::KnownTag(KnownTag::Hls(Tag::ServerControl(sc))) => {
                     pl.server_control = Some(ServerControlInfo {
+                        hold_back: sc.hold_back(),
                         part_hold_back: sc.part_hold_back(),
                         can_skip_until: sc.can_skip_until(),
                         can_block_reload: sc.can_block_reload(),
@@ -1076,6 +1093,23 @@ fn parse_media_playlist(
             Ok(None) => break,
             Err(_) => break,
         }
+    }
+    // Parts left over once the playlist ends belong to a parent segment the server is
+    // still appending: they are published and fetchable, but the segment they will become
+    // is not in the playlist yet. That is the live edge, and it is the only place a client
+    // can watch a URI appear.
+    if !pending_parts.is_empty() {
+        pl.trailing_segment = Some(SegmentEntry {
+            uri: String::new(),
+            duration_s: 0.0,
+            byterange: None,
+            gap: pending_gap,
+            msn: Some(next_msn),
+            program_date_time: pending_pdt.take(),
+            parts: std::mem::take(&mut pending_parts),
+            map_uri: current_map_uri.clone(),
+            map_byterange: current_map_byterange,
+        });
     }
     pl
 }
@@ -1134,13 +1168,25 @@ fn timing_media_summary(
     inherited: &HashMap<String, String>,
 ) -> MediaSummary {
     let pl = parse_media_playlist(base_url, content, inherited);
+    let mut segments = pl.segments;
+    // The Timing phase is the one caller that has to see the parent segment being
+    // appended: without it there is no way to say which part comes next, and the live
+    // edge is where the whole live measurement happens.
+    segments.extend(pl.trailing_segment);
+    let server_control = pl.server_control.as_ref();
     MediaSummary {
         target_duration_s: (pl.target_duration > 0.0).then_some(pl.target_duration),
         part_target_s: pl.part_target,
         // No EXT-X-ENDLIST means the playlist can still grow, which is the only definition
         // of live available from one snapshot.
         is_live: !pl.has_endlist,
-        segments: pl.segments,
+        // Only the server saying CAN-BLOCK-RELOAD=YES makes a held reload worth asking
+        // for. Its absence means polling, and a polled appearance is later than a
+        // blocked one by up to a poll interval.
+        can_block_reload: server_control.is_some_and(|sc| sc.can_block_reload),
+        hold_back_s: server_control.and_then(|sc| sc.hold_back),
+        part_hold_back_s: server_control.and_then(|sc| sc.part_hold_back),
+        segments,
     }
 }
 
@@ -2352,9 +2398,10 @@ pub fn Ffprobe() -> impl IntoView {
             media_pairs: media_pairs.get_untracked(),
             playlist_timing: sel.contains(TIMING_PLAYLIST_ID),
             media_timing: sel.contains(TIMING_MEDIA_ID),
+            live_timing: sel.contains(TIMING_LIVE_ID),
         }
         .clamped();
-        let run_timing_phase = options.playlist_timing || options.media_timing;
+        let run_timing_phase = options.playlist_timing || options.wants_media_samples();
 
         leptos::task::spawn_local(async move {
             match probe_stream(&u, &probe_sel).await {
@@ -2433,6 +2480,14 @@ pub fn Ffprobe() -> impl IntoView {
                          What it reports is what this browser could observe \u{2014} which is \
                          less than a network measurement, and the table says where each figure \
                          came from."
+                    </p>
+                    <p class="body-content body-text">
+                        "The two media checks are separate because a stream is either finished or \
+                         still being written. \u{201c}Media sample timing\u{201d} strides a VOD \
+                         asset and needs \u{201c}EXT-X-ENDLIST\u{201d}; \u{201c}Live edge \
+                         timing\u{201d} waits at the edge of a live one and reports an \
+                         observation lag. Choosing the one the playlist cannot answer downloads \
+                         nothing and says why."
                     </p>
                 </div>
             </div>
@@ -4262,6 +4317,77 @@ mod tests {
         assert!(summary.is_live);
     }
 
+    /// A low-latency live playlist: the origin will hold a reload, the newest parent
+    /// segment is still being appended, and a preload hint names bytes that do not exist
+    /// yet.
+    const TIMING_LIVE_PARTS: &str = "#EXTM3U\n\
+        #EXT-X-VERSION:9\n\
+        #EXT-X-TARGETDURATION:4\n\
+        #EXT-X-PART-INF:PART-TARGET=1.0\n\
+        #EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,HOLD-BACK=12.0,PART-HOLD-BACK=3.0,\
+CAN-SKIP-UNTIL=24.0\n\
+        #EXT-X-MEDIA-SEQUENCE:266\n\
+        #EXTINF:4.0,\n\
+        seg266.m4s\n\
+        #EXT-X-PART:DURATION=1.0,URI=\"seg267.0.m4s\",INDEPENDENT=YES\n\
+        #EXT-X-PART:DURATION=1.0,URI=\"seg267.1.m4s\"\n\
+        #EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"seg267.2.m4s\"\n";
+
+    #[test]
+    fn the_server_control_a_live_wait_needs_reaches_the_timing_summary() {
+        let summary = timing_media(TIMING_LIVE_PARTS);
+        assert!(summary.is_live);
+        // Without CAN-BLOCK-RELOAD there is nothing to do but poll, and a polled
+        // appearance is later than a blocked one — so the flag has to survive the parse.
+        assert!(summary.can_block_reload);
+        assert_eq!(summary.hold_back_s, Some(12.0));
+        assert_eq!(summary.part_hold_back_s, Some(3.0));
+        assert_eq!(summary.part_target_s, Some(1.0));
+        assert_eq!(summary.target_duration_s, Some(4.0));
+    }
+
+    #[test]
+    fn a_playlist_with_no_server_control_claims_no_blocking_reload() {
+        let summary = timing_media("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\na.m4s\n");
+        assert!(!summary.can_block_reload);
+        assert_eq!(summary.hold_back_s, None);
+        assert_eq!(summary.part_hold_back_s, None);
+    }
+
+    #[test]
+    fn the_parent_segment_being_appended_reaches_timing_as_an_entry_with_no_uri() {
+        // Its parts are published and fetchable; the segment they will become is not in
+        // the playlist yet, which is what makes a part the next thing that can appear.
+        let summary = timing_media(TIMING_LIVE_PARTS);
+        assert_eq!(summary.segments.len(), 2);
+        let edge = &summary.segments[1];
+        assert!(edge.uri.is_empty());
+        assert_eq!(edge.msn, Some(267));
+        let parts: Vec<&str> = edge.parts.iter().map(|p| p.uri.as_str()).collect();
+        assert_eq!(
+            parts,
+            vec![
+                "https://example.com/hls/seg267.0.m4s",
+                "https://example.com/hls/seg267.1.m4s",
+            ]
+        );
+        // A preload hint names bytes the server has said may not exist yet, so it is not
+        // a part and is never fetched.
+        assert!(!parts.iter().any(|uri| uri.contains("seg267.2")));
+    }
+
+    #[test]
+    fn the_probe_report_still_counts_only_the_segments_the_playlist_completed() {
+        // The parent being appended is media the Timing phase can watch, but it is not a
+        // segment: counting it would change what every live report says it saw.
+        let mut report = ProbeReport::default();
+        let pl = parse_media_playlist(BASE, TIMING_LIVE_PARTS, &HashMap::new());
+        apply_protocol_from_media(&mut report, &pl);
+        assert_eq!(report.total_segments, 1);
+        assert_eq!(report.duration_s, Some(4.0));
+        assert!(report.is_live);
+    }
+
     #[test]
     fn a_byterange_with_no_offset_and_nothing_to_continue_from_is_not_a_range() {
         // The playlist is malformed. Asking for bytes 0.. would be a guess at what the
@@ -4300,12 +4426,46 @@ mod tests {
         let initial = all_check_ids();
         assert!(!initial.contains(TIMING_PLAYLIST_ID));
         assert!(!initial.contains(TIMING_MEDIA_ID));
+        assert!(!initial.contains(TIMING_LIVE_ID));
         assert!(initial.contains("format_name"));
         // The category is still offered, so it can be opted into.
         assert!(CATEGORIES.iter().any(|c| c.id == TIMING_CAT_ID));
         assert!(is_timing_check(TIMING_PLAYLIST_ID));
         assert!(is_timing_check(TIMING_MEDIA_ID));
+        assert!(is_timing_check(TIMING_LIVE_ID));
         assert!(!is_timing_check("format_name"));
+    }
+
+    #[test]
+    fn the_timing_box_offers_playlist_vod_media_and_live_edge_as_three_separate_checks() {
+        // One box doing both media kinds meant a VOD-labelled check waiting at a live edge.
+        // The ids are what `on_submit` maps to the two option flags, so they are pinned.
+        let timing = cat_by_id(TIMING_CAT_ID).expect("the Timing category");
+        let offered: Vec<(&str, &str)> =
+            timing.items.iter().map(|it| (it.id, it.label)).collect();
+        assert_eq!(
+            offered,
+            [
+                (TIMING_PLAYLIST_ID, "Playlist request timing"),
+                (TIMING_MEDIA_ID, "Media sample timing"),
+                (TIMING_LIVE_ID, "Live edge timing"),
+            ],
+        );
+        // The VOD check still says so, since it is the one that will not run on a live URL.
+        assert_eq!(
+            timing.items[1].note,
+            Some("VOD, downloads bytes"),
+        );
+        assert!(timing.items[2].note.is_some_and(|n| n.contains("live")));
+    }
+
+    #[test]
+    fn every_timing_check_is_one_the_timing_phase_answers() {
+        // Select-all on the Timing box ticks whatever the category lists, and any id that
+        // is not a Timing check would be handed to `probe_stream`, which cannot answer it.
+        let timing = cat_by_id(TIMING_CAT_ID).expect("the Timing category");
+        assert!(timing.items.iter().all(|it| is_timing_check(it.id)));
+        assert_eq!(timing.items.len(), 3);
     }
 
     /// The category id of every box the grid draws, in reading order.
